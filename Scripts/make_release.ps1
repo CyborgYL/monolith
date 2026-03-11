@@ -1,6 +1,6 @@
 # Monolith Release Zip Builder
 # Creates a release zip with "Installed": true for Blueprint-only compatibility.
-# Usage: powershell -ExecutionPolicy Bypass -File Scripts\make_release.ps1 -Version "0.5.0"
+# Usage: powershell -ExecutionPolicy Bypass -File Scripts\make_release.ps1 -Version "0.7.1"
 
 param(
     [Parameter(Mandatory=$true)]
@@ -19,11 +19,19 @@ Write-Host "Building Monolith v$Version release zip..." -ForegroundColor Cyan
 if (Test-Path $TempDir) { Remove-Item $TempDir -Recurse -Force }
 New-Item -ItemType Directory -Path $TempDir | Out-Null
 
-# Use git archive to export only tracked files (respects .gitignore)
-# This ensures internal docs (plans/, TESTING.md) and build artifacts don't leak into releases
-Write-Host "  Exporting tracked files via git archive..." -ForegroundColor Yellow
+# Use git ls-files to get only tracked files (respects .gitignore)
+# This ensures internal docs, plans, TESTING.md, and build artifacts don't leak into releases
+Write-Host "  Copying tracked files..." -ForegroundColor Yellow
 Push-Location $PluginDir
-git archive HEAD --format=tar | tar -xf - -C $TempDir
+$trackedFiles = git ls-files
+foreach ($file in $trackedFiles) {
+    $destPath = Join-Path $TempDir $file
+    $destDir = Split-Path -Parent $destPath
+    if (-not (Test-Path $destDir)) {
+        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+    }
+    Copy-Item $file -Destination $destPath -Force
+}
 Pop-Location
 
 # Copy Binaries (gitignored but needed for Blueprint-only users)
@@ -32,7 +40,7 @@ if (Test-Path $binDir) {
     Copy-Item $binDir -Destination (Join-Path $TempDir "Binaries") -Recurse -Force
     Write-Host "  Included Binaries/ for Blueprint-only compatibility" -ForegroundColor Green
 } else {
-    Write-Host "  WARNING: No Binaries/ found — C++ projects must rebuild" -ForegroundColor Yellow
+    Write-Host "  WARNING: No Binaries/ found" -ForegroundColor Yellow
 }
 
 # Patch .uplugin: set "Installed": true for Blueprint-only users
@@ -41,7 +49,7 @@ $content = Get-Content $upluginPath -Raw
 $content = $content -replace '"Installed":\s*false', '"Installed": true'
 Set-Content $upluginPath $content -NoNewline
 
-Write-Host "  Set 'Installed': true in release .uplugin" -ForegroundColor Green
+Write-Host "  Set Installed=true in release .uplugin" -ForegroundColor Green
 
 # Create zip
 if (Test-Path $OutputZip) { Remove-Item $OutputZip -Force }
@@ -50,5 +58,6 @@ Compress-Archive -Path "$TempDir\*" -DestinationPath $OutputZip -Force
 # Clean temp
 Remove-Item $TempDir -Recurse -Force
 
-$sizeMB = [math]::Round((Get-Item $OutputZip).Length / 1MB, 1)
-Write-Host "Done: $OutputZip ($sizeMB MB)" -ForegroundColor Green
+$fileSize = [math]::Round((Get-Item $OutputZip).Length / 1MB, 1)
+Write-Host "Release complete: $OutputZip" -ForegroundColor Green
+Write-Host "Size: $fileSize megabytes" -ForegroundColor Green
