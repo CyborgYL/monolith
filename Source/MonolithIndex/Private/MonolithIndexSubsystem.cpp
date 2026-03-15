@@ -23,6 +23,7 @@
 #include "Indexers/UserDefinedEnumIndexer.h"
 #include "Indexers/UserDefinedStructIndexer.h"
 #include "Indexers/InputActionIndexer.h"
+#include "Indexers/DataAssetIndexer.h"
 
 void UMonolithIndexSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -156,6 +157,8 @@ void UMonolithIndexSubsystem::RegisterDefaultIndexers()
 		RegisterIndexer(MakeShared<FUserDefinedStructIndexer>());
 	if (Settings->bIndexInputActions)
 		RegisterIndexer(MakeShared<FInputActionIndexer>());
+	if (Settings->bIndexDataAssets)
+		RegisterIndexer(MakeShared<FDataAssetIndexer>());
 
 	UE_LOG(LogMonolithIndex, Log, TEXT("Registered %d indexers"), Indexers.Num());
 }

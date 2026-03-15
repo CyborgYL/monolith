@@ -5,6 +5,7 @@
 #include "MonolithBlueprintGraphActions.h"
 #include "MonolithBlueprintNodeActions.h"
 #include "MonolithBlueprintCompileActions.h"
+#include "MonolithBlueprintCDOActions.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
@@ -22,7 +23,8 @@ void FMonolithBlueprintModule::StartupModule()
 	FMonolithBlueprintGraphActions::RegisterActions(Registry);
 	FMonolithBlueprintNodeActions::RegisterActions(Registry);
 	FMonolithBlueprintCompileActions::RegisterActions(Registry);
-	UE_LOG(LogMonolith, Log, TEXT("Monolith — Blueprint module loaded (46 actions)"));
+	FMonolithBlueprintCDOActions::RegisterActions(Registry);
+	UE_LOG(LogMonolith, Log, TEXT("Monolith — Blueprint module loaded (47 actions)"));
 }
 
 void FMonolithBlueprintModule::ShutdownModule()

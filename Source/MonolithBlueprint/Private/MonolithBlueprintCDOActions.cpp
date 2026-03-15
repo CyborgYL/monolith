@@ -1,0 +1,253 @@
+#include "MonolithBlueprintCDOActions.h"
+#include "MonolithBlueprintInternal.h"
+#include "MonolithJsonUtils.h"
+#include "MonolithParamSchema.h"
+#include "MonolithAssetUtils.h"
+#include "UObject/UnrealType.h"
+#include "Engine/Blueprint.h"
+#include "Serialization/JsonWriter.h"
+#include "Serialization/JsonSerializer.h"
+
+// --- Registration ---
+
+void FMonolithBlueprintCDOActions::RegisterActions(FMonolithToolRegistry& Registry)
+{
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_cdo_properties"),
+		TEXT("Read all CDO (Class Default Object) properties from a Blueprint or any UObject asset. "
+			 "Essential for GameplayEffects (Duration, Modifiers, Tags, Stacking), AbilitySets, InputActions, "
+			 "and any asset whose config is stored as UPROPERTY defaults rather than Blueprint graph nodes."),
+		FMonolithActionHandler::CreateStatic(&HandleGetCDOProperties),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path (e.g. /Game/Blueprints/BP_MyActor or /Game/Data/DA_MyData)"))
+			.Optional(TEXT("category_filter"), TEXT("string"), TEXT("Only include properties whose category contains this string"))
+			.Optional(TEXT("include_parent_defaults"), TEXT("boolean"), TEXT("If true, include properties inherited from native parent class (default: true)"))
+			.Build());
+}
+
+// --- Property serialization helpers ---
+
+namespace MonolithCDOInternal
+{
+	TSharedPtr<FJsonValue> PropertyToJsonValue(FProperty* Prop, const void* ValuePtr, const UObject* CDO)
+	{
+		if (!Prop || !ValuePtr) return MakeShared<FJsonValueNull>();
+
+		// Numeric types
+		if (const FNumericProperty* NumProp = CastField<FNumericProperty>(Prop))
+		{
+			if (const FByteProperty* ByteProp = CastField<FByteProperty>(Prop))
+			{
+				if (ByteProp->Enum)
+				{
+					uint8 Val = ByteProp->GetPropertyValue(ValuePtr);
+					return MakeShared<FJsonValueString>(ByteProp->Enum->GetNameStringByValue(Val));
+				}
+			}
+			if (NumProp->IsInteger())
+				return MakeShared<FJsonValueNumber>(static_cast<double>(NumProp->GetSignedIntPropertyValue(ValuePtr)));
+			if (NumProp->IsFloatingPoint())
+				return MakeShared<FJsonValueNumber>(NumProp->GetFloatingPointPropertyValue(ValuePtr));
+		}
+
+		// Bool
+		if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+			return MakeShared<FJsonValueBoolean>(BoolProp->GetPropertyValue(ValuePtr));
+
+		// Enum
+		if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
+		{
+			FString Val;
+			EnumProp->ExportTextItem_Direct(Val, ValuePtr, nullptr, nullptr, PPF_None);
+			return MakeShared<FJsonValueString>(Val);
+		}
+
+		// String types
+		if (const FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+			return MakeShared<FJsonValueString>(StrProp->GetPropertyValue(ValuePtr));
+		if (const FNameProperty* NameProp = CastField<FNameProperty>(Prop))
+			return MakeShared<FJsonValueString>(NameProp->GetPropertyValue(ValuePtr).ToString());
+		if (const FTextProperty* TextProp = CastField<FTextProperty>(Prop))
+			return MakeShared<FJsonValueString>(TextProp->GetPropertyValue(ValuePtr).ToString());
+
+		// Soft/class/object references
+		if (const FSoftObjectProperty* SoftProp = CastField<FSoftObjectProperty>(Prop))
+		{
+			const FSoftObjectPtr& Ref = *static_cast<const FSoftObjectPtr*>(ValuePtr);
+			return MakeShared<FJsonValueString>(Ref.ToSoftObjectPath().ToString());
+		}
+		if (const FSoftClassProperty* SoftClassProp = CastField<FSoftClassProperty>(Prop))
+		{
+			const FSoftObjectPtr& Ref = *static_cast<const FSoftObjectPtr*>(ValuePtr);
+			return MakeShared<FJsonValueString>(Ref.ToSoftObjectPath().ToString());
+		}
+		if (const FClassProperty* ClassProp = CastField<FClassProperty>(Prop))
+		{
+			UClass* ClassVal = Cast<UClass>(ClassProp->GetObjectPropertyValue(ValuePtr));
+			return MakeShared<FJsonValueString>(ClassVal ? ClassVal->GetPathName() : TEXT("None"));
+		}
+		if (const FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
+		{
+			UObject* ObjVal = ObjProp->GetObjectPropertyValue(ValuePtr);
+			return MakeShared<FJsonValueString>(ObjVal ? ObjVal->GetPathName() : TEXT("None"));
+		}
+
+		// Struct — recurse
+		if (const FStructProperty* StructProp = CastField<FStructProperty>(Prop))
+		{
+			auto StructObj = MakeShared<FJsonObject>();
+			for (TFieldIterator<FProperty> It(StructProp->Struct); It; ++It)
+			{
+				FProperty* Inner = *It;
+				const void* InnerPtr = Inner->ContainerPtrToValuePtr<void>(ValuePtr);
+				StructObj->SetField(Inner->GetName(), PropertyToJsonValue(Inner, InnerPtr, CDO));
+			}
+			return MakeShared<FJsonValueObject>(StructObj);
+		}
+
+		// Array — recurse
+		if (const FArrayProperty* ArrayProp = CastField<FArrayProperty>(Prop))
+		{
+			TArray<TSharedPtr<FJsonValue>> Arr;
+			FScriptArrayHelper Helper(ArrayProp, ValuePtr);
+			for (int32 i = 0; i < Helper.Num(); ++i)
+			{
+				Arr.Add(PropertyToJsonValue(ArrayProp->Inner, Helper.GetRawPtr(i), CDO));
+			}
+			return MakeShared<FJsonValueArray>(Arr);
+		}
+
+		// Set
+		if (const FSetProperty* SetProp = CastField<FSetProperty>(Prop))
+		{
+			TArray<TSharedPtr<FJsonValue>> Arr;
+			FScriptSetHelper Helper(SetProp, ValuePtr);
+			for (int32 i = 0; i < Helper.Num(); ++i)
+			{
+				if (Helper.IsValidIndex(i))
+					Arr.Add(PropertyToJsonValue(SetProp->ElementProp, Helper.GetElementPtr(i), CDO));
+			}
+			return MakeShared<FJsonValueArray>(Arr);
+		}
+
+		// Map
+		if (const FMapProperty* MapProp = CastField<FMapProperty>(Prop))
+		{
+			auto MapObj = MakeShared<FJsonObject>();
+			FScriptMapHelper Helper(MapProp, ValuePtr);
+			for (int32 i = 0; i < Helper.Num(); ++i)
+			{
+				if (Helper.IsValidIndex(i))
+				{
+					FString KeyStr;
+					MapProp->KeyProp->ExportTextItem_Direct(KeyStr, Helper.GetKeyPtr(i), nullptr, nullptr, PPF_None);
+					MapObj->SetField(KeyStr, PropertyToJsonValue(MapProp->ValueProp, Helper.GetValuePtr(i), CDO));
+				}
+			}
+			return MakeShared<FJsonValueObject>(MapObj);
+		}
+
+		// Fallback: ExportTextItem
+		FString ExportedStr;
+		Prop->ExportTextItem_Direct(ExportedStr, ValuePtr, nullptr, const_cast<UObject*>(CDO), PPF_None);
+		return MakeShared<FJsonValueString>(ExportedStr);
+	}
+}
+
+// --- Handler ---
+
+FMonolithActionResult FMonolithBlueprintCDOActions::HandleGetCDOProperties(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	if (AssetPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: asset_path"));
+	}
+
+	// Try Blueprint first (has GeneratedClass -> CDO), then fall back to any UObject
+	UObject* TargetObject = nullptr;
+	UClass* TargetClass = nullptr;
+
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (BP && BP->GeneratedClass)
+	{
+		TargetClass = BP->GeneratedClass;
+		TargetObject = TargetClass->GetDefaultObject(false);
+	}
+	else
+	{
+		// Not a Blueprint — try as a generic UObject (DataAsset, GameplayEffect, etc.)
+		TargetObject = FMonolithAssetUtils::LoadAssetByPath(AssetPath);
+		if (TargetObject)
+		{
+			TargetClass = TargetObject->GetClass();
+		}
+	}
+
+	if (!TargetObject || !TargetClass)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset not found or has no class: %s"), *AssetPath));
+	}
+
+	// Find the native parent class
+	UClass* NativeParent = TargetClass;
+	while (NativeParent && !NativeParent->HasAnyClassFlags(CLASS_Native))
+	{
+		NativeParent = NativeParent->GetSuperClass();
+	}
+
+	FString CategoryFilter;
+	if (Params->HasField(TEXT("category_filter")))
+	{
+		CategoryFilter = Params->GetStringField(TEXT("category_filter"));
+	}
+
+	bool bIncludeParentDefaults = true;
+	if (Params->HasField(TEXT("include_parent_defaults")))
+	{
+		bIncludeParentDefaults = Params->GetBoolField(TEXT("include_parent_defaults"));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("native_class"), NativeParent ? NativeParent->GetName() : TEXT("Unknown"));
+	Root->SetStringField(TEXT("parent_class"), TargetClass->GetSuperClass() ? TargetClass->GetSuperClass()->GetName() : TEXT("None"));
+
+	TArray<TSharedPtr<FJsonValue>> PropsArr;
+
+	for (TFieldIterator<FProperty> It(TargetClass, EFieldIteratorFlags::IncludeSuper, EFieldIteratorFlags::ExcludeDeprecated); It; ++It)
+	{
+		FProperty* Prop = *It;
+		if (!Prop) continue;
+
+		UClass* OwnerClass = Prop->GetOwnerClass();
+		if (OwnerClass == UObject::StaticClass()) continue;
+
+		if (!bIncludeParentDefaults && OwnerClass != TargetClass) continue;
+
+		FString Category = Prop->GetMetaData(TEXT("Category"));
+		if (!CategoryFilter.IsEmpty() && !Category.Contains(CategoryFilter)) continue;
+
+		if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+
+		const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(TargetObject);
+
+		auto PropObj = MakeShared<FJsonObject>();
+		PropObj->SetStringField(TEXT("name"), Prop->GetName());
+		PropObj->SetStringField(TEXT("type"), Prop->GetCPPType());
+		PropObj->SetStringField(TEXT("category"), Category);
+		PropObj->SetStringField(TEXT("owner_class"), OwnerClass->GetName());
+		PropObj->SetField(TEXT("value"), MonolithCDOInternal::PropertyToJsonValue(Prop, ValuePtr, TargetObject));
+
+		if (Prop->HasAnyPropertyFlags(CPF_Net))
+			PropObj->SetBoolField(TEXT("replicated"), true);
+		if (Prop->HasAnyPropertyFlags(CPF_EditConst))
+			PropObj->SetBoolField(TEXT("edit_const"), true);
+
+		PropsArr.Add(MakeShared<FJsonValueObject>(PropObj));
+	}
+
+	Root->SetArrayField(TEXT("properties"), PropsArr);
+	Root->SetNumberField(TEXT("property_count"), PropsArr.Num());
+
+	return FMonolithActionResult::Success(Root);
+}
