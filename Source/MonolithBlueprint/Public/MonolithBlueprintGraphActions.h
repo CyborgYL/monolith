@@ -16,4 +16,7 @@ public:
 	static FMonolithActionResult HandleImplementInterface(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleRemoveInterface(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleReparentBlueprint(const TSharedPtr<FJsonObject>& Params);
+
+	// Wave 5 — Scaffolding & Templates
+	static FMonolithActionResult HandleScaffoldInterfaceImplementation(const TSharedPtr<FJsonObject>& Params);
 };

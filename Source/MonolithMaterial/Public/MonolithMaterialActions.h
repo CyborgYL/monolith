@@ -71,10 +71,31 @@ public:
 	static FMonolithActionResult RenameExpression(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult ListMaterialInstances(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Wave 6: Material Functions ---
+	static FMonolithActionResult CreateMaterialFunction(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult BuildFunctionGraph(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult GetFunctionInfo(const TSharedPtr<FJsonObject>& Params);
+
 private:
 	/** Load a UMaterial from an asset path. Returns nullptr on failure. */
 	static UMaterial* LoadBaseMaterial(const FString& AssetPath);
 
 	/** Serialize a single expression node to JSON. */
 	static TSharedPtr<FJsonObject> SerializeExpression(const UMaterialExpression* Expression);
+
+	/**
+	 * Shared helper for building expression graphs in both Materials and MaterialFunctions.
+	 * Handles node creation (standard + Custom HLSL), property setting, and connection wiring.
+	 * Returns nodes_created, connections_made, id_to_name map via the ResultJson out param.
+	 * The CreateExpressionFunc callback abstracts the difference between CreateMaterialExpression
+	 * and CreateMaterialExpressionInFunction.
+	 */
+	using FCreateExpressionFunc = TFunction<UMaterialExpression*(UClass* ExprClass, int32 PosX, int32 PosY)>;
+	static void BuildGraphFromSpec(
+		const TSharedPtr<FJsonObject>& Spec,
+		const FCreateExpressionFunc& CreateExpressionFunc,
+		TMap<FString, UMaterialExpression*>& IdToExpr,
+		int32& OutNodesCreated,
+		int32& OutConnectionsMade,
+		TArray<TSharedPtr<FJsonValue>>& OutErrors);
 };

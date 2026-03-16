@@ -15,7 +15,11 @@
 #include "K2Node_MacroInstance.h"
 #include "K2Node_ExecutionSequence.h"
 #include "K2Node_SpawnActorFromClass.h"
+#include "K2Node_Timeline.h"
+#include "K2Node_Event.h"
+#include "EdGraphNode_Comment.h"
 #include "EdGraphSchema_K2.h"
+#include "Engine/TimelineTemplate.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Editor.h"
@@ -146,6 +150,45 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
 			.Required(TEXT("defaults"),   TEXT("array"),  TEXT("Array of pin default descriptors: { node_id, pin_name, value }"))
 			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Graph name (searches all graphs if omitted)"))
+			.Build());
+
+	// ---- Wave 5 ----
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_timeline"),
+		TEXT("Create a Timeline node in a Blueprint event graph. Handles both the UTimelineTemplate (data) and UK2Node_Timeline (graph node) creation with GUID linkage validation. Only works in event graphs (ubergraph pages), not function graphs."),
+		FMonolithActionHandler::CreateStatic(&HandleAddTimeline),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),    TEXT("string"),  TEXT("Blueprint asset path"))
+			.Optional(TEXT("timeline_name"), TEXT("string"),  TEXT("Timeline variable name (auto-generated if omitted)"))
+			.Optional(TEXT("graph_name"),    TEXT("string"),  TEXT("Event graph name (defaults to EventGraph)"))
+			.Optional(TEXT("auto_play"),     TEXT("boolean"), TEXT("Start playing automatically (default: false)"))
+			.Optional(TEXT("loop"),          TEXT("boolean"), TEXT("Loop the timeline (default: false)"))
+			.Optional(TEXT("position"),      TEXT("array"),   TEXT("Node position as [x, y] (default: [0, 0])"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_event_node"),
+		TEXT("Add a native override event node (BeginPlay, Tick, EndPlay, etc.) or custom event to a Blueprint event graph. Alias table: BeginPlay->ReceiveBeginPlay, Tick->ReceiveTick, EndPlay->ReceiveEndPlay, BeginOverlap->ReceiveActorBeginOverlap, EndOverlap->ReceiveActorEndOverlap, Hit->ReceiveHit, Destroyed->ReceiveDestroyed, AnyDamage->ReceiveAnyDamage, PointDamage->ReceivePointDamage, RadialDamage->ReceiveRadialDamage."),
+		FMonolithActionHandler::CreateStatic(&HandleAddEventNode),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),  TEXT("string"), TEXT("Blueprint asset path"))
+			.Required(TEXT("event_name"),  TEXT("string"), TEXT("Event name: BeginPlay, Tick, EndPlay, BeginOverlap, EndOverlap, Hit, Destroyed, AnyDamage, PointDamage, RadialDamage, or a custom event name"))
+			.Optional(TEXT("graph_name"),  TEXT("string"), TEXT("Event graph name (defaults to EventGraph)"))
+			.Optional(TEXT("position"),    TEXT("array"),  TEXT("Node position as [x, y] (default: [0, 0])"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_comment_node"),
+		TEXT("Add a comment box to a Blueprint graph, optionally enclosing a set of nodes. If node_ids is provided, the comment box auto-sizes to contain those nodes with 50px padding."),
+		FMonolithActionHandler::CreateStatic(&HandleAddCommentNode),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),  TEXT("string"),  TEXT("Blueprint asset path"))
+			.Required(TEXT("text"),        TEXT("string"),  TEXT("Comment box text"))
+			.Optional(TEXT("graph_name"),  TEXT("string"),  TEXT("Graph name (defaults to EventGraph)"))
+			.Optional(TEXT("node_ids"),    TEXT("array"),   TEXT("Array of node IDs to enclose in the comment box (auto-sizes with 50px padding)"))
+			.Optional(TEXT("color"),       TEXT("object"),  TEXT("Comment color as {r, g, b, a} floats 0-1 (default: yellow {r:1, g:1, b:0, a:0.6})"))
+			.Optional(TEXT("font_size"),   TEXT("integer"), TEXT("Comment text font size (default: 18)"))
+			.Optional(TEXT("position"),    TEXT("array"),   TEXT("Node position as [x, y] — overridden if node_ids provided"))
+			.Optional(TEXT("width"),       TEXT("integer"), TEXT("Comment box width — overridden if node_ids provided"))
+			.Optional(TEXT("height"),      TEXT("integer"), TEXT("Comment box height — overridden if node_ids provided"))
 			.Build());
 }
 
@@ -899,8 +942,13 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TS
 		else if (OpName == TEXT("add_macro"))              SubResult = FMonolithBlueprintGraphActions::HandleAddMacro(SubParams);
 		else if (OpName == TEXT("add_event_dispatcher"))   SubResult = FMonolithBlueprintGraphActions::HandleAddEventDispatcher(SubParams);
 		else if (OpName == TEXT("set_function_params"))    SubResult = FMonolithBlueprintGraphActions::HandleSetFunctionParams(SubParams);
-		else if (OpName == TEXT("implement_interface"))    SubResult = FMonolithBlueprintGraphActions::HandleImplementInterface(SubParams);
-		else if (OpName == TEXT("remove_interface"))       SubResult = FMonolithBlueprintGraphActions::HandleRemoveInterface(SubParams);
+		else if (OpName == TEXT("implement_interface"))        SubResult = FMonolithBlueprintGraphActions::HandleImplementInterface(SubParams);
+		else if (OpName == TEXT("remove_interface"))           SubResult = FMonolithBlueprintGraphActions::HandleRemoveInterface(SubParams);
+		// Wave 5 scaffolding ops
+		else if (OpName == TEXT("scaffold_interface_implementation")) SubResult = FMonolithBlueprintGraphActions::HandleScaffoldInterfaceImplementation(SubParams);
+		else if (OpName == TEXT("add_timeline"))               SubResult = HandleAddTimeline(SubParams);
+		else if (OpName == TEXT("add_event_node"))             SubResult = HandleAddEventNode(SubParams);
+		else if (OpName == TEXT("add_comment_node"))           SubResult = HandleAddCommentNode(SubParams);
 
 		RO->SetBoolField(TEXT("success"), SubResult.bSuccess);
 		if (!SubResult.bSuccess)
@@ -1486,4 +1534,454 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleSetPinDefaultsBulk(co
 	Final->SetArrayField(TEXT("results"),  Results);
 
 	return FMonolithActionResult::Success(Final);
+}
+
+// ============================================================
+//  add_timeline
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimeline(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	// Timelines are only supported in actor-based blueprints
+	if (!FBlueprintEditorUtils::DoesSupportTimelines(BP))
+	{
+		return FMonolithActionResult::Error(TEXT("This Blueprint type does not support timelines (must be Actor-based)"));
+	}
+
+	// Resolve or find the target graph — must be an event graph (ubergraph page)
+	FString GraphName = Params->GetStringField(TEXT("graph_name"));
+	UEdGraph* Graph = nullptr;
+
+	if (GraphName.IsEmpty())
+	{
+		// Default to first ubergraph page
+		if (BP->UbergraphPages.Num() > 0)
+		{
+			Graph = BP->UbergraphPages[0];
+		}
+	}
+	else
+	{
+		// Find by name in ubergraph pages only
+		for (UEdGraph* G : BP->UbergraphPages)
+		{
+			if (G && G->GetName() == GraphName)
+			{
+				Graph = G;
+				break;
+			}
+		}
+	}
+
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Event graph not found: '%s'. Timeline nodes can only be placed in event graphs (ubergraph pages), not function graphs."),
+			GraphName.IsEmpty() ? TEXT("EventGraph") : *GraphName));
+	}
+
+	// Resolve timeline variable name — generate unique if not provided
+	FString TimelineVarName = Params->GetStringField(TEXT("timeline_name"));
+	if (TimelineVarName.IsEmpty())
+	{
+		TimelineVarName = FBlueprintEditorUtils::FindUniqueTimelineName(BP).ToString();
+	}
+	else
+	{
+		// Validate the provided name is unique
+		FName DesiredName(*TimelineVarName);
+		for (const UTimelineTemplate* Existing : BP->Timelines)
+		{
+			if (Existing && Existing->GetVariableName() == DesiredName)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("A timeline named '%s' already exists in this Blueprint"), *TimelineVarName));
+			}
+		}
+	}
+
+	// Parse options
+	bool bAutoPlay = false;
+	bool bLoop = false;
+	Params->TryGetBoolField(TEXT("auto_play"), bAutoPlay);
+	Params->TryGetBoolField(TEXT("loop"), bLoop);
+
+	int32 PosX = 0;
+	int32 PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("position"), PosArray) && PosArray && PosArray->Num() >= 2)
+	{
+		PosX = (int32)(*PosArray)[0]->AsNumber();
+		PosY = (int32)(*PosArray)[1]->AsNumber();
+	}
+
+	// Step 1: Create the UTimelineTemplate (the data container)
+	UTimelineTemplate* Template = FBlueprintEditorUtils::AddNewTimeline(BP, FName(*TimelineVarName));
+	if (!Template)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("AddNewTimeline failed for name '%s'"), *TimelineVarName));
+	}
+
+	// Verify template is in BP->Timelines
+	if (!BP->Timelines.Contains(Template))
+	{
+		return FMonolithActionResult::Error(TEXT("Timeline template was created but not found in BP->Timelines — aborting"));
+	}
+
+	// Step 2: Create the UK2Node_Timeline graph node
+	UK2Node_Timeline* TimelineNode = NewObject<UK2Node_Timeline>(Graph);
+	if (!TimelineNode)
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to create UK2Node_Timeline node object"));
+	}
+
+	// Step 3: Wire the node to the template via name and GUID
+	TimelineNode->TimelineName = Template->GetVariableName();
+	TimelineNode->TimelineGuid = Template->TimelineGuid;
+	TimelineNode->bAutoPlay = bAutoPlay;
+	TimelineNode->bLoop = bLoop;
+	TimelineNode->NodePosX = PosX;
+	TimelineNode->NodePosY = PosY;
+
+	// Step 4: GUID validation — critical. Silent failure if wrong.
+	if (TimelineNode->TimelineGuid != Template->TimelineGuid)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("GUID linkage mismatch: node GUID '%s' != template GUID '%s'. This would cause silent compile errors."),
+			*TimelineNode->TimelineGuid.ToString(),
+			*Template->TimelineGuid.ToString()));
+	}
+	if (TimelineNode->TimelineName != Template->GetVariableName())
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Name linkage mismatch: node name '%s' != template name '%s'."),
+			*TimelineNode->TimelineName.ToString(),
+			*Template->GetVariableName().ToString()));
+	}
+
+	// Step 5: Add to graph and allocate pins
+	Graph->AddNode(TimelineNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
+	TimelineNode->AllocateDefaultPins();
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+	// Serialize pins for the response
+	TArray<TSharedPtr<FJsonValue>> PinsArr;
+	for (const UEdGraphPin* Pin : TimelineNode->Pins)
+	{
+		if (!Pin || Pin->bHidden) continue;
+		TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
+		PinObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
+		PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+		PinObj->SetBoolField(TEXT("is_exec"), Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec);
+		PinsArr.Add(MakeShared<FJsonValueObject>(PinObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("node_id"), TimelineNode->GetName());
+	Root->SetStringField(TEXT("timeline_name"), TimelineNode->TimelineName.ToString());
+	Root->SetStringField(TEXT("timeline_guid"), TimelineNode->TimelineGuid.ToString());
+	Root->SetBoolField(TEXT("auto_play"), bAutoPlay);
+	Root->SetBoolField(TEXT("loop"), bLoop);
+	Root->SetArrayField(TEXT("pins"), PinsArr);
+	Root->SetStringField(TEXT("graph"), Graph->GetName());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  add_event_node
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddEventNode(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString EventName = Params->GetStringField(TEXT("event_name"));
+	if (EventName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: event_name"));
+	}
+
+	// Resolve graph — must be an event graph
+	FString GraphName = Params->GetStringField(TEXT("graph_name"));
+	UEdGraph* Graph = nullptr;
+
+	if (GraphName.IsEmpty())
+	{
+		if (BP->UbergraphPages.Num() > 0)
+		{
+			Graph = BP->UbergraphPages[0];
+		}
+	}
+	else
+	{
+		for (UEdGraph* G : BP->UbergraphPages)
+		{
+			if (G && G->GetName() == GraphName)
+			{
+				Graph = G;
+				break;
+			}
+		}
+	}
+
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Event graph not found: '%s'. Event nodes can only be placed in event graphs (ubergraph pages)."),
+			GraphName.IsEmpty() ? TEXT("EventGraph") : *GraphName));
+	}
+
+	// Parse position
+	int32 PosX = 0;
+	int32 PosY = 0;
+	const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("position"), PosArray) && PosArray && PosArray->Num() >= 2)
+	{
+		PosX = (int32)(*PosArray)[0]->AsNumber();
+		PosY = (int32)(*PosArray)[1]->AsNumber();
+	}
+
+	// Alias table: friendly names -> actual UE function names on AActor (or other classes)
+	static const TMap<FString, FString> EventAliases = {
+		{TEXT("beginplay"),         TEXT("ReceiveBeginPlay")},
+		{TEXT("begin_play"),        TEXT("ReceiveBeginPlay")},
+		{TEXT("tick"),              TEXT("ReceiveTick")},
+		{TEXT("receive_tick"),      TEXT("ReceiveTick")},
+		{TEXT("endplay"),           TEXT("ReceiveEndPlay")},
+		{TEXT("end_play"),          TEXT("ReceiveEndPlay")},
+		{TEXT("beginoverlap"),      TEXT("ReceiveActorBeginOverlap")},
+		{TEXT("begin_overlap"),     TEXT("ReceiveActorBeginOverlap")},
+		{TEXT("endoverlap"),        TEXT("ReceiveActorEndOverlap")},
+		{TEXT("end_overlap"),       TEXT("ReceiveActorEndOverlap")},
+		{TEXT("hit"),               TEXT("ReceiveHit")},
+		{TEXT("destroyed"),         TEXT("ReceiveDestroyed")},
+		{TEXT("anydamage"),         TEXT("ReceiveAnyDamage")},
+		{TEXT("any_damage"),        TEXT("ReceiveAnyDamage")},
+		{TEXT("pointdamage"),       TEXT("ReceivePointDamage")},
+		{TEXT("point_damage"),      TEXT("ReceivePointDamage")},
+		{TEXT("radialdamage"),      TEXT("ReceiveRadialDamage")},
+		{TEXT("radial_damage"),     TEXT("ReceiveRadialDamage")},
+	};
+
+	FString Lower = EventName.ToLower();
+	FString ResolvedEventName = EventName; // Use as-is by default
+	if (const FString* Canonical = EventAliases.Find(Lower))
+	{
+		ResolvedEventName = *Canonical;
+	}
+
+	// Try to find the declaring class by walking the inheritance chain
+	// This is needed for SetExternalMember — it must be the class that DECLARES the function
+	UClass* DeclaringClass = nullptr;
+	UFunction* EventFunc = nullptr;
+
+	FName EventFName(*ResolvedEventName);
+	UClass* ParentClass = BP->ParentClass;
+	if (ParentClass)
+	{
+		// Walk up the chain to find the class that first declares this function
+		for (UClass* TestClass = ParentClass; TestClass; TestClass = TestClass->GetSuperClass())
+		{
+			UFunction* TestFunc = TestClass->FindFunctionByName(EventFName, EIncludeSuperFlag::ExcludeSuper);
+			if (TestFunc)
+			{
+				DeclaringClass = TestClass;
+				EventFunc = TestFunc;
+				// Keep walking up — we want the topmost class that declares it
+			}
+		}
+	}
+
+	// If we found a native event in the inheritance chain, create an override event node
+	if (DeclaringClass && EventFunc)
+	{
+		// Check if an override already exists for this function
+		UK2Node_Event* ExistingOverride = FBlueprintEditorUtils::FindOverrideForFunction(BP, DeclaringClass, EventFName);
+		if (ExistingOverride)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Override event '%s' already exists in this Blueprint (node: %s)"),
+				*ResolvedEventName, *ExistingOverride->GetName()));
+		}
+
+		UK2Node_Event* EventNode = NewObject<UK2Node_Event>(Graph);
+		EventNode->EventReference.SetExternalMember(EventFName, DeclaringClass);
+		EventNode->bOverrideFunction = true;
+		EventNode->NodePosX = PosX;
+		EventNode->NodePosY = PosY;
+		Graph->AddNode(EventNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
+		EventNode->AllocateDefaultPins();
+
+		FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+		TSharedPtr<FJsonObject> Root = MonolithBlueprintInternal::SerializeNode(EventNode);
+		Root->SetStringField(TEXT("event_name"), ResolvedEventName);
+		Root->SetBoolField(TEXT("is_override"), true);
+		Root->SetStringField(TEXT("class"), DeclaringClass->GetName());
+		Root->SetStringField(TEXT("graph"), Graph->GetName());
+		return FMonolithActionResult::Success(Root);
+	}
+	else
+	{
+		// No native function found — treat as a custom event
+		// Delegate to the same creation path as add_node with CustomEvent type
+		UK2Node_CustomEvent* EventNode = NewObject<UK2Node_CustomEvent>(Graph);
+		EventNode->CustomFunctionName = FName(*EventName);
+		EventNode->NodePosX = PosX;
+		EventNode->NodePosY = PosY;
+		Graph->AddNode(EventNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
+		EventNode->AllocateDefaultPins();
+
+		FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+		TSharedPtr<FJsonObject> Root = MonolithBlueprintInternal::SerializeNode(EventNode);
+		Root->SetStringField(TEXT("event_name"), EventName);
+		Root->SetBoolField(TEXT("is_override"), false);
+		Root->SetStringField(TEXT("class"), TEXT("CustomEvent"));
+		Root->SetStringField(TEXT("graph"), Graph->GetName());
+		return FMonolithActionResult::Success(Root);
+	}
+}
+
+// ============================================================
+//  add_comment_node
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddCommentNode(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString CommentText = Params->GetStringField(TEXT("text"));
+	if (CommentText.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: text"));
+	}
+
+	FString GraphName = Params->GetStringField(TEXT("graph_name"));
+	UEdGraph* Graph = MonolithBlueprintInternal::FindGraphByName(BP, GraphName);
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Graph not found: %s"), GraphName.IsEmpty() ? TEXT("EventGraph") : *GraphName));
+	}
+
+	// Parse color — default yellow (semi-transparent)
+	double R = 1.0, G = 1.0, B = 0.0, A = 0.6;
+	const TSharedPtr<FJsonObject>* ColorObj = nullptr;
+	if (Params->TryGetObjectField(TEXT("color"), ColorObj) && ColorObj)
+	{
+		(*ColorObj)->TryGetNumberField(TEXT("r"), R);
+		(*ColorObj)->TryGetNumberField(TEXT("g"), G);
+		(*ColorObj)->TryGetNumberField(TEXT("b"), B);
+		(*ColorObj)->TryGetNumberField(TEXT("a"), A);
+	}
+
+	double FontSizeD = 18.0;
+	Params->TryGetNumberField(TEXT("font_size"), FontSizeD);
+	int32 FontSize = (int32)FontSizeD;
+
+	// Parse position and dimensions defaults
+	int32 PosX = 0;
+	int32 PosY = 0;
+	double WidthD = 400.0, HeightD = 200.0;
+	int32 Width = 400;
+	int32 Height = 200;
+
+	const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("position"), PosArray) && PosArray && PosArray->Num() >= 2)
+	{
+		PosX = (int32)(*PosArray)[0]->AsNumber();
+		PosY = (int32)(*PosArray)[1]->AsNumber();
+	}
+
+	if (Params->TryGetNumberField(TEXT("width"), WidthD))  Width  = (int32)WidthD;
+	if (Params->TryGetNumberField(TEXT("height"), HeightD)) Height = (int32)HeightD;
+
+	// If node_ids provided, compute bounding rect from those nodes
+	const TArray<TSharedPtr<FJsonValue>>* NodeIdsArray = nullptr;
+	bool bAutoSized = false;
+	if (Params->TryGetArrayField(TEXT("node_ids"), NodeIdsArray) && NodeIdsArray && NodeIdsArray->Num() > 0)
+	{
+		// Estimated node dimensions (no runtime widget dimensions available in editor backend)
+		constexpr int32 EstNodeW = 200;
+		constexpr int32 EstNodeH = 100;
+		constexpr int32 Padding = 50;
+
+		int32 MinX = INT_MAX, MinY = INT_MAX, MaxX = INT_MIN, MaxY = INT_MIN;
+
+		for (const TSharedPtr<FJsonValue>& IdVal : *NodeIdsArray)
+		{
+			FString NodeId = IdVal->AsString();
+			if (NodeId.IsEmpty()) continue;
+
+			UEdGraphNode* Node = MonolithBlueprintInternal::FindNodeById(BP, GraphName, NodeId);
+			if (!Node) continue;
+
+			MinX = FMath::Min(MinX, Node->NodePosX);
+			MinY = FMath::Min(MinY, Node->NodePosY);
+			MaxX = FMath::Max(MaxX, Node->NodePosX + EstNodeW);
+			MaxY = FMath::Max(MaxY, Node->NodePosY + EstNodeH);
+		}
+
+		if (MinX != INT_MAX)
+		{
+			PosX   = MinX - Padding;
+			PosY   = MinY - Padding - 30; // extra space for comment header
+			Width  = (MaxX - MinX) + Padding * 2;
+			Height = (MaxY - MinY) + Padding * 2 + 30;
+			bAutoSized = true;
+		}
+	}
+
+	// Create the comment node
+	UEdGraphNode_Comment* CommentNode = NewObject<UEdGraphNode_Comment>(Graph);
+	CommentNode->NodeComment = CommentText;
+	CommentNode->CommentColor = FLinearColor(R, G, B, A);
+	CommentNode->FontSize = FontSize;
+	CommentNode->NodePosX = PosX;
+	CommentNode->NodePosY = PosY;
+	CommentNode->NodeWidth = Width;
+	CommentNode->NodeHeight = Height;
+
+	if (bAutoSized)
+	{
+		CommentNode->MoveMode = ECommentBoxMode::GroupMovement;
+	}
+
+	Graph->AddNode(CommentNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("node_id"), CommentNode->GetName());
+	Root->SetStringField(TEXT("text"), CommentText);
+
+	TSharedPtr<FJsonObject> Bounds = MakeShared<FJsonObject>();
+	Bounds->SetNumberField(TEXT("x"), PosX);
+	Bounds->SetNumberField(TEXT("y"), PosY);
+	Bounds->SetNumberField(TEXT("w"), Width);
+	Bounds->SetNumberField(TEXT("h"), Height);
+	Root->SetObjectField(TEXT("bounds"), Bounds);
+	Root->SetStringField(TEXT("graph"), Graph->GetName());
+
+	return FMonolithActionResult::Success(Root);
 }

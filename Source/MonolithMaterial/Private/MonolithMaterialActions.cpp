@@ -434,6 +434,34 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("parent_path"), TEXT("string"), TEXT("Path to the parent material or material instance"))
 			.Optional(TEXT("recursive"), TEXT("bool"), TEXT("Recursively find instances of instances"), TEXT("true"))
 			.Build());
+
+	// --- Wave 6: Material Functions ---
+
+	Registry.RegisterAction(TEXT("material"), TEXT("create_material_function"),
+		TEXT("Create a new UMaterialFunction asset"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::CreateMaterialFunction),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Content path for the new function (e.g. /Game/Materials/Functions/MF_MyFunc)"))
+			.Optional(TEXT("description"), TEXT("string"), TEXT("Description shown in the material editor"))
+			.Optional(TEXT("expose_to_library"), TEXT("bool"), TEXT("Expose to the material function library"), TEXT("true"))
+			.Optional(TEXT("library_categories"), TEXT("array"), TEXT("Array of category strings for library organization"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("build_function_graph"),
+		TEXT("Build a material function graph from JSON spec — same schema as build_material_graph but with function inputs[] and outputs[] definitions"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::BuildFunctionGraph),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material function asset path"))
+			.Required(TEXT("graph_spec"), TEXT("object"), TEXT("JSON specification: { inputs: [{name, type, sort_priority?, preview_value?}], outputs: [{name, sort_priority?}], nodes: [...], custom_hlsl_nodes: [...], connections: [...] }"))
+			.Optional(TEXT("clear_existing"), TEXT("bool"), TEXT("Clear existing expressions before building"), TEXT("false"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("get_function_info"),
+		TEXT("Get detailed info about a material function — inputs, outputs, description, categories, expressions"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::GetFunctionInfo),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material function asset path"))
+			.Build());
 }
 
 // ============================================================================
@@ -1109,255 +1137,12 @@ FMonolithActionResult FMonolithMaterialActions::BuildMaterialGraph(const TShared
 		}
 	}
 
-	// Phase 1 — Standard nodes
-	const TArray<TSharedPtr<FJsonValue>>* NodesArray = nullptr;
-	if (Spec->TryGetArrayField(TEXT("nodes"), NodesArray))
+	// Phases 1-3 — Standard nodes, Custom HLSL, and connections (shared logic)
+	FCreateExpressionFunc CreateFunc = [Mat](UClass* ExprClass, int32 PosX, int32 PosY) -> UMaterialExpression*
 	{
-		for (const TSharedPtr<FJsonValue>& NodeVal : *NodesArray)
-		{
-			const TSharedPtr<FJsonObject>* NodeObjPtr = nullptr;
-			if (!NodeVal || !NodeVal->TryGetObject(NodeObjPtr) || !NodeObjPtr)
-			{
-				continue;
-			}
-			const TSharedPtr<FJsonObject>& NodeObj = *NodeObjPtr;
-
-			FString Id = NodeObj->GetStringField(TEXT("id"));
-			FString ShortClass = NodeObj->GetStringField(TEXT("class"));
-
-			FString FullClassName = ShortClass;
-			if (!ShortClass.StartsWith(TEXT("MaterialExpression")))
-			{
-				FullClassName = FString::Printf(TEXT("MaterialExpression%s"), *ShortClass);
-			}
-
-			// Try multiple lookup strategies for the expression class
-			UClass* ExprClass = FindFirstObject<UClass>(*FullClassName, EFindFirstObjectOptions::NativeFirst);
-			if (!ExprClass)
-			{
-				// Try with U prefix (UMaterialExpressionConstant)
-				FString UClassName = FString::Printf(TEXT("U%s"), *FullClassName);
-				ExprClass = FindFirstObject<UClass>(*UClassName, EFindFirstObjectOptions::NativeFirst);
-			}
-			if (!ExprClass)
-			{
-				auto ErrJson = MakeShared<FJsonObject>();
-				ErrJson->SetStringField(TEXT("node_id"), Id);
-				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Class '%s' not found"), *FullClassName));
-				ErrorsArray.Add(MakeShared<FJsonValueObject>(ErrJson));
-				continue;
-			}
-
-			int32 PosX = 0, PosY = 0;
-			const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
-			if (NodeObj->TryGetArrayField(TEXT("pos"), PosArray) && PosArray->Num() >= 2)
-			{
-				PosX = static_cast<int32>((*PosArray)[0]->AsNumber());
-				PosY = static_cast<int32>((*PosArray)[1]->AsNumber());
-			}
-
-			UMaterialExpression* NewExpr = UMaterialEditingLibrary::CreateMaterialExpression(Mat, ExprClass, PosX, PosY);
-			if (!NewExpr)
-			{
-				auto ErrJson = MakeShared<FJsonObject>();
-				ErrJson->SetStringField(TEXT("node_id"), Id);
-				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Failed to create expression of class '%s'"), *FullClassName));
-				ErrorsArray.Add(MakeShared<FJsonValueObject>(ErrJson));
-				continue;
-			}
-
-			// Set properties
-			const TSharedPtr<FJsonObject>* PropsObjPtr = nullptr;
-			if (NodeObj->TryGetObjectField(TEXT("props"), PropsObjPtr) && PropsObjPtr)
-			{
-				const TSharedPtr<FJsonObject>& PropsObj = *PropsObjPtr;
-				for (const auto& Pair : PropsObj->Values)
-				{
-					FProperty* Prop = NewExpr->GetClass()->FindPropertyByName(*Pair.Key);
-					if (!Prop)
-					{
-						auto ErrJson = MakeShared<FJsonObject>();
-						ErrJson->SetStringField(TEXT("node_id"), Id);
-						ErrJson->SetStringField(TEXT("warning"), FString::Printf(TEXT("Property '%s' not found on '%s'"), *Pair.Key, *FullClassName));
-						ErrorsArray.Add(MakeShared<FJsonValueObject>(ErrJson));
-						continue;
-					}
-
-					FString ValueStr = Pair.Value->AsString();
-					void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(NewExpr);
-
-					if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
-					{
-						FloatProp->SetPropertyValue(ValuePtr, static_cast<float>(Pair.Value->AsNumber()));
-					}
-					else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
-					{
-						DoubleProp->SetPropertyValue(ValuePtr, Pair.Value->AsNumber());
-					}
-					else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
-					{
-						IntProp->SetPropertyValue(ValuePtr, static_cast<int32>(Pair.Value->AsNumber()));
-					}
-					else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
-					{
-						BoolProp->SetPropertyValue(ValuePtr, Pair.Value->AsBool());
-					}
-					else
-					{
-						Prop->ImportText_Direct(*ValueStr, ValuePtr, NewExpr, PPF_None);
-					}
-				}
-			}
-
-			IdToExpr.Add(Id, NewExpr);
-			NodesCreated++;
-		}
-	}
-
-	// Phase 2 — Custom HLSL nodes
-	const TArray<TSharedPtr<FJsonValue>>* CustomArray = nullptr;
-	if (Spec->TryGetArrayField(TEXT("custom_hlsl_nodes"), CustomArray))
-	{
-		for (const TSharedPtr<FJsonValue>& CustomVal : *CustomArray)
-		{
-			const TSharedPtr<FJsonObject>* CustomObjPtr = nullptr;
-			if (!CustomVal || !CustomVal->TryGetObject(CustomObjPtr) || !CustomObjPtr)
-			{
-				continue;
-			}
-			const TSharedPtr<FJsonObject>& CustomObj = *CustomObjPtr;
-
-			FString Id = CustomObj->GetStringField(TEXT("id"));
-
-			int32 PosX = 0, PosY = 0;
-			const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
-			if (CustomObj->TryGetArrayField(TEXT("pos"), PosArray) && PosArray->Num() >= 2)
-			{
-				PosX = static_cast<int32>((*PosArray)[0]->AsNumber());
-				PosY = static_cast<int32>((*PosArray)[1]->AsNumber());
-			}
-
-			UMaterialExpression* BaseExpr = UMaterialEditingLibrary::CreateMaterialExpression(
-				Mat, UMaterialExpressionCustom::StaticClass(), PosX, PosY);
-
-			UMaterialExpressionCustom* CustomExpr = Cast<UMaterialExpressionCustom>(BaseExpr);
-			if (!CustomExpr)
-			{
-				auto ErrJson = MakeShared<FJsonObject>();
-				ErrJson->SetStringField(TEXT("node_id"), Id);
-				ErrJson->SetStringField(TEXT("error"), TEXT("Failed to create Custom HLSL expression"));
-				ErrorsArray.Add(MakeShared<FJsonValueObject>(ErrJson));
-				continue;
-			}
-
-			CustomExpr->Code = CustomObj->GetStringField(TEXT("code"));
-			// Bug fix: when graph_spec arrives as a pre-serialized JSON string, newlines
-			// get double-encoded as literal \\n text. Unescape them.
-			CustomExpr->Code.ReplaceInline(TEXT("\\n"), TEXT("\n"), ESearchCase::CaseSensitive);
-			CustomExpr->Code.ReplaceInline(TEXT("\\t"), TEXT("\t"), ESearchCase::CaseSensitive);
-			if (CustomObj->HasField(TEXT("description")))
-			{
-				CustomExpr->Description = CustomObj->GetStringField(TEXT("description"));
-			}
-			if (CustomObj->HasField(TEXT("output_type")))
-			{
-				CustomExpr->OutputType = ParseCustomOutputType(CustomObj->GetStringField(TEXT("output_type")));
-			}
-
-			const TArray<TSharedPtr<FJsonValue>>* InputsArray = nullptr;
-			if (CustomObj->TryGetArrayField(TEXT("inputs"), InputsArray))
-			{
-				CustomExpr->Inputs.Empty();
-				for (const TSharedPtr<FJsonValue>& InputVal : *InputsArray)
-				{
-					const TSharedPtr<FJsonObject>* InputObjPtr = nullptr;
-					if (InputVal && InputVal->TryGetObject(InputObjPtr) && InputObjPtr)
-					{
-						FCustomInput NewInput;
-						NewInput.InputName = *(*InputObjPtr)->GetStringField(TEXT("name"));
-						CustomExpr->Inputs.Add(NewInput);
-					}
-				}
-			}
-
-			const TArray<TSharedPtr<FJsonValue>>* AddOutputsArray = nullptr;
-			if (CustomObj->TryGetArrayField(TEXT("additional_outputs"), AddOutputsArray))
-			{
-				CustomExpr->AdditionalOutputs.Empty();
-				for (const TSharedPtr<FJsonValue>& OutVal : *AddOutputsArray)
-				{
-					const TSharedPtr<FJsonObject>* OutObjPtr = nullptr;
-					if (OutVal && OutVal->TryGetObject(OutObjPtr) && OutObjPtr)
-					{
-						FCustomOutput NewOutput;
-						NewOutput.OutputName = *(*OutObjPtr)->GetStringField(TEXT("name"));
-						if ((*OutObjPtr)->HasField(TEXT("type")))
-						{
-							NewOutput.OutputType = ParseCustomOutputType((*OutObjPtr)->GetStringField(TEXT("type")));
-						}
-						CustomExpr->AdditionalOutputs.Add(NewOutput);
-					}
-				}
-			}
-
-			CustomExpr->RebuildOutputs();
-			IdToExpr.Add(Id, CustomExpr);
-			NodesCreated++;
-		}
-	}
-
-	// Phase 3 — Wire connections between expressions
-	const TArray<TSharedPtr<FJsonValue>>* ConnsArray = nullptr;
-	if (Spec->TryGetArrayField(TEXT("connections"), ConnsArray))
-	{
-		for (const TSharedPtr<FJsonValue>& ConnVal : *ConnsArray)
-		{
-			const TSharedPtr<FJsonObject>* ConnObjPtr = nullptr;
-			if (!ConnVal || !ConnVal->TryGetObject(ConnObjPtr) || !ConnObjPtr)
-			{
-				continue;
-			}
-			const TSharedPtr<FJsonObject>& ConnObj = *ConnObjPtr;
-
-			FString FromId = ConnObj->GetStringField(TEXT("from"));
-			FString ToId = ConnObj->GetStringField(TEXT("to"));
-			FString FromPin = ConnObj->HasField(TEXT("from_pin")) ? ConnObj->GetStringField(TEXT("from_pin")) : TEXT("");
-			FString ToPin = ConnObj->HasField(TEXT("to_pin")) ? ConnObj->GetStringField(TEXT("to_pin")) : TEXT("");
-
-			UMaterialExpression** FromPtr = IdToExpr.Find(FromId);
-			UMaterialExpression** ToPtr = IdToExpr.Find(ToId);
-
-			if (!FromPtr || !*FromPtr)
-			{
-				auto ErrJson = MakeShared<FJsonObject>();
-				ErrJson->SetStringField(TEXT("connection"), FString::Printf(TEXT("%s -> %s"), *FromId, *ToId));
-				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Source node '%s' not found"), *FromId));
-				ErrorsArray.Add(MakeShared<FJsonValueObject>(ErrJson));
-				continue;
-			}
-			if (!ToPtr || !*ToPtr)
-			{
-				auto ErrJson = MakeShared<FJsonObject>();
-				ErrJson->SetStringField(TEXT("connection"), FString::Printf(TEXT("%s -> %s"), *FromId, *ToId));
-				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Target node '%s' not found"), *ToId));
-				ErrorsArray.Add(MakeShared<FJsonValueObject>(ErrJson));
-				continue;
-			}
-
-			bool bConnected = UMaterialEditingLibrary::ConnectMaterialExpressions(*FromPtr, FromPin, *ToPtr, ToPin);
-			if (bConnected)
-			{
-				ConnectionsMade++;
-			}
-			else
-			{
-				auto ErrJson = MakeShared<FJsonObject>();
-				ErrJson->SetStringField(TEXT("connection"), FString::Printf(TEXT("%s.%s -> %s.%s"), *FromId, *FromPin, *ToId, *ToPin));
-				ErrJson->SetStringField(TEXT("error"), TEXT("ConnectMaterialExpressions returned false"));
-				ErrorsArray.Add(MakeShared<FJsonValueObject>(ErrJson));
-			}
-		}
-	}
+		return UMaterialEditingLibrary::CreateMaterialExpression(Mat, ExprClass, PosX, PosY);
+	};
+	BuildGraphFromSpec(Spec, CreateFunc, IdToExpr, NodesCreated, ConnectionsMade, ErrorsArray);
 
 	// Phase 4 — Wire material output properties
 	const TArray<TSharedPtr<FJsonValue>>* OutputsArray = nullptr;
@@ -5386,6 +5171,762 @@ FMonolithActionResult FMonolithMaterialActions::ListMaterialInstances(const TSha
 	ResultJson->SetNumberField(TEXT("instance_count"), InstancesArray.Num());
 	ResultJson->SetArrayField(TEXT("instances"), InstancesArray);
 	ResultJson->SetBoolField(TEXT("recursive"), bRecursive);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Shared Helper: BuildGraphFromSpec
+// Handles node creation (standard + Custom HLSL) and connection wiring.
+// Used by both BuildMaterialGraph and BuildFunctionGraph.
+// ============================================================================
+
+void FMonolithMaterialActions::BuildGraphFromSpec(
+	const TSharedPtr<FJsonObject>& Spec,
+	const FCreateExpressionFunc& CreateExpressionFunc,
+	TMap<FString, UMaterialExpression*>& IdToExpr,
+	int32& OutNodesCreated,
+	int32& OutConnectionsMade,
+	TArray<TSharedPtr<FJsonValue>>& OutErrors)
+{
+	OutNodesCreated = 0;
+	OutConnectionsMade = 0;
+
+	// Phase 1 — Standard nodes
+	const TArray<TSharedPtr<FJsonValue>>* NodesArray = nullptr;
+	if (Spec->TryGetArrayField(TEXT("nodes"), NodesArray))
+	{
+		for (const TSharedPtr<FJsonValue>& NodeVal : *NodesArray)
+		{
+			const TSharedPtr<FJsonObject>* NodeObjPtr = nullptr;
+			if (!NodeVal || !NodeVal->TryGetObject(NodeObjPtr) || !NodeObjPtr)
+			{
+				continue;
+			}
+			const TSharedPtr<FJsonObject>& NodeObj = *NodeObjPtr;
+
+			FString Id = NodeObj->GetStringField(TEXT("id"));
+			FString ShortClass = NodeObj->GetStringField(TEXT("class"));
+
+			FString FullClassName = ShortClass;
+			if (!ShortClass.StartsWith(TEXT("MaterialExpression")))
+			{
+				FullClassName = FString::Printf(TEXT("MaterialExpression%s"), *ShortClass);
+			}
+
+			// Try multiple lookup strategies for the expression class
+			UClass* ExprClass = FindFirstObject<UClass>(*FullClassName, EFindFirstObjectOptions::NativeFirst);
+			if (!ExprClass)
+			{
+				FString UClassName = FString::Printf(TEXT("U%s"), *FullClassName);
+				ExprClass = FindFirstObject<UClass>(*UClassName, EFindFirstObjectOptions::NativeFirst);
+			}
+			if (!ExprClass)
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("node_id"), Id);
+				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Class '%s' not found"), *FullClassName));
+				OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+				continue;
+			}
+
+			int32 PosX = 0, PosY = 0;
+			const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
+			if (NodeObj->TryGetArrayField(TEXT("pos"), PosArray) && PosArray->Num() >= 2)
+			{
+				PosX = static_cast<int32>((*PosArray)[0]->AsNumber());
+				PosY = static_cast<int32>((*PosArray)[1]->AsNumber());
+			}
+
+			UMaterialExpression* NewExpr = CreateExpressionFunc(ExprClass, PosX, PosY);
+			if (!NewExpr)
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("node_id"), Id);
+				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Failed to create expression of class '%s'"), *FullClassName));
+				OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+				continue;
+			}
+
+			// Set properties
+			const TSharedPtr<FJsonObject>* PropsObjPtr = nullptr;
+			if (NodeObj->TryGetObjectField(TEXT("props"), PropsObjPtr) && PropsObjPtr)
+			{
+				const TSharedPtr<FJsonObject>& PropsObj = *PropsObjPtr;
+				for (const auto& Pair : PropsObj->Values)
+				{
+					FProperty* Prop = NewExpr->GetClass()->FindPropertyByName(*Pair.Key);
+					if (!Prop)
+					{
+						auto ErrJson = MakeShared<FJsonObject>();
+						ErrJson->SetStringField(TEXT("node_id"), Id);
+						ErrJson->SetStringField(TEXT("warning"), FString::Printf(TEXT("Property '%s' not found on '%s'"), *Pair.Key, *FullClassName));
+						OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+						continue;
+					}
+
+					FString ValueStr = Pair.Value->AsString();
+					void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(NewExpr);
+
+					if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+					{
+						FloatProp->SetPropertyValue(ValuePtr, static_cast<float>(Pair.Value->AsNumber()));
+					}
+					else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
+					{
+						DoubleProp->SetPropertyValue(ValuePtr, Pair.Value->AsNumber());
+					}
+					else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
+					{
+						IntProp->SetPropertyValue(ValuePtr, static_cast<int32>(Pair.Value->AsNumber()));
+					}
+					else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+					{
+						BoolProp->SetPropertyValue(ValuePtr, Pair.Value->AsBool());
+					}
+					else
+					{
+						Prop->ImportText_Direct(*ValueStr, ValuePtr, NewExpr, PPF_None);
+					}
+				}
+			}
+
+			IdToExpr.Add(Id, NewExpr);
+			OutNodesCreated++;
+		}
+	}
+
+	// Phase 2 — Custom HLSL nodes
+	const TArray<TSharedPtr<FJsonValue>>* CustomArray = nullptr;
+	if (Spec->TryGetArrayField(TEXT("custom_hlsl_nodes"), CustomArray))
+	{
+		for (const TSharedPtr<FJsonValue>& CustomVal : *CustomArray)
+		{
+			const TSharedPtr<FJsonObject>* CustomObjPtr = nullptr;
+			if (!CustomVal || !CustomVal->TryGetObject(CustomObjPtr) || !CustomObjPtr)
+			{
+				continue;
+			}
+			const TSharedPtr<FJsonObject>& CustomObj = *CustomObjPtr;
+
+			FString Id = CustomObj->GetStringField(TEXT("id"));
+
+			int32 PosX = 0, PosY = 0;
+			const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
+			if (CustomObj->TryGetArrayField(TEXT("pos"), PosArray) && PosArray->Num() >= 2)
+			{
+				PosX = static_cast<int32>((*PosArray)[0]->AsNumber());
+				PosY = static_cast<int32>((*PosArray)[1]->AsNumber());
+			}
+
+			UMaterialExpression* BaseExpr = CreateExpressionFunc(UMaterialExpressionCustom::StaticClass(), PosX, PosY);
+			UMaterialExpressionCustom* CustomExpr = Cast<UMaterialExpressionCustom>(BaseExpr);
+			if (!CustomExpr)
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("node_id"), Id);
+				ErrJson->SetStringField(TEXT("error"), TEXT("Failed to create Custom HLSL expression"));
+				OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+				continue;
+			}
+
+			CustomExpr->Code = CustomObj->GetStringField(TEXT("code"));
+			// Unescape double-encoded newlines from JSON string serialization
+			CustomExpr->Code.ReplaceInline(TEXT("\\n"), TEXT("\n"), ESearchCase::CaseSensitive);
+			CustomExpr->Code.ReplaceInline(TEXT("\\t"), TEXT("\t"), ESearchCase::CaseSensitive);
+			if (CustomObj->HasField(TEXT("description")))
+			{
+				CustomExpr->Description = CustomObj->GetStringField(TEXT("description"));
+			}
+			if (CustomObj->HasField(TEXT("output_type")))
+			{
+				CustomExpr->OutputType = ParseCustomOutputType(CustomObj->GetStringField(TEXT("output_type")));
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* InputsArray = nullptr;
+			if (CustomObj->TryGetArrayField(TEXT("inputs"), InputsArray))
+			{
+				CustomExpr->Inputs.Empty();
+				for (const TSharedPtr<FJsonValue>& InputVal : *InputsArray)
+				{
+					const TSharedPtr<FJsonObject>* InputObjPtr = nullptr;
+					if (InputVal && InputVal->TryGetObject(InputObjPtr) && InputObjPtr)
+					{
+						FCustomInput NewInput;
+						NewInput.InputName = *(*InputObjPtr)->GetStringField(TEXT("name"));
+						CustomExpr->Inputs.Add(NewInput);
+					}
+				}
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* AddOutputsArray = nullptr;
+			if (CustomObj->TryGetArrayField(TEXT("additional_outputs"), AddOutputsArray))
+			{
+				CustomExpr->AdditionalOutputs.Empty();
+				for (const TSharedPtr<FJsonValue>& OutVal : *AddOutputsArray)
+				{
+					const TSharedPtr<FJsonObject>* OutObjPtr = nullptr;
+					if (OutVal && OutVal->TryGetObject(OutObjPtr) && OutObjPtr)
+					{
+						FCustomOutput NewOutput;
+						NewOutput.OutputName = *(*OutObjPtr)->GetStringField(TEXT("name"));
+						if ((*OutObjPtr)->HasField(TEXT("type")))
+						{
+							NewOutput.OutputType = ParseCustomOutputType((*OutObjPtr)->GetStringField(TEXT("type")));
+						}
+						CustomExpr->AdditionalOutputs.Add(NewOutput);
+					}
+				}
+			}
+
+			CustomExpr->RebuildOutputs();
+			IdToExpr.Add(Id, CustomExpr);
+			OutNodesCreated++;
+		}
+	}
+
+	// Phase 3 — Wire connections between expressions
+	const TArray<TSharedPtr<FJsonValue>>* ConnsArray = nullptr;
+	if (Spec->TryGetArrayField(TEXT("connections"), ConnsArray))
+	{
+		for (const TSharedPtr<FJsonValue>& ConnVal : *ConnsArray)
+		{
+			const TSharedPtr<FJsonObject>* ConnObjPtr = nullptr;
+			if (!ConnVal || !ConnVal->TryGetObject(ConnObjPtr) || !ConnObjPtr)
+			{
+				continue;
+			}
+			const TSharedPtr<FJsonObject>& ConnObj = *ConnObjPtr;
+
+			FString FromId = ConnObj->GetStringField(TEXT("from"));
+			FString ToId = ConnObj->GetStringField(TEXT("to"));
+			FString FromPin = ConnObj->HasField(TEXT("from_pin")) ? ConnObj->GetStringField(TEXT("from_pin")) : TEXT("");
+			FString ToPin = ConnObj->HasField(TEXT("to_pin")) ? ConnObj->GetStringField(TEXT("to_pin")) : TEXT("");
+
+			UMaterialExpression** FromPtr = IdToExpr.Find(FromId);
+			UMaterialExpression** ToPtr = IdToExpr.Find(ToId);
+
+			if (!FromPtr || !*FromPtr)
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("connection"), FString::Printf(TEXT("%s -> %s"), *FromId, *ToId));
+				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Source node '%s' not found"), *FromId));
+				OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+				continue;
+			}
+			if (!ToPtr || !*ToPtr)
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("connection"), FString::Printf(TEXT("%s -> %s"), *FromId, *ToId));
+				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Target node '%s' not found"), *ToId));
+				OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+				continue;
+			}
+
+			bool bConnected = UMaterialEditingLibrary::ConnectMaterialExpressions(*FromPtr, FromPin, *ToPtr, ToPin);
+			if (bConnected)
+			{
+				OutConnectionsMade++;
+			}
+			else
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("connection"), FString::Printf(TEXT("%s.%s -> %s.%s"), *FromId, *FromPin, *ToId, *ToPin));
+				ErrJson->SetStringField(TEXT("error"), TEXT("ConnectMaterialExpressions returned false"));
+				OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+			}
+		}
+	}
+}
+
+// ============================================================================
+// Action: create_material_function
+// Params: { "asset_path", "description"?, "expose_to_library"?, "library_categories"? }
+// Creates a new UMaterialFunction asset.
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::CreateMaterialFunction(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	// Extract package path and asset name
+	FString PackagePath, AssetName;
+	int32 LastSlash;
+	if (AssetPath.FindLastChar('/', LastSlash))
+	{
+		PackagePath = AssetPath.Left(LastSlash);
+		AssetName = AssetPath.Mid(LastSlash + 1);
+	}
+	else
+	{
+		return FMonolithActionResult::Error(TEXT("Invalid asset path — must contain at least one '/' (e.g. /Game/Materials/Functions/MF_MyFunc)"));
+	}
+
+	if (AssetName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Asset name is empty"));
+	}
+
+	// Check if asset already exists
+	UObject* Existing = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (Existing)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+	}
+
+	// Create package and material function
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+	}
+
+	UMaterialFunction* NewFunc = NewObject<UMaterialFunction>(Pkg, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional);
+	if (!NewFunc)
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to create UMaterialFunction object"));
+	}
+
+	// Set optional properties
+	if (Params->HasField(TEXT("description")))
+	{
+		NewFunc->Description = Params->GetStringField(TEXT("description"));
+	}
+
+	bool bExposeToLibrary = Params->HasField(TEXT("expose_to_library"))
+		? Params->GetBoolField(TEXT("expose_to_library"))
+		: true;
+	NewFunc->bExposeToLibrary = bExposeToLibrary;
+
+	// LibraryCategories was renamed to LibraryCategoriesText (TArray<FString> → TArray<FText>) in UE 5.x
+	const TArray<TSharedPtr<FJsonValue>>* CategoriesArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("library_categories"), CategoriesArray))
+	{
+		NewFunc->LibraryCategoriesText.Empty();
+		for (const TSharedPtr<FJsonValue>& CatVal : *CategoriesArray)
+		{
+			if (CatVal)
+			{
+				NewFunc->LibraryCategoriesText.Add(FText::FromString(CatVal->AsString()));
+			}
+		}
+	}
+
+	// Register with asset registry
+	FAssetRegistryModule::AssetCreated(NewFunc);
+	Pkg->MarkPackageDirty();
+
+	// Save to disk
+	FString PackageFilename = FPackageName::LongPackageNameToFilename(AssetPath, FPackageName::GetAssetPackageExtension());
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	UPackage::SavePackage(Pkg, NewFunc, *PackageFilename, SaveArgs);
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), NewFunc->GetPathName());
+	ResultJson->SetStringField(TEXT("asset_name"), AssetName);
+	ResultJson->SetStringField(TEXT("description"), NewFunc->Description);
+	ResultJson->SetBoolField(TEXT("expose_to_library"), bExposeToLibrary);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: build_function_graph
+// Params: { "asset_path", "graph_spec": { inputs, outputs, nodes, custom_hlsl_nodes, connections }, "clear_existing"? }
+// Builds a material function graph from JSON spec. Same schema as build_material_graph
+// but with function inputs[] and outputs[] definitions.
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::BuildFunctionGraph(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	bool bClearExisting = Params->HasField(TEXT("clear_existing")) ? Params->GetBoolField(TEXT("clear_existing")) : false;
+
+	// Load the material function
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+	UMaterialFunction* Func = Cast<UMaterialFunction>(LoadedAsset);
+	if (!Func)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset '%s' is not a UMaterialFunction"), *AssetPath));
+	}
+
+	// Parse graph_spec (object or JSON string)
+	TSharedPtr<FJsonObject> Spec;
+	if (Params->HasTypedField<EJson::Object>(TEXT("graph_spec")))
+	{
+		Spec = Params->GetObjectField(TEXT("graph_spec"));
+	}
+	else if (Params->HasTypedField<EJson::String>(TEXT("graph_spec")))
+	{
+		FString GraphSpecJson = Params->GetStringField(TEXT("graph_spec"));
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(GraphSpecJson);
+		if (!FJsonSerializer::Deserialize(Reader, Spec) || !Spec.IsValid())
+		{
+			return FMonolithActionResult::Error(TEXT("Failed to parse graph_spec JSON string"));
+		}
+	}
+	else
+	{
+		return FMonolithActionResult::Error(TEXT("Missing 'graph_spec' parameter"));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> ErrorsArray;
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("BuildFunctionGraph")));
+	Func->Modify();
+
+	if (bClearExisting)
+	{
+		// Copy to local array to avoid iterator invalidation during deletion
+		TArray<UMaterialExpression*> ToDelete;
+		for (const TObjectPtr<UMaterialExpression>& Expr : Func->GetExpressions())
+		{
+			if (Expr)
+			{
+				ToDelete.Add(Expr);
+			}
+		}
+		for (UMaterialExpression* Expr : ToDelete)
+		{
+			UMaterialEditingLibrary::DeleteMaterialExpression(nullptr, Expr);
+		}
+	}
+
+	TMap<FString, UMaterialExpression*> IdToExpr;
+
+	// Seed remap table with pre-existing expressions
+	for (const TObjectPtr<UMaterialExpression>& Expr : Func->GetExpressions())
+	{
+		if (Expr)
+		{
+			IdToExpr.Add(Expr->GetName(), Expr.Get());
+		}
+	}
+
+	// Create expression lambda that uses CreateMaterialExpressionInFunction
+	FCreateExpressionFunc CreateFunc = [Func](UClass* ExprClass, int32 PosX, int32 PosY) -> UMaterialExpression*
+	{
+		return UMaterialEditingLibrary::CreateMaterialExpressionInFunction(Func, ExprClass, PosX, PosY);
+	};
+
+	int32 NodesCreated = 0;
+	int32 ConnectionsMade = 0;
+	int32 InputCount = 0;
+	int32 OutputCount = 0;
+
+	// Phase 0a — Create FunctionInput nodes from spec
+	const TArray<TSharedPtr<FJsonValue>>* FuncInputsArray = nullptr;
+	if (Spec->TryGetArrayField(TEXT("inputs"), FuncInputsArray))
+	{
+		for (const TSharedPtr<FJsonValue>& InputVal : *FuncInputsArray)
+		{
+			const TSharedPtr<FJsonObject>* InputObjPtr = nullptr;
+			if (!InputVal || !InputVal->TryGetObject(InputObjPtr) || !InputObjPtr)
+			{
+				continue;
+			}
+			const TSharedPtr<FJsonObject>& InputObj = *InputObjPtr;
+
+			FString InputName = InputObj->GetStringField(TEXT("name"));
+			FString InputId = InputObj->HasField(TEXT("id")) ? InputObj->GetStringField(TEXT("id")) : InputName;
+
+			// Position: spread inputs vertically, allow override
+			int32 PosX = -400;
+			int32 PosY = InputCount * 200;
+			const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
+			if (InputObj->TryGetArrayField(TEXT("pos"), PosArray) && PosArray->Num() >= 2)
+			{
+				PosX = static_cast<int32>((*PosArray)[0]->AsNumber());
+				PosY = static_cast<int32>((*PosArray)[1]->AsNumber());
+			}
+
+			UMaterialExpression* BaseExpr = UMaterialEditingLibrary::CreateMaterialExpressionInFunction(
+				Func, UMaterialExpressionFunctionInput::StaticClass(), PosX, PosY);
+			UMaterialExpressionFunctionInput* FuncInput = Cast<UMaterialExpressionFunctionInput>(BaseExpr);
+			if (!FuncInput)
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("input"), InputName);
+				ErrJson->SetStringField(TEXT("error"), TEXT("Failed to create FunctionInput expression"));
+				ErrorsArray.Add(MakeShared<FJsonValueObject>(ErrJson));
+				continue;
+			}
+
+			FuncInput->InputName = *InputName;
+
+			// Parse input type via StaticEnum
+			if (InputObj->HasField(TEXT("type")))
+			{
+				FString TypeStr = InputObj->GetStringField(TEXT("type"));
+				FString EnumError;
+				EFunctionInputType InputType;
+				if (ParseEnum<EFunctionInputType>(TypeStr, InputType, EnumError))
+				{
+					FuncInput->InputType = InputType;
+				}
+				else
+				{
+					auto ErrJson = MakeShared<FJsonObject>();
+					ErrJson->SetStringField(TEXT("input"), InputName);
+					ErrJson->SetStringField(TEXT("warning"), FString::Printf(TEXT("input type: %s — defaulting to Scalar"), *EnumError));
+					ErrorsArray.Add(MakeShared<FJsonValueObject>(ErrJson));
+				}
+			}
+
+			if (InputObj->HasField(TEXT("sort_priority")))
+			{
+				FuncInput->SortPriority = static_cast<int32>(InputObj->GetNumberField(TEXT("sort_priority")));
+			}
+			else
+			{
+				FuncInput->SortPriority = InputCount;
+			}
+
+			if (InputObj->HasField(TEXT("description")))
+			{
+				FuncInput->Description = InputObj->GetStringField(TEXT("description"));
+			}
+
+			if (InputObj->HasField(TEXT("preview_value")))
+			{
+				FuncInput->bUsePreviewValueAsDefault = true;
+				// Preview value is connected via the Preview input pin, not set directly as a number.
+				// The user should provide a preview_value node in the nodes array and wire it.
+			}
+
+			IdToExpr.Add(InputId, FuncInput);
+			InputCount++;
+			NodesCreated++;
+		}
+	}
+
+	// Phase 0b — Create FunctionOutput nodes from spec
+	const TArray<TSharedPtr<FJsonValue>>* FuncOutputsArray = nullptr;
+	if (Spec->TryGetArrayField(TEXT("outputs"), FuncOutputsArray))
+	{
+		for (const TSharedPtr<FJsonValue>& OutputVal : *FuncOutputsArray)
+		{
+			const TSharedPtr<FJsonObject>* OutputObjPtr = nullptr;
+			if (!OutputVal || !OutputVal->TryGetObject(OutputObjPtr) || !OutputObjPtr)
+			{
+				continue;
+			}
+			const TSharedPtr<FJsonObject>& OutputObj = *OutputObjPtr;
+
+			FString OutputName = OutputObj->GetStringField(TEXT("name"));
+			FString OutputId = OutputObj->HasField(TEXT("id")) ? OutputObj->GetStringField(TEXT("id")) : OutputName;
+
+			// Position: spread outputs vertically on the right, allow override
+			int32 PosX = 400;
+			int32 PosY = OutputCount * 200;
+			const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
+			if (OutputObj->TryGetArrayField(TEXT("pos"), PosArray) && PosArray->Num() >= 2)
+			{
+				PosX = static_cast<int32>((*PosArray)[0]->AsNumber());
+				PosY = static_cast<int32>((*PosArray)[1]->AsNumber());
+			}
+
+			UMaterialExpression* BaseExpr = UMaterialEditingLibrary::CreateMaterialExpressionInFunction(
+				Func, UMaterialExpressionFunctionOutput::StaticClass(), PosX, PosY);
+			UMaterialExpressionFunctionOutput* FuncOutput = Cast<UMaterialExpressionFunctionOutput>(BaseExpr);
+			if (!FuncOutput)
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("output"), OutputName);
+				ErrJson->SetStringField(TEXT("error"), TEXT("Failed to create FunctionOutput expression"));
+				ErrorsArray.Add(MakeShared<FJsonValueObject>(ErrJson));
+				continue;
+			}
+
+			FuncOutput->OutputName = *OutputName;
+
+			if (OutputObj->HasField(TEXT("sort_priority")))
+			{
+				FuncOutput->SortPriority = static_cast<int32>(OutputObj->GetNumberField(TEXT("sort_priority")));
+			}
+			else
+			{
+				FuncOutput->SortPriority = OutputCount;
+			}
+
+			if (OutputObj->HasField(TEXT("description")))
+			{
+				FuncOutput->Description = OutputObj->GetStringField(TEXT("description"));
+			}
+
+			IdToExpr.Add(OutputId, FuncOutput);
+			OutputCount++;
+			NodesCreated++;
+		}
+	}
+
+	// Phases 1-3 — Standard nodes, Custom HLSL, and connections (shared logic)
+	int32 SharedNodesCreated = 0, SharedConnectionsMade = 0;
+	BuildGraphFromSpec(Spec, CreateFunc, IdToExpr, SharedNodesCreated, SharedConnectionsMade, ErrorsArray);
+	NodesCreated += SharedNodesCreated;
+	ConnectionsMade += SharedConnectionsMade;
+
+	// Update the function to propagate changes to dependent materials
+	UMaterialEditingLibrary::UpdateMaterialFunction(Func, nullptr);
+
+	GEditor->EndTransaction();
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	// Separate errors from warnings
+	int32 ErrorCount = 0, WarningCount = 0;
+	for (const TSharedPtr<FJsonValue>& Entry : ErrorsArray)
+	{
+		if (Entry->AsObject()->HasField(TEXT("warning"))) WarningCount++;
+		else ErrorCount++;
+	}
+	ResultJson->SetBoolField(TEXT("has_errors"), ErrorCount > 0);
+	ResultJson->SetBoolField(TEXT("has_warnings"), WarningCount > 0);
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetNumberField(TEXT("nodes_created"), NodesCreated);
+	ResultJson->SetNumberField(TEXT("connections_made"), ConnectionsMade);
+	ResultJson->SetNumberField(TEXT("input_count"), InputCount);
+	ResultJson->SetNumberField(TEXT("output_count"), OutputCount);
+
+	auto IdMapJson = MakeShared<FJsonObject>();
+	for (const auto& Pair : IdToExpr)
+	{
+		if (Pair.Value)
+		{
+			IdMapJson->SetStringField(Pair.Key, Pair.Value->GetName());
+		}
+	}
+	ResultJson->SetObjectField(TEXT("id_to_name"), IdMapJson);
+	ResultJson->SetArrayField(TEXT("errors"), ErrorsArray);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: get_function_info
+// Params: { "asset_path" }
+// Returns detailed info about a material function — inputs, outputs, description,
+// categories, and full expression list.
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::GetFunctionInfo(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+
+	// UMaterialFunction is the base class for layers and layer blends too
+	UMaterialFunction* MatFunc = Cast<UMaterialFunction>(LoadedAsset);
+	if (!MatFunc)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset '%s' is not a MaterialFunction"), *AssetPath));
+	}
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetStringField(TEXT("description"), MatFunc->Description);
+	ResultJson->SetBoolField(TEXT("expose_to_library"), MatFunc->bExposeToLibrary);
+
+	// Determine specific type
+	if (Cast<UMaterialFunctionMaterialLayer>(LoadedAsset))
+	{
+		ResultJson->SetStringField(TEXT("type"), TEXT("MaterialLayer"));
+	}
+	else if (Cast<UMaterialFunctionMaterialLayerBlend>(LoadedAsset))
+	{
+		ResultJson->SetStringField(TEXT("type"), TEXT("MaterialLayerBlend"));
+	}
+	else
+	{
+		ResultJson->SetStringField(TEXT("type"), TEXT("MaterialFunction"));
+	}
+
+	// Library categories (LibraryCategoriesText — renamed from LibraryCategories)
+	TArray<TSharedPtr<FJsonValue>> CatsJson;
+	for (const FText& Cat : MatFunc->LibraryCategoriesText)
+	{
+		CatsJson.Add(MakeShared<FJsonValueString>(Cat.ToString()));
+	}
+	ResultJson->SetArrayField(TEXT("library_categories"), CatsJson);
+
+	// Walk expressions to collect inputs, outputs, and expression list
+	TArray<TSharedPtr<FJsonValue>> InputsJson;
+	TArray<TSharedPtr<FJsonValue>> OutputsJson;
+	TArray<TSharedPtr<FJsonValue>> ExpressionsJson;
+
+	const UEnum* InputTypeEnum = StaticEnum<EFunctionInputType>();
+
+	TConstArrayView<TObjectPtr<UMaterialExpression>> FuncExprs = MatFunc->GetExpressions();
+	for (const TObjectPtr<UMaterialExpression>& Expr : FuncExprs)
+	{
+		if (!Expr)
+		{
+			continue;
+		}
+
+		if (const auto* FuncInput = Cast<UMaterialExpressionFunctionInput>(Expr))
+		{
+			auto InputJson = MakeShared<FJsonObject>();
+			InputJson->SetStringField(TEXT("name"), FuncInput->InputName.ToString());
+			InputJson->SetStringField(TEXT("expression_name"), FuncInput->GetName());
+			InputJson->SetNumberField(TEXT("sort_priority"), FuncInput->SortPriority);
+
+			// Map InputType enum to readable string
+			if (InputTypeEnum)
+			{
+				FString TypeStr = InputTypeEnum->GetNameStringByIndex(static_cast<int32>(FuncInput->InputType));
+				TypeStr.RemoveFromStart(TEXT("FunctionInput_"));
+				InputJson->SetStringField(TEXT("type"), TypeStr);
+			}
+			InputJson->SetStringField(TEXT("description"), FuncInput->Description);
+			InputJson->SetBoolField(TEXT("use_preview_value_as_default"), FuncInput->bUsePreviewValueAsDefault);
+
+			InputsJson.Add(MakeShared<FJsonValueObject>(InputJson));
+		}
+
+		if (const auto* FuncOutput = Cast<UMaterialExpressionFunctionOutput>(Expr))
+		{
+			auto OutputJson = MakeShared<FJsonObject>();
+			OutputJson->SetStringField(TEXT("name"), FuncOutput->OutputName.ToString());
+			OutputJson->SetStringField(TEXT("expression_name"), FuncOutput->GetName());
+			OutputJson->SetNumberField(TEXT("sort_priority"), FuncOutput->SortPriority);
+			OutputJson->SetStringField(TEXT("description"), FuncOutput->Description);
+
+			OutputsJson.Add(MakeShared<FJsonValueObject>(OutputJson));
+		}
+
+		auto ExprJson = MakeShared<FJsonObject>();
+		ExprJson->SetStringField(TEXT("name"), Expr->GetName());
+		ExprJson->SetStringField(TEXT("class"), Expr->GetClass()->GetName());
+		ExprJson->SetNumberField(TEXT("pos_x"), Expr->MaterialExpressionEditorX);
+		ExprJson->SetNumberField(TEXT("pos_y"), Expr->MaterialExpressionEditorY);
+		ExpressionsJson.Add(MakeShared<FJsonValueObject>(ExprJson));
+	}
+
+	// Sort inputs and outputs by sort priority
+	InputsJson.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+	{
+		return A->AsObject()->GetNumberField(TEXT("sort_priority")) < B->AsObject()->GetNumberField(TEXT("sort_priority"));
+	});
+	OutputsJson.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+	{
+		return A->AsObject()->GetNumberField(TEXT("sort_priority")) < B->AsObject()->GetNumberField(TEXT("sort_priority"));
+	});
+
+	ResultJson->SetArrayField(TEXT("inputs"), InputsJson);
+	ResultJson->SetArrayField(TEXT("outputs"), OutputsJson);
+	ResultJson->SetArrayField(TEXT("expressions"), ExpressionsJson);
+	ResultJson->SetNumberField(TEXT("expression_count"), ExpressionsJson.Num());
+	ResultJson->SetNumberField(TEXT("input_count"), InputsJson.Num());
+	ResultJson->SetNumberField(TEXT("output_count"), OutputsJson.Num());
 
 	return FMonolithActionResult::Success(ResultJson);
 }

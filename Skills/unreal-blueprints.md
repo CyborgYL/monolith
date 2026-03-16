@@ -5,7 +5,7 @@ description: Use when working with Unreal Engine Blueprints via Monolith MCP —
 
 # Unreal Blueprint Workflows
 
-You have access to **Monolith** with 55 Blueprint actions via `blueprint_query()`.
+You have access to **Monolith** with 59 Blueprint actions via `blueprint_query()`.
 
 ## Discovery
 
@@ -128,6 +128,15 @@ monolith_discover({ namespace: "blueprint" })
 **`add_variable` type aliases:** `"integer"` → int, `"vector"` → Vector, `"color"` → LinearColor, `"rotator"` → Rotator, `"transform"` → Transform. Unknown types return error with valid type list.
 
 **`create_blueprint`** supports `skip_save` param to defer the asset save.
+
+### Scaffolding & Events (4)
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `scaffold_interface_implementation` | `asset_path`, `interface_class` | Add interface + create stub function graphs in one call |
+| `add_timeline` | `asset_path`, `timeline_name`?, `auto_play`?, `loop`? | Create timeline node with template + GUID linkage. Returns timeline_guid |
+| `add_event_node` | `asset_path`, `event_name` | Create override events (BeginPlay, Tick, etc.) or custom events. Alias table for common names |
+| `add_comment_node` | `asset_path`, `text`, `node_ids`?, `color`? | Add comment box, optionally enclosing specified nodes |
 
 ## Common Workflows
 

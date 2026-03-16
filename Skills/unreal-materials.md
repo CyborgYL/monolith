@@ -5,7 +5,7 @@ description: Use when creating, editing, or inspecting Unreal Engine materials v
 
 # Unreal Material Workflows
 
-You have access to **Monolith** with 41 material actions via `material_query()`.
+You have access to **Monolith** with 44 material actions via `material_query()`.
 
 ## Discovery
 
@@ -27,9 +27,9 @@ All asset paths follow UE content browser format (no .uasset extension):
 
 - `asset_path` — the material asset path (NOT `asset`)
 
-## Action Reference (41 actions)
+## Action Reference (44 actions)
 
-### Read Actions (15)
+### Read Actions (16)
 | Action | Key Params | Purpose |
 |--------|-----------|---------|
 | `get_all_expressions` | `asset_path` | List all expression nodes in a material |
@@ -43,6 +43,7 @@ All asset paths follow UE content browser format (no .uasset extension):
 | `list_expression_classes` | `filter`?, `category`? | List all available expression classes with pin counts. Cached after first call |
 | `get_expression_pin_info` | `class_name` | Query pin names/types for an expression class without creating an instance in a material |
 | `list_material_instances` | `parent_path`, `recursive`? | Find all instances of a parent material. Recursive walks instance-of-instance trees |
+| `get_function_info` | `asset_path` | Read material function inputs, outputs, description, expression list |
 | `export_material_graph` | `asset_path`, `include_properties`?, `include_positions`? | Serialize graph as JSON. Pass `include_properties: false` to reduce ~70% |
 | `get_thumbnail` | `asset_path`, `save_to_file`? | Get thumbnail. Use `save_to_file: true` — inline base64 wastes context |
 | `validate_material` | `asset_path`, `fix_issues`? | Check for broken connections, unused nodes, errors |
@@ -56,6 +57,12 @@ All asset paths follow UE content browser format (no .uasset extension):
 | `set_instance_parent` | `asset_path`, `new_parent` | Reparent a material instance. Reports lost/kept parameters |
 | `clear_instance_parameter` | `asset_path`, `parameter_name`, `parameter_type`? | Remove a single override (reverts to parent). Use type `"all"` to clear everything |
 | `save_material` | `asset_path`, `only_if_dirty`? | Save material to disk. One-liner |
+
+### Function Actions (2)
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `create_material_function` | `asset_path`, `description`?, `expose_to_library`? | Create a new material function asset |
+| `build_function_graph` | `asset_path`, `graph_spec` (with `inputs`, `outputs`, `nodes`, `connections`) | Build function graph with typed I/O. Same node spec as build_material_graph |
 
 ### Write Actions (21)
 | Action | Key Params | Purpose |

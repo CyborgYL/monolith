@@ -6,6 +6,7 @@
 #include "BlueprintEditorLibrary.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
+#include "K2Node_Event.h"
 #include "EdGraphSchema_K2.h"
 
 // --- Registration ---
@@ -93,6 +94,16 @@ void FMonolithBlueprintGraphActions::RegisterActions(FMonolithToolRegistry& Regi
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
 			.Required(TEXT("new_parent_class"), TEXT("string"), TEXT("New parent class name"))
+			.Build());
+
+	// ---- Wave 5 ----
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("scaffold_interface_implementation"),
+		TEXT("Add an interface to a Blueprint AND create all stub function graphs in one call. Returns the interface name and list of created graphs. Much more useful than implement_interface alone — this one actually wires up the stubs."),
+		FMonolithActionHandler::CreateStatic(&HandleScaffoldInterfaceImplementation),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),       TEXT("string"), TEXT("Blueprint asset path"))
+			.Required(TEXT("interface_class"),   TEXT("string"), TEXT("Interface class name (e.g. BPI_Interactable or IBpi_Interactable)"))
 			.Build());
 }
 
@@ -596,6 +607,130 @@ FMonolithActionResult FMonolithBlueprintGraphActions::HandleRemoveInterface(cons
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("interface_class"), InterfaceClassName);
 	Root->SetBoolField(TEXT("functions_preserved"), bPreserveFunctions);
+	return FMonolithActionResult::Success(Root);
+}
+
+// --- scaffold_interface_implementation ---
+
+FMonolithActionResult FMonolithBlueprintGraphActions::HandleScaffoldInterfaceImplementation(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString InterfaceClassName = Params->GetStringField(TEXT("interface_class"));
+	if (InterfaceClassName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: interface_class"));
+	}
+
+	// Resolve the interface class — try as-is, then strip leading 'I', then add 'U' prefix
+	UClass* InterfaceClass = FindFirstObject<UClass>(*InterfaceClassName, EFindFirstObjectOptions::NativeFirst);
+	if (!InterfaceClass && InterfaceClassName.StartsWith(TEXT("I")))
+	{
+		// Blueprint interfaces typically have U prefix in the class system (e.g. IBpi_Interactable -> UBpi_Interactable)
+		InterfaceClass = FindFirstObject<UClass>(*FString::Printf(TEXT("U%s"), *InterfaceClassName.Mid(1)), EFindFirstObjectOptions::NativeFirst);
+	}
+	if (!InterfaceClass)
+	{
+		InterfaceClass = FindFirstObject<UClass>(*FString::Printf(TEXT("U%s"), *InterfaceClassName), EFindFirstObjectOptions::NativeFirst);
+	}
+	if (!InterfaceClass)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Interface class not found: %s"), *InterfaceClassName));
+	}
+
+	if (!InterfaceClass->HasAnyClassFlags(CLASS_Interface))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Class '%s' is not an interface"), *InterfaceClassName));
+	}
+
+	// Check if already implemented
+	bool bAlreadyImplemented = false;
+	for (const FBPInterfaceDescription& Existing : BP->ImplementedInterfaces)
+	{
+		if (Existing.Interface == InterfaceClass)
+		{
+			bAlreadyImplemented = true;
+			break;
+		}
+	}
+
+	// Snapshot function graph names before implementing so we can detect which were newly created
+	TSet<FName> GraphsBefore;
+	for (const UEdGraph* G : BP->FunctionGraphs)
+	{
+		if (G) GraphsBefore.Add(G->GetFName());
+	}
+	TSet<FName> UbergraphsBefore;
+	for (const UEdGraph* G : BP->UbergraphPages)
+	{
+		if (G) UbergraphsBefore.Add(G->GetFName());
+	}
+
+	if (!bAlreadyImplemented)
+	{
+		// ImplementNewInterface requires FTopLevelAssetPath (not the deprecated FName overload)
+		const bool bAdded = FBlueprintEditorUtils::ImplementNewInterface(BP, InterfaceClass->GetClassPathName());
+		if (!bAdded)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("ImplementNewInterface failed for: %s"), *InterfaceClassName));
+		}
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+	}
+
+	// Collect newly created graphs — compare against pre-implementation snapshots
+	// Functions with return values get function graphs; void functions become event nodes in the ubergraph
+	TArray<TSharedPtr<FJsonValue>> FunctionsCreated;
+
+	for (const UEdGraph* G : BP->FunctionGraphs)
+	{
+		if (!G) continue;
+		if (GraphsBefore.Contains(G->GetFName())) continue;
+
+		TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+		Entry->SetStringField(TEXT("name"), G->GetName());
+		Entry->SetStringField(TEXT("graph_name"), G->GetName());
+		Entry->SetBoolField(TEXT("is_event"), false);
+		FunctionsCreated.Add(MakeShared<FJsonValueObject>(Entry));
+	}
+
+	// Also detect new event nodes added to ubergraph pages (void interface functions)
+	for (const UEdGraph* G : BP->UbergraphPages)
+	{
+		if (!G) continue;
+		for (const UEdGraphNode* Node : G->Nodes)
+		{
+			if (const UK2Node_Event* EvNode = Cast<UK2Node_Event>(Node))
+			{
+				// Interface events added by ImplementNewInterface will be overrides
+				if (EvNode->bOverrideFunction)
+				{
+					// Check that this event's function is from the interface we just added
+					if (EvNode->EventReference.GetMemberParentClass() == InterfaceClass ||
+						InterfaceClass->FindFunctionByName(EvNode->EventReference.GetMemberName()))
+					{
+						// Was this node in the ubergraph before? We don't have per-node snapshot,
+						// so report all override events belonging to this interface.
+						// When already_implemented=true, we still list them so the caller knows what's there.
+						TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+						Entry->SetStringField(TEXT("name"), EvNode->EventReference.GetMemberName().ToString());
+						Entry->SetStringField(TEXT("graph_name"), G->GetName());
+						Entry->SetBoolField(TEXT("is_event"), true);
+						FunctionsCreated.Add(MakeShared<FJsonValueObject>(Entry));
+					}
+				}
+			}
+		}
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("interface_name"), InterfaceClass->GetName());
+	Root->SetArrayField(TEXT("functions_created"), FunctionsCreated);
+	Root->SetBoolField(TEXT("already_implemented"), bAlreadyImplemented);
 	return FMonolithActionResult::Success(Root);
 }
 
