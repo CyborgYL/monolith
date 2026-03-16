@@ -10,19 +10,21 @@ class UNiagaraNodeFunctionCall;
 class UNiagaraScript;
 class UNiagaraGraph;
 class UNiagaraRendererProperties;
+class UNiagaraDataInterface;
 struct FVersionedNiagaraEmitterData;
 struct FNiagaraVariable;
 struct FNiagaraParameterStore;
 
 /**
  * Niagara domain action handlers for Monolith.
- * 51 actions across 9 domains (Wave 1 bug fixes + Wave 2 summary/discovery).
+ * 64 actions across system, module, parameter, renderer, DI, diagnostics, and advanced domains.
+ * Waves 1-6 implementation (bug fixes + 17 new actions).
  * Fixed for UE 5.7 API compatibility.
  */
 class FMonolithNiagaraActions
 {
 public:
-	/** Register all 51 niagara actions with the tool registry */
+	/** Register all 64 niagara actions with the tool registry */
 	static void RegisterActions(FMonolithToolRegistry& Registry);
 
 	// --- System (8) ---
@@ -68,7 +70,7 @@ public:
 	static FMonolithActionResult HandleGetRendererBindings(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetRendererBinding(const TSharedPtr<FJsonObject>& Params);
 
-	// --- Read (2) ---
+	// --- Read/Discovery (4) ---
 	static FMonolithActionResult HandleListEmitters(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleListRenderers(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleListModuleScripts(const TSharedPtr<FJsonObject>& Params);
@@ -94,6 +96,33 @@ public:
 	// --- Static Switch (1) ---
 	static FMonolithActionResult HandleSetStaticSwitchValue(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Wave 2: Summary & Discovery (4 new) ---
+	static FMonolithActionResult HandleGetSystemSummary(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetEmitterSummary(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleListEmitterProperties(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetModuleInputValue(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 3: DI Curve & Configuration (2 new) ---
+	static FMonolithActionResult HandleConfigureCurveKeys(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleConfigureDataInterface(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 4: System Management (5 new) ---
+	static FMonolithActionResult HandleDuplicateSystem(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetFixedBounds(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetEffectType(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateEmitter(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleExportSystemSpec(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 5: Dynamic Inputs (3 new) ---
+	static FMonolithActionResult HandleAddDynamicInput(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetDynamicInputValue(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSearchDynamicInputs(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 6: Advanced (3 new) ---
+	static FMonolithActionResult HandleAddEventHandler(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleValidateSystem(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddSimulationStage(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);
 
@@ -106,6 +135,7 @@ private:
 	static UNiagaraGraph* GetGraphForUsage(UNiagaraSystem* System, const FString& EmitterHandleId, ENiagaraScriptUsage Usage);
 	static UNiagaraNodeOutput* FindOutputNode(UNiagaraSystem* System, const FString& EmitterHandleId, ENiagaraScriptUsage Usage);
 	static UNiagaraNodeFunctionCall* FindModuleNode(UNiagaraSystem* System, const FString& EmitterHandleId, const FString& NodeGuidStr, ENiagaraScriptUsage* OutUsage = nullptr);
+	static UNiagaraNodeFunctionCall* FindFunctionCallNode(UNiagaraSystem* System, const FString& EmitterHandleId, const FString& NodeGuidStr);
 	static UClass* ResolveRendererClass(const FString& RendererClass);
 	static UNiagaraRendererProperties* GetRenderer(UNiagaraSystem* System, const FString& EmitterHandleId, int32 RendererIndex, FVersionedNiagaraEmitterData** OutEmitterData = nullptr);
 	static FNiagaraTypeDefinition ResolveNiagaraType(const FString& TypeName);
@@ -113,6 +143,9 @@ private:
 	static FString JsonObjectToString(const TSharedRef<FJsonObject>& JsonObj);
 	static FString JsonArrayToString(const TArray<TSharedPtr<FJsonValue>>& JsonArray);
 	static FString JsonValueToString(const TSharedPtr<FJsonValue>& Value);
+
+	// DI override resolution helper — walks override pin upstream to find the DI UObject
+	static UNiagaraDataInterface* FindDIFromOverridePin(UNiagaraNodeFunctionCall* ModuleNode, const FName& MatchedFullName, const FNiagaraTypeDefinition& InputType);
 
 	// HLSL script creation helper
 	static FMonolithActionResult CreateScriptFromHLSL(const TSharedPtr<FJsonObject>& Params, ENiagaraScriptUsage Usage);

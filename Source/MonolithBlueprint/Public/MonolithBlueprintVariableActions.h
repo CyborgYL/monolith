@@ -14,4 +14,7 @@ public:
 	static FMonolithActionResult HandleSetVariableDefaults(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddLocalVariable(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleRemoveLocalVariable(const TSharedPtr<FJsonObject>& Params);
+
+	// Wave 7 — Advanced
+	static FMonolithActionResult HandleAddReplicatedVariable(const TSharedPtr<FJsonObject>& Params);
 };

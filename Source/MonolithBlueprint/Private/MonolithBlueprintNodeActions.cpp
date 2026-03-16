@@ -15,6 +15,7 @@
 #include "K2Node_MacroInstance.h"
 #include "K2Node_ExecutionSequence.h"
 #include "K2Node_SpawnActorFromClass.h"
+#include "K2Node_DynamicCast.h"
 #include "K2Node_Timeline.h"
 #include "K2Node_Event.h"
 #include "EdGraphNode_Comment.h"
@@ -45,6 +46,7 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("event_name"),        TEXT("string"),  TEXT("Custom event name for CustomEvent nodes"))
 			.Optional(TEXT("macro_name"),        TEXT("string"),  TEXT("Macro graph name for MacroInstance nodes"))
 			.Optional(TEXT("macro_blueprint"),   TEXT("string"),  TEXT("Blueprint asset path containing the macro (optional for MacroInstance)"))
+			.Optional(TEXT("cast_class"),        TEXT("string"),  TEXT("Class name for DynamicCast nodes (e.g. 'MyPawn'). Accepts A/U prefix or bare name."))
 			.Optional(TEXT("actor_class"),       TEXT("string"),  TEXT("Actor class name for SpawnActorFromClass nodes"))
 			.Build());
 
@@ -113,7 +115,7 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("batch_execute"),
-		TEXT("Execute multiple Blueprint write operations on a single asset in one transaction. Each operation is { \"op\": \"action_name\", ...action_params_minus_asset_path }. Supported ops: add_node, remove_node, connect_pins, disconnect_pins, set_pin_default, set_node_position, add_variable, remove_variable, rename_variable, set_variable_type, set_variable_defaults, add_local_variable, remove_local_variable, add_component, remove_component, rename_component, reparent_component, set_component_property, duplicate_component, add_function, remove_function, rename_function, add_macro, add_event_dispatcher, set_function_params, implement_interface, remove_interface."),
+		TEXT("Execute multiple Blueprint write operations on a single asset in one transaction. Each operation is { \"op\": \"action_name\", ...action_params_minus_asset_path }. Supported ops: add_node, remove_node, connect_pins, disconnect_pins, set_pin_default, set_node_position, add_variable, remove_variable, rename_variable, set_variable_type, set_variable_defaults, add_local_variable, remove_local_variable, add_component, remove_component, rename_component, reparent_component, set_component_property, duplicate_component, add_function, remove_function, rename_function, add_macro, add_event_dispatcher, set_function_params, implement_interface, remove_interface, scaffold_interface_implementation, add_timeline, add_event_node, add_comment_node, promote_pin_to_variable, add_replicated_variable."),
 		FMonolithActionHandler::CreateStatic(&HandleBatchExecute),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"),         TEXT("string"),  TEXT("Blueprint asset path"))
@@ -190,6 +192,21 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("width"),       TEXT("integer"), TEXT("Comment box width — overridden if node_ids provided"))
 			.Optional(TEXT("height"),      TEXT("integer"), TEXT("Comment box height — overridden if node_ids provided"))
 			.Build());
+
+	// ---- Wave 7 ----
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("promote_pin_to_variable"),
+		TEXT("Promote a scalar pin on an existing node to a Blueprint member variable, then create and wire a VariableGet (for output pins) or VariableSet (for input pins) node in its place. "
+		     "Supports scalar types only (bool, int, float, double, string, name, text, vector, rotator, transform, object refs, soft refs, enums, structs). "
+		     "Container types (Array, Map, Set) are not supported in v1 — use add_variable + manual wiring instead."),
+		FMonolithActionHandler::CreateStatic(&HandlePromotePinToVariable),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),     TEXT("string"), TEXT("Blueprint asset path"))
+			.Required(TEXT("node_id"),        TEXT("string"), TEXT("Node ID containing the pin to promote"))
+			.Required(TEXT("pin_name"),       TEXT("string"), TEXT("Name of the pin to promote to a variable"))
+			.Optional(TEXT("variable_name"),  TEXT("string"), TEXT("Name for the new variable (defaults to pin_name)"))
+			.Optional(TEXT("graph_name"),     TEXT("string"), TEXT("Graph name (searches all graphs if omitted)"))
+			.Build());
 }
 
 // ============================================================
@@ -231,6 +248,9 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 			{TEXT("macro_instance"), TEXT("MacroInstance")},
 			{TEXT("spawn_actor"),    TEXT("SpawnActorFromClass")},
 			{TEXT("spawn"),          TEXT("SpawnActorFromClass")},
+			// Wave 7 — DynamicCast aliases
+			{TEXT("cast"),           TEXT("DynamicCast")},
+			{TEXT("dynamic_cast"),   TEXT("DynamicCast")},
 		};
 		FString Lower = NodeType.ToLower();
 		if (const FString* Canonical = Aliases.Find(Lower))
@@ -490,10 +510,43 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 
 		NewNode = SpawnNode;
 	}
+	// ---- DynamicCast ----
+	else if (NodeType == TEXT("DynamicCast"))
+	{
+		// Accept cast_class as the primary param; actor_class is the deprecated fallback
+		FString CastClassName = Params->GetStringField(TEXT("cast_class"));
+		if (CastClassName.IsEmpty())
+		{
+			CastClassName = Params->GetStringField(TEXT("actor_class"));
+		}
+		if (CastClassName.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT("DynamicCast node requires 'cast_class' (e.g. cast_class=MyPawn)"));
+		}
+
+		UClass* CastClass = FindFirstObject<UClass>(*CastClassName, EFindFirstObjectOptions::NativeFirst);
+		if (!CastClass && !CastClassName.StartsWith(TEXT("A")))
+			CastClass = FindFirstObject<UClass>(*FString::Printf(TEXT("A%s"), *CastClassName), EFindFirstObjectOptions::NativeFirst);
+		if (!CastClass && !CastClassName.StartsWith(TEXT("U")))
+			CastClass = FindFirstObject<UClass>(*FString::Printf(TEXT("U%s"), *CastClassName), EFindFirstObjectOptions::NativeFirst);
+		if (!CastClass)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Class not found for DynamicCast: '%s'"), *CastClassName));
+		}
+
+		UK2Node_DynamicCast* CastNode = NewObject<UK2Node_DynamicCast>(Graph);
+		CastNode->TargetType = CastClass;
+		CastNode->NodePosX = PosX;
+		CastNode->NodePosY = PosY;
+		Graph->AddNode(CastNode, true, false);
+		CastNode->AllocateDefaultPins();
+		NewNode = CastNode;
+	}
 	else
 	{
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Unknown node_type: '%s'. Valid types: CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass"), *NodeType));
+			TEXT("Unknown node_type: '%s'. Valid types: CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast (or 'cast')"), *NodeType));
 	}
 
 	if (!NewNode)
@@ -949,6 +1002,9 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TS
 		else if (OpName == TEXT("add_timeline"))               SubResult = HandleAddTimeline(SubParams);
 		else if (OpName == TEXT("add_event_node"))             SubResult = HandleAddEventNode(SubParams);
 		else if (OpName == TEXT("add_comment_node"))           SubResult = HandleAddCommentNode(SubParams);
+		// Wave 7 advanced ops
+		else if (OpName == TEXT("promote_pin_to_variable"))    SubResult = HandlePromotePinToVariable(SubParams);
+		else if (OpName == TEXT("add_replicated_variable"))    SubResult = FMonolithBlueprintVariableActions::HandleAddReplicatedVariable(SubParams);
 
 		RO->SetBoolField(TEXT("success"), SubResult.bSuccess);
 		if (!SubResult.bSuccess)
@@ -1983,5 +2039,247 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddCommentNode(const 
 	Root->SetObjectField(TEXT("bounds"), Bounds);
 	Root->SetStringField(TEXT("graph"), Graph->GetName());
 
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  promote_pin_to_variable  (Wave 7)
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintNodeActions::HandlePromotePinToVariable(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString NodeId = Params->GetStringField(TEXT("node_id"));
+	if (NodeId.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: node_id"));
+	}
+
+	FString PinName = Params->GetStringField(TEXT("pin_name"));
+	if (PinName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: pin_name"));
+	}
+
+	FString GraphName = Params->GetStringField(TEXT("graph_name"));
+
+	// Find the node
+	UEdGraphNode* SourceNode = MonolithBlueprintInternal::FindNodeById(BP, GraphName, NodeId);
+	if (!SourceNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Node not found: %s"), *NodeId));
+	}
+
+	// Find the pin
+	UEdGraphPin* Pin = MonolithBlueprintInternal::FindPinOnNode(SourceNode, PinName);
+	if (!Pin)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Pin '%s' not found on node '%s'"), *PinName, *NodeId));
+	}
+
+	// Validate: not exec
+	if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+	{
+		return FMonolithActionResult::Error(TEXT("Cannot promote execution (exec) pins to variables"));
+	}
+
+	// Validate: not wildcard
+	if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard)
+	{
+		return FMonolithActionResult::Error(TEXT("Cannot promote wildcard pins to variables — resolve the type first"));
+	}
+
+	// Validate: scalar types only (no containers)
+	if (Pin->PinType.ContainerType != EPinContainerType::None)
+	{
+		return FMonolithActionResult::Error(
+			TEXT("Container types (Array, Map, Set) are not yet supported by promote_pin_to_variable. "
+			     "Use add_variable + manual wiring instead."));
+	}
+
+	// Determine variable name: use provided or default to pin name
+	FString VarNameStr = Params->GetStringField(TEXT("variable_name"));
+	if (VarNameStr.IsEmpty())
+	{
+		VarNameStr = PinName;
+	}
+	FName VarName(*VarNameStr);
+
+	// Check for name collision
+	for (const FBPVariableDescription& Existing : BP->NewVariables)
+	{
+		if (Existing.VarName == VarName)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("A variable named '%s' already exists in this Blueprint. Provide a unique 'variable_name'."), *VarNameStr));
+		}
+	}
+
+	// Find the hosting graph (needed for placing the new variable node)
+	UEdGraph* Graph = nullptr;
+	if (!GraphName.IsEmpty())
+	{
+		Graph = MonolithBlueprintInternal::FindGraphByName(BP, GraphName);
+	}
+	else
+	{
+		// Find graph by searching for the node
+		auto SearchInGraphs = [&](const TArray<TObjectPtr<UEdGraph>>& Graphs) -> UEdGraph*
+		{
+			for (const auto& G : Graphs)
+			{
+				if (!G) continue;
+				for (UEdGraphNode* N : G->Nodes)
+				{
+					if (N && N->GetName() == NodeId) return G;
+				}
+			}
+			return nullptr;
+		};
+		Graph = SearchInGraphs(BP->UbergraphPages);
+		if (!Graph) Graph = SearchInGraphs(BP->FunctionGraphs);
+		if (!Graph) Graph = SearchInGraphs(BP->MacroGraphs);
+	}
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(TEXT("Could not locate graph containing the node"));
+	}
+
+	// Build pin type string for the response before modifying anything
+	FString TypeStr = MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
+	                  MonolithBlueprintInternal::PinTypeToString(Pin->PinType);
+
+	// Step 1: Add the member variable.
+	// AddMemberVariable requires the type and returns the new variable index.
+	FBlueprintEditorUtils::AddMemberVariable(BP, VarName, Pin->PinType);
+
+	// Step 2: Mark as structurally modified so the skeleton class regenerates
+	// and the new variable is available before we create the variable node.
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+	// Step 3: Position the new variable node relative to the source node
+	const EEdGraphPinDirection PinDir = Pin->Direction;
+	int32 VarNodePosX = SourceNode->NodePosX + (PinDir == EGPD_Output ? 200 : -200);
+	int32 VarNodePosY = SourceNode->NodePosY;
+
+	// Step 4: Create VariableGet (for output pins — feeds data to consumers)
+	//         or VariableSet (for input pins — receives data from producers)
+	UEdGraphNode* VarNode = nullptr;
+	int32 ConnectionsMade = 0;
+
+	if (PinDir == EGPD_Output)
+	{
+		// Output pin → promote to VariableGet
+		UK2Node_VariableGet* GetNode = NewObject<UK2Node_VariableGet>(Graph);
+		GetNode->VariableReference.SetSelfMember(VarName);
+		GetNode->NodePosX = VarNodePosX;
+		GetNode->NodePosY = VarNodePosY;
+		Graph->AddNode(GetNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
+		GetNode->AllocateDefaultPins();
+		VarNode = GetNode;
+
+		// Rewire: connect the VariableGet's output to each of the original pin's consumers
+		// Find the output data pin on the new VariableGet node
+		UEdGraphPin* GetOutputPin = nullptr;
+		for (UEdGraphPin* P : GetNode->Pins)
+		{
+			if (P && P->Direction == EGPD_Output && P->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{
+				GetOutputPin = P;
+				break;
+			}
+		}
+
+		if (GetOutputPin)
+		{
+			// Collect existing connections before breaking
+			TArray<UEdGraphPin*> Consumers;
+			for (UEdGraphPin* Linked : Pin->LinkedTo)
+			{
+				if (Linked) Consumers.Add(Linked);
+			}
+
+			// Break the original pin's connections
+			Pin->BreakAllPinLinks(true);
+
+			// Wire the VariableGet output to each former consumer
+			const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+			for (UEdGraphPin* Consumer : Consumers)
+			{
+				if (Schema->TryCreateConnection(GetOutputPin, Consumer))
+				{
+					ConnectionsMade++;
+				}
+			}
+		}
+	}
+	else
+	{
+		// Input pin → promote to VariableSet
+		UK2Node_VariableSet* SetNode = NewObject<UK2Node_VariableSet>(Graph);
+		SetNode->VariableReference.SetSelfMember(VarName);
+		SetNode->NodePosX = VarNodePosX;
+		SetNode->NodePosY = VarNodePosY;
+		Graph->AddNode(SetNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
+		SetNode->AllocateDefaultPins();
+		VarNode = SetNode;
+
+		// Find the input data pin on the VariableSet node (the value pin, not exec)
+		UEdGraphPin* SetInputPin = nullptr;
+		for (UEdGraphPin* P : SetNode->Pins)
+		{
+			if (P && P->Direction == EGPD_Input && P->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{
+				SetInputPin = P;
+				break;
+			}
+		}
+
+		if (SetInputPin)
+		{
+			// Collect existing producers before breaking
+			TArray<UEdGraphPin*> Producers;
+			for (UEdGraphPin* Linked : Pin->LinkedTo)
+			{
+				if (Linked) Producers.Add(Linked);
+			}
+
+			// Break the original pin's connections
+			Pin->BreakAllPinLinks(true);
+
+			// Wire each former producer to the VariableSet input
+			const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+			for (UEdGraphPin* Producer : Producers)
+			{
+				if (Schema->TryCreateConnection(Producer, SetInputPin))
+				{
+					ConnectionsMade++;
+				}
+			}
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("variable_name"), VarNameStr);
+	Root->SetStringField(TEXT("variable_type"), TypeStr);
+	if (PinDir == EGPD_Output)
+	{
+		Root->SetStringField(TEXT("getter_node_id"), VarNode ? VarNode->GetName() : TEXT(""));
+	}
+	else
+	{
+		Root->SetStringField(TEXT("setter_node_id"), VarNode ? VarNode->GetName() : TEXT(""));
+	}
+	Root->SetNumberField(TEXT("connections_made"), ConnectionsMade);
+	Root->SetStringField(TEXT("graph"), Graph->GetName());
 	return FMonolithActionResult::Success(Root);
 }

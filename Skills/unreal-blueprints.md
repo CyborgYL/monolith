@@ -5,7 +5,7 @@ description: Use when working with Unreal Engine Blueprints via Monolith MCP —
 
 # Unreal Blueprint Workflows
 
-You have access to **Monolith** with 59 Blueprint actions via `blueprint_query()`.
+You have access to **Monolith** with 67 Blueprint actions via `blueprint_query()`.
 
 ## Discovery
 
@@ -137,6 +137,28 @@ monolith_discover({ namespace: "blueprint" })
 | `add_timeline` | `asset_path`, `timeline_name`?, `auto_play`?, `loop`? | Create timeline node with template + GUID linkage. Returns timeline_guid |
 | `add_event_node` | `asset_path`, `event_name` | Create override events (BeginPlay, Tick, etc.) or custom events. Alias table for common names |
 | `add_comment_node` | `asset_path`, `text`, `node_ids`?, `color`? | Add comment box, optionally enclosing specified nodes |
+
+### Inspection & Editing (6)
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `get_function_signature` | `asset_path`, `function_name`, `include_inherited`? | Read function inputs, outputs, flags, local vars |
+| `get_blueprint_info` | `asset_path` | Comprehensive BP overview: graphs, has_tick, compile_status, counts |
+| `get_event_dispatcher_details` | `asset_path`, `dispatcher_name` | Signature pins + referencing nodes |
+| `remove_event_dispatcher` | `asset_path`, `dispatcher_name` | Remove dispatcher (warns about referencing nodes) |
+| `set_event_dispatcher_params` | `asset_path`, `dispatcher_name`, `params` | Set dispatcher signature parameters |
+| `validate_blueprint` | `asset_path` | Enhanced: checks unimplemented interfaces, duplicate events, empty functions, unused locals |
+
+### Advanced (2)
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `promote_pin_to_variable` | `asset_path`, `node_id`, `pin_name`, `variable_name`? | Promote a pin to a member variable + auto-wire. Scalar types only v1 |
+| `add_replicated_variable` | `asset_path`, `variable_name`, `type`, `replication_condition`?, `create_on_rep`? | Add replicated variable with OnRep function stub |
+
+**`add_node` cast support:** Use `node_type: "cast"` with `cast_class` param. Also accepts `"dynamic_cast"`. Class resolution tries bare name, A-prefix, U-prefix.
+
+**Soft reference shorthands:** `type: "soft_object:StaticMesh"` → `TSoftObjectPtr<UStaticMesh>`, `type: "soft_class:Actor"` → `TSoftClassPtr<AActor>`.
 
 ## Common Workflows
 

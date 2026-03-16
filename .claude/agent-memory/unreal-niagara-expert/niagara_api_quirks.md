@@ -32,3 +32,13 @@ type: feedback
 
 ## GPU HLSL check
 - `get_compiled_gpu_hlsl` returns an error "Emitter is not GPU simulation" for CPU sim emitters — this is expected, not an actual compilation failure.
+
+## Wave 1-6 implementation notes (2026-03-16)
+- `FVersionedNiagaraEmitterData::StaticStruct()` works for reflection via `TFieldIterator<FProperty>` — it's a UStruct not UObject.
+- `configure_curve_keys` uses the existing `ApplyCurveConfig` helper but must detect key format (color vs vector vs float) from JSON field names in the first key object.
+- `FindFunctionCallNode` searches ALL `UNiagaraNodeFunctionCall` nodes in the emitter graph by GUID — needed for dynamic input nodes which aren't in the ParameterMap chain.
+- `SetDynamicInputForFunctionInput` is NIAGARAEDITOR_API exported — confirmed working pattern: GetOrCreateOverridePin -> BreakAllPinLinks -> SetDynamicInputForFunctionInput.
+- `add_simulation_stage` is a stub — `SimulationStages` array on `FVersionedNiagaraEmitterData` has no exported non-const accessor.
+- `add_module` fuzzy suggestions use `FString::Contains` bidirectional matching (requested name in script name AND script name in requested name).
+- `set_fixed_bounds` must handle both system-level (`bFixedBounds` + `SetFixedBounds`) and emitter-level (`CalculateBoundsMode` + `FixedBounds`).
+- `EventHandlerScriptProps` is a public UPROPERTY on `FVersionedNiagaraEmitterData` — direct `.Add()` works for event handler creation. The Script property can be left null; the engine creates it during compile.

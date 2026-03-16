@@ -494,6 +494,20 @@ namespace MonolithBlueprintInternal
 			UEnum* FoundEnum = FindFirstObject<UEnum>(*EnumName, EFindFirstObjectOptions::NativeFirst);
 			if (FoundEnum) PinType.PinSubCategoryObject = FoundEnum;
 		}
+		else if (BaseType.StartsWith(TEXT("softobject:")))
+		{
+			PinType.PinCategory = UEdGraphSchema_K2::PC_SoftObject;
+			FString ClassName = BaseType.Mid(11);
+			UClass* FoundClass = FindFirstObject<UClass>(*ClassName, EFindFirstObjectOptions::NativeFirst);
+			if (FoundClass) PinType.PinSubCategoryObject = FoundClass;
+		}
+		else if (BaseType.StartsWith(TEXT("softclass:")))
+		{
+			PinType.PinCategory = UEdGraphSchema_K2::PC_SoftClass;
+			FString ClassName = BaseType.Mid(10);
+			UClass* FoundClass = FindFirstObject<UClass>(*ClassName, EFindFirstObjectOptions::NativeFirst);
+			if (FoundClass) PinType.PinSubCategoryObject = FoundClass;
+		}
 		else if (BaseType == TEXT("exec"))
 		{
 			PinType.PinCategory = UEdGraphSchema_K2::PC_Exec;

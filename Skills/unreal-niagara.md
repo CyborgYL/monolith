@@ -5,7 +5,7 @@ description: Use when creating, editing, or inspecting Niagara particle systems 
 
 # Unreal Niagara VFX Workflows
 
-You have access to **Monolith** with 47 Niagara actions via `niagara_query()`.
+You have access to **Monolith** with 64 Niagara actions via `niagara_query()`.
 
 ## Discovery
 
@@ -45,15 +45,39 @@ All asset paths follow UE content browser format (no .uasset extension):
 | `set_system_property` | `asset_path`, `property`, `value` | Set system-level properties (WarmupTime, bDeterminism, bFixedTickDelta, RandomSeed, MaxPoolSize, etc.). Snake_case aliases supported |
 | `request_compile` | `asset_path` | Force recompile the system |
 
-### Read / Inspection (7)
+### Read / Inspection (7 + 4 new summary)
 | Action | Key Params | Purpose |
 |--------|-----------|---------|
-| `list_emitters` | `asset_path` | List all emitters in a system (returns name, index, enabled, sim_target, renderer_count, GUID) |
-| `list_renderers` | `asset_path`, `emitter` | List all renderers on an emitter (returns `type` short class name, index, enabled, material) |
-| `list_module_scripts` | `query` | Search module scripts by keyword. Supports space-separated queries — `"Gravity Force"` matches `"GravityForce"` |
+| `list_emitters` | `asset_path` | List all emitters (name, index, enabled, sim_target, renderer_count, GUID) |
+| `list_renderers` | `asset_path`, `emitter` | List renderers (`type` short name, index, enabled, material) |
+| `list_module_scripts` | `query` | Search module scripts. Space-separated queries work ("Gravity Force") |
 | `list_renderer_properties` | `asset_path`, `emitter`, `renderer` | List editable properties on a renderer |
+| `list_emitter_properties` | `asset_path`, `emitter` | Discover what set_emitter_property accepts (reflection-based) |
 | `get_ordered_modules` | `asset_path`, `emitter` | Get modules with GUIDs (needed for module actions) |
-| `get_system_diagnostics` | `asset_path` | Compile errors, warnings, SimTarget/renderer incompatibility, GPU bounds warnings, per-script stats |
+| `get_system_diagnostics` | `asset_path` | Compile errors, warnings, incompatibility checks |
+| `get_system_summary` | `asset_path` | One-call overview: emitters, user params, module counts, renderer types |
+| `get_emitter_summary` | `asset_path`, `emitter` | Deep emitter view: modules per stage, renderers, event handlers |
+| `get_module_input_value` | `asset_path`, `emitter`, `module_node`, `input` | Read current override value (literal, bound, DI, or dynamic input) |
+| `validate_system` | `asset_path` | Pre-compile validation: GPU+Light error, missing materials, bounds warnings |
+
+### System Management (9 + 5 new)
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `create_system` | `asset_path` | Create a new Niagara system |
+| `add_emitter` | `asset_path`, `emitter` | Add an emitter to a system |
+| `remove_emitter` | `asset_path`, `emitter` | Remove an emitter |
+| `duplicate_emitter` | `asset_path`, `emitter` | Duplicate an emitter |
+| `duplicate_system` | `asset_path`, `save_path` | Clone entire system asset |
+| `create_emitter` | `asset_path`, `name`, `sim_target`? | Add truly empty emitter (Minimal template) |
+| `set_fixed_bounds` | `asset_path`, `emitter`?, `min`, `max` | Set fixed bounds on system or emitter |
+| `set_effect_type` | `asset_path`, `effect_type` | Assign effect type for scalability |
+| `export_system_spec` | `asset_path`, `include_values`? | Reverse-engineer system to create_system_from_spec JSON |
+| `set_emitter_enabled` | `asset_path`, `emitter`, `enabled` | Enable/disable an emitter |
+| `reorder_emitters` | `asset_path`, `order` | Change emitter evaluation order |
+| `set_emitter_property` | `asset_path`, `emitter`, `property`, `value` | Modify emitter settings |
+| `get_system_property` | `asset_path`, `property` | Read a system-level property |
+| `set_system_property` | `asset_path`, `property`, `value` | Set system-level properties |
+| `request_compile` | `asset_path` | Force recompile |
 | `get_module_graph` | `asset_path`, `emitter`, `module_node` | Get module's internal graph |
 
 ### Module Editing (9)
@@ -81,6 +105,25 @@ All asset paths follow UE content browser format (no .uasset extension):
 | `remove_user_parameter` | `asset_path`, `name` | Remove a user parameter |
 | `set_parameter_default` | `asset_path`, `parameter`, `value` | Set parameter default value |
 | `set_curve_value` | `asset_path`, `emitter`, `module_node`, `input`, `keys` | Set curve keys on a module input |
+
+### DI & Curve Configuration (2 new)
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `configure_curve_keys` | `asset_path`, `emitter`, `module_node`, `input`, `keys`, `interp`? | Set keys on curve DI (float/color/vector). Auto-creates override if needed |
+| `configure_data_interface` | `asset_path`, `emitter`, `module_node`, `input`, `properties` | Set arbitrary DI properties via reflection |
+
+### Dynamic Inputs (3 new)
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `add_dynamic_input` | `asset_path`, `emitter`, `module_node`, `input`, `dynamic_input_script` | Attach dynamic input to module pin. Returns node GUID + inputs |
+| `set_dynamic_input_value` | `asset_path`, `emitter`, `dynamic_input_node`, `input`, `value` | Set value on a dynamic input node |
+| `search_dynamic_inputs` | `query`?, `input_type`?, `limit`? | Browse available dynamic input scripts |
+
+### Advanced (2 new + 1 stub)
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `add_event_handler` | `asset_path`, `emitter`, `event_name`, `source_emitter`? | Add inter-emitter event handler (death, collision, location) |
+| `add_simulation_stage` | — | Stub — returns informative error (private API, no exported setter) |
 
 ### Renderers (6)
 | Action | Key Params | Purpose |

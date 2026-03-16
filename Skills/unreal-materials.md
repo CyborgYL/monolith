@@ -5,7 +5,7 @@ description: Use when creating, editing, or inspecting Unreal Engine materials v
 
 # Unreal Material Workflows
 
-You have access to **Monolith** with 44 material actions via `material_query()`.
+You have access to **Monolith** with 47 material actions via `material_query()`.
 
 ## Discovery
 
@@ -27,7 +27,7 @@ All asset paths follow UE content browser format (no .uasset extension):
 
 - `asset_path` — the material asset path (NOT `asset`)
 
-## Action Reference (44 actions)
+## Action Reference (47 actions)
 
 ### Read Actions (16)
 | Action | Key Params | Purpose |
@@ -88,6 +88,13 @@ All asset paths follow UE content browser format (no .uasset extension):
 | `import_material_graph` | `asset_path`, `graph_json`, `mode`? | Deserialize graph from JSON |
 | `begin_transaction` | `transaction_name` | Start an undo group |
 | `end_transaction` | — | End an undo group |
+
+### Batch Actions (3)
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `batch_set_material_property` | `asset_paths` (array), `properties` | Apply same properties to multiple materials in one call |
+| `batch_recompile` | `asset_paths` (array) | Recompile multiple materials, returns per-material VS/PS instruction counts |
+| `import_texture` | `source_file`, `dest_path`, `compression`?, `srgb`?, `max_size`? | Import texture from disk with compression/sRGB settings |
 
 ## PBR Material Workflow
 

@@ -3,6 +3,8 @@
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "EdGraphSchema_K2.h"
+#include "Net/UnrealNetwork.h"
 
 // ============================================================
 //  Registration
@@ -86,6 +88,22 @@ void FMonolithBlueprintVariableActions::RegisterActions(FMonolithToolRegistry& R
 			.Required(TEXT("asset_path"),    TEXT("string"), TEXT("Blueprint asset path"))
 			.Required(TEXT("function_name"), TEXT("string"), TEXT("Function graph name"))
 			.Required(TEXT("name"),          TEXT("string"), TEXT("Local variable name to remove"))
+			.Build());
+
+	// ---- Wave 7 ----
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_replicated_variable"),
+		TEXT("Add a replicated member variable to a Blueprint with full network replication settings. "
+		     "Optionally creates an OnRep_ notification function. Requires the Blueprint's parent class to support replication."),
+		FMonolithActionHandler::CreateStatic(&HandleAddReplicatedVariable),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),            TEXT("string"),  TEXT("Blueprint asset path"))
+			.Required(TEXT("variable_name"),         TEXT("string"),  TEXT("Variable name"))
+			.Required(TEXT("type"),                  TEXT("string"),  TEXT("Pin type string (e.g. bool, int, float, object:Actor)"))
+			.Optional(TEXT("replication_condition"), TEXT("string"),  TEXT("ELifetimeCondition: None, InitialOnly, OwnerOnly, SkipOwner, SimulatedOnly, AutonomousOnly, SimulatedOrPhysics, InitialOrOwner, Custom (default: None)"), TEXT("None"))
+			.Optional(TEXT("create_on_rep"),         TEXT("boolean"), TEXT("Create an OnRep_<VarName> function stub and link it to the variable (default: false)"), TEXT("false"))
+			.Optional(TEXT("default_value"),         TEXT("string"),  TEXT("Default value as string"))
+			.Optional(TEXT("category"),              TEXT("string"),  TEXT("Category for organization in the Blueprint editor"))
 			.Build());
 }
 
@@ -210,6 +228,18 @@ FMonolithActionResult FMonolithBlueprintVariableActions::HandleAddVariable(const
 	// Normalize common aliases so users get sensible errors instead of silent bool fallback.
 	// Only normalize bare base types (not container-prefixed ones like "array:vector").
 	{
+		// Wave 7: Accept soft reference shorthands before other normalization
+		// soft_object:ClassName -> softobject:ClassName
+		// soft_class:ClassName  -> softclass:ClassName
+		if (TypeStr.StartsWith(TEXT("soft_object:"), ESearchCase::IgnoreCase))
+		{
+			TypeStr = TEXT("softobject:") + TypeStr.Mid(12);
+		}
+		else if (TypeStr.StartsWith(TEXT("soft_class:"), ESearchCase::IgnoreCase))
+		{
+			TypeStr = TEXT("softclass:") + TypeStr.Mid(11);
+		}
+
 		// Build a mutable working copy of just the base portion for alias checks
 		auto NormalizeBaseType = [](const FString& In) -> FString
 		{
@@ -676,6 +706,170 @@ FMonolithActionResult FMonolithBlueprintVariableActions::HandleRemoveLocalVariab
 	Root->SetStringField(TEXT("asset_path"), AssetPath);
 	Root->SetStringField(TEXT("function"), FunctionName);
 	Root->SetStringField(TEXT("removed_variable"), Name);
+	Root->SetBoolField(TEXT("success"), true);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  add_replicated_variable  (Wave 7)
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintVariableActions::HandleAddReplicatedVariable(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString VarNameStr = Params->GetStringField(TEXT("variable_name"));
+	if (VarNameStr.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: variable_name"));
+	}
+
+	FString TypeStr = Params->GetStringField(TEXT("type"));
+	if (TypeStr.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: type"));
+	}
+
+	// Normalize type string the same way HandleAddVariable does
+	{
+		if (TypeStr.StartsWith(TEXT("soft_object:"), ESearchCase::IgnoreCase))
+			TypeStr = TEXT("softobject:") + TypeStr.Mid(12);
+		else if (TypeStr.StartsWith(TEXT("soft_class:"), ESearchCase::IgnoreCase))
+			TypeStr = TEXT("softclass:") + TypeStr.Mid(11);
+	}
+
+	FName VarName(*VarNameStr);
+	FEdGraphPinType PinType = MonolithBlueprintInternal::ParsePinTypeFromString(TypeStr);
+
+	// Check for name collision
+	for (const FBPVariableDescription& Existing : BP->NewVariables)
+	{
+		if (Existing.VarName == VarName)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("A variable named '%s' already exists in this Blueprint."), *VarNameStr));
+		}
+	}
+
+	// Parse replication condition string -> ELifetimeCondition
+	FString ConditionStr = Params->GetStringField(TEXT("replication_condition"));
+	if (ConditionStr.IsEmpty()) ConditionStr = TEXT("None");
+
+	ELifetimeCondition LifetimeCondition = COND_None;
+	{
+		static const TMap<FString, ELifetimeCondition> ConditionMap = {
+			{TEXT("None"),               COND_None},
+			{TEXT("InitialOnly"),        COND_InitialOnly},
+			{TEXT("OwnerOnly"),          COND_OwnerOnly},
+			{TEXT("SkipOwner"),          COND_SkipOwner},
+			{TEXT("SimulatedOnly"),      COND_SimulatedOnly},
+			{TEXT("AutonomousOnly"),     COND_AutonomousOnly},
+			{TEXT("SimulatedOrPhysics"), COND_SimulatedOrPhysics},
+			{TEXT("InitialOrOwner"),     COND_InitialOrOwner},
+			{TEXT("Custom"),             COND_Custom},
+		};
+		if (const ELifetimeCondition* Found = ConditionMap.Find(ConditionStr))
+		{
+			LifetimeCondition = *Found;
+		}
+		else
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unknown replication_condition '%s'. Valid values: None, InitialOnly, OwnerOnly, SkipOwner, SimulatedOnly, AutonomousOnly, SimulatedOrPhysics, InitialOrOwner, Custom"),
+				*ConditionStr));
+		}
+	}
+
+	bool bCreateOnRep = false;
+	Params->TryGetBoolField(TEXT("create_on_rep"), bCreateOnRep);
+
+	FString DefaultValue = Params->GetStringField(TEXT("default_value"));
+
+	// Step 1: Add the variable
+	FBlueprintEditorUtils::AddMemberVariable(BP, VarName, PinType, DefaultValue);
+
+	// Step 2: Set replication flags and condition directly on the variable description
+	for (FBPVariableDescription& Var : BP->NewVariables)
+	{
+		if (Var.VarName != VarName) continue;
+
+		// Set the CPF_Net flag to mark this variable as replicated
+		Var.PropertyFlags |= CPF_Net;
+
+		// Set the replication condition
+		Var.ReplicationCondition = LifetimeCondition;
+
+		break;
+	}
+
+	// Apply optional category
+	FString Category = Params->GetStringField(TEXT("category"));
+	if (!Category.IsEmpty())
+	{
+		FBlueprintEditorUtils::SetBlueprintVariableCategory(BP, VarName, nullptr, FText::FromString(Category));
+	}
+
+	// Step 3: Optionally create OnRep function and link it
+	FString OnRepFunctionName;
+	if (bCreateOnRep)
+	{
+		OnRepFunctionName = FString::Printf(TEXT("OnRep_%s"), *VarNameStr);
+		FName OnRepFuncName(*OnRepFunctionName);
+
+		// Check the function doesn't already exist
+		bool bFuncExists = false;
+		for (const UEdGraph* FuncGraph : BP->FunctionGraphs)
+		{
+			if (FuncGraph && FuncGraph->GetFName() == OnRepFuncName)
+			{
+				bFuncExists = true;
+				break;
+			}
+		}
+
+		if (!bFuncExists)
+		{
+			// Create the function graph
+			UEdGraph* OnRepGraph = FBlueprintEditorUtils::CreateNewGraph(
+				BP, OnRepFuncName, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+
+			if (OnRepGraph)
+			{
+				FBlueprintEditorUtils::AddFunctionGraph<UClass>(BP, OnRepGraph, /*bIsUserCreated=*/true, nullptr);
+
+				// Link the variable to this OnRep function
+				FBlueprintEditorUtils::SetBlueprintVariableRepNotifyFunc(BP, VarName, OnRepFuncName);
+			}
+			else
+			{
+				// Non-fatal: variable was created, just couldn't make the OnRep stub
+				OnRepFunctionName = TEXT("");
+			}
+		}
+		else
+		{
+			// Function already exists — just link it
+			FBlueprintEditorUtils::SetBlueprintVariableRepNotifyFunc(BP, VarName, OnRepFuncName);
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("variable_name"), VarNameStr);
+	Root->SetStringField(TEXT("type"), TypeStr);
+	Root->SetBoolField(TEXT("replicated"), true);
+	Root->SetStringField(TEXT("replication_condition"), ConditionStr);
+	if (bCreateOnRep && !OnRepFunctionName.IsEmpty())
+	{
+		Root->SetStringField(TEXT("on_rep_function"), OnRepFunctionName);
+	}
 	Root->SetBoolField(TEXT("success"), true);
 	return FMonolithActionResult::Success(Root);
 }
