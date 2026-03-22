@@ -26,7 +26,15 @@ public class MonolithEditor : ModuleRules
 			"SlateCore",
 			"Json",
 			"JsonUtilities",
-			"MessageLog"
+			"MessageLog",
+			// Capture actions
+			"RenderCore",
+			"RHI",
+			"ImageWrapper",
+			"Niagara",
+			"AssetTools",
+			"AdvancedPreviewScene",
+			"ImageCore"
 		});
 
 		if (Target.Platform == UnrealTargetPlatform.Win64)

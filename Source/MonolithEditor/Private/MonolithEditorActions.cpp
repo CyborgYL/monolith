@@ -12,6 +12,30 @@
 #include "ILiveCodingModule.h"
 #endif
 
+// Capture action includes
+#include "Components/SceneCaptureComponent2D.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "AdvancedPreviewScene.h"
+#include "NiagaraComponent.h"
+#include "NiagaraSystem.h"
+#include "NiagaraWorldManager.h"
+#include "IImageWrapperModule.h"
+#include "IImageWrapper.h"
+#include "ImageUtils.h"
+#include "AssetToolsModule.h"
+#include "IAssetTools.h"
+#include "AutomatedAssetImportData.h"
+#include "Engine/Texture2D.h"
+#include "RenderingThread.h"
+#include "TextureResource.h"
+#include "Engine/StaticMesh.h"
+#include "Components/StaticMeshComponent.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "UObject/SavePackage.h"
+#include "LevelEditorViewport.h"
+#include "PixelFormat.h"
+#include "ObjectTools.h"
+
 // --- Compile state ---
 
 FMonolithLogCapture* FMonolithEditorActions::CachedLogCapture = nullptr;
@@ -329,6 +353,68 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 	Registry.RegisterAction(TEXT("editor"), TEXT("get_crash_context"),
 		TEXT("Get last crash/ensure context information"),
 		FMonolithActionHandler::CreateStatic(&HandleGetCrashContext),
+		MakeShared<FJsonObject>());
+
+	// --- Capture actions ---
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("capture_scene_preview"),
+		TEXT("Capture a screenshot of an asset (Niagara, material) rendered in a preview scene"),
+		FMonolithActionHandler::CreateStatic(&HandleCaptureScenePreview),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path to preview"))
+			.Required(TEXT("asset_type"), TEXT("string"), TEXT("niagara | material"))
+			.Optional(TEXT("preview_mesh"), TEXT("string"), TEXT("Mesh for materials: plane, sphere, cube"), TEXT("plane"))
+			.Optional(TEXT("seek_time"), TEXT("number"), TEXT("Advance Niagara sim to this time (seconds)"), TEXT("0.0"))
+			.Optional(TEXT("camera"), TEXT("object"), TEXT("{location:[x,y,z], rotation:[p,y,r], fov:60}"))
+			.Optional(TEXT("resolution"), TEXT("array"), TEXT("[width, height]"), TEXT("[512,512]"))
+			.Optional(TEXT("output_path"), TEXT("string"), TEXT("Output PNG path (absolute or relative to project)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("capture_sequence_frames"),
+		TEXT("Capture multiple frames of an animated effect at specified timestamps"),
+		FMonolithActionHandler::CreateStatic(&HandleCaptureSequenceFrames),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path to preview"))
+			.Required(TEXT("asset_type"), TEXT("string"), TEXT("niagara"))
+			.Required(TEXT("timestamps"), TEXT("array"), TEXT("Array of capture times in seconds"))
+			.Optional(TEXT("camera"), TEXT("object"), TEXT("{location:[x,y,z], rotation:[p,y,r], fov:60}"))
+			.Optional(TEXT("resolution"), TEXT("array"), TEXT("[width, height]"), TEXT("[512,512]"))
+			.Optional(TEXT("output_dir"), TEXT("string"), TEXT("Output directory for frame PNGs"))
+			.Optional(TEXT("filename_prefix"), TEXT("string"), TEXT("Prefix for frame files"), TEXT("frame"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("import_texture"),
+		TEXT("Import an external image as a UTexture2D with configurable settings"),
+		FMonolithActionHandler::CreateStatic(&HandleImportTexture),
+		FParamSchemaBuilder()
+			.Required(TEXT("source_path"), TEXT("string"), TEXT("Absolute path to source image (PNG, TGA, EXR, HDR)"))
+			.Required(TEXT("destination"), TEXT("string"), TEXT("UE asset path for imported texture"))
+			.Optional(TEXT("settings"), TEXT("object"), TEXT("{compression, srgb, tiling, max_size, lod_group}"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("stitch_flipbook"),
+		TEXT("Stitch individual frame images into a flipbook atlas texture and import as UTexture2D"),
+		FMonolithActionHandler::CreateStatic(&HandleStitchFlipbook),
+		FParamSchemaBuilder()
+			.Required(TEXT("frame_paths"), TEXT("array"), TEXT("Ordered array of absolute file paths to frame PNGs"))
+			.Required(TEXT("dest_path"), TEXT("string"), TEXT("UE asset path for the output texture (e.g. /Game/AgentTraining/Textures/T_FB_001)"))
+			.Required(TEXT("grid"), TEXT("array"), TEXT("[columns, rows] grid layout (e.g. [4, 4] for 16 frames)"))
+			.Optional(TEXT("srgb"), TEXT("bool"), TEXT("sRGB color space (true for color, false for masks)"), TEXT("true"))
+			.Optional(TEXT("no_mipmaps"), TEXT("bool"), TEXT("Disable mipmap generation to prevent atlas bleed"), TEXT("true"))
+			.Optional(TEXT("delete_sources"), TEXT("bool"), TEXT("Delete source PNG files after successful stitch"), TEXT("true"))
+			.Optional(TEXT("lod_group"), TEXT("string"), TEXT("Texture LOD group"), TEXT("TEXTUREGROUP_Effects"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("delete_assets"),
+		TEXT("Delete UE assets by path. Safety: only allows paths under /Game/AgentTraining/"),
+		FMonolithActionHandler::CreateStatic(&HandleDeleteAssets),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_paths"), TEXT("array"), TEXT("Array of UE asset paths to delete (must be under /Game/AgentTraining/)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("get_viewport_info"),
+		TEXT("Get current editor viewport camera position, rotation, FOV, and resolution"),
+		FMonolithActionHandler::CreateStatic(&HandleGetViewportInfo),
 		MakeShared<FJsonObject>());
 
 	InitLiveCodingDelegate();
@@ -821,4 +907,1090 @@ FMonolithActionResult FMonolithEditorActions::HandleGetCrashContext(const TShare
 	}
 
 	return FMonolithActionResult::Success(Root);
+}
+
+// --- Capture helpers ---
+
+bool FMonolithEditorActions::RenderAndSaveCapture(
+	USceneCaptureComponent2D* CaptureComp,
+	UTextureRenderTarget2D* RT,
+	int32 ResX, int32 ResY,
+	const FString& OutputPath)
+{
+	if (!CaptureComp || !RT)
+	{
+		return false;
+	}
+
+	// Trigger the capture — submits render commands to the render thread
+	CaptureComp->CaptureScene();
+
+	// Use GameThread_GetRenderTargetResource — the non-GameThread variant
+	// asserts IsInRenderingThread() which crashes when called from game thread.
+	FTextureRenderTargetResource* RTResource = RT->GameThread_GetRenderTargetResource();
+	if (!RTResource)
+	{
+		UE_LOG(LogMonolith, Error, TEXT("CaptureScenePreview: Failed to get RT resource"));
+		return false;
+	}
+
+	// ReadPixels internally calls FlushRenderingCommands() to synchronize the GPU readback
+	TArray<FColor> Pixels;
+	bool bReadOk = RTResource->ReadPixels(Pixels);
+
+	if (!bReadOk || Pixels.Num() == 0)
+	{
+		UE_LOG(LogMonolith, Error, TEXT("CaptureScenePreview: ReadPixels failed (read=%d, count=%d)"),
+			bReadOk, Pixels.Num());
+		return false;
+	}
+
+	// Ensure output directory exists
+	FString Dir = FPaths::GetPath(OutputPath);
+	IFileManager::Get().MakeDirectory(*Dir, true);
+
+	// Encode as PNG and save
+	FImage Image;
+	Image.Init(ResX, ResY, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+	FMemory::Memcpy(Image.RawData.GetData(), Pixels.GetData(), Pixels.Num() * sizeof(FColor));
+
+	return FImageUtils::SaveImageAutoFormat(*OutputPath, Image);
+}
+
+bool FMonolithEditorActions::CaptureNiagaraFrame(
+	UNiagaraSystem* System,
+	float SeekTime,
+	const FVector& CameraLocation,
+	const FRotator& CameraRotation,
+	float FOV,
+	int32 ResX, int32 ResY,
+	const FString& OutputPath,
+	ESceneCaptureSource CaptureSource)
+{
+	if (!System)
+	{
+		return false;
+	}
+
+	// Create preview scene with black background (no environment lighting)
+	// VFX effects (especially fire, emissives) need a dark background to evaluate properly
+	FPreviewScene::ConstructionValues CVs;
+	CVs.bDefaultLighting = false;
+	CVs.LightBrightness = 0.0f;
+	CVs.SkyBrightness = 0.0f;
+	TSharedPtr<FAdvancedPreviewScene> PreviewScene =
+		MakeShareable(new FAdvancedPreviewScene(CVs));
+	PreviewScene->SetFloorVisibility(false);
+	PreviewScene->SetEnvironmentVisibility(false);
+
+	// Create Niagara component
+	UNiagaraComponent* NiagaraComp = NewObject<UNiagaraComponent>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	NiagaraComp->CastShadow = false;
+	NiagaraComp->bCastDynamicShadow = false;
+	NiagaraComp->SetAllowScalability(false);
+	NiagaraComp->SetAsset(System);
+	NiagaraComp->SetForceSolo(true);
+	NiagaraComp->SetAgeUpdateMode(ENiagaraAgeUpdateMode::DesiredAge);
+	NiagaraComp->SetCanRenderWhileSeeking(true);
+	NiagaraComp->SetMaxSimTime(0.0f);
+	NiagaraComp->Activate(true);
+
+	PreviewScene->AddComponent(NiagaraComp, NiagaraComp->GetRelativeTransform());
+
+	// Seek to desired time
+	if (SeekTime > 0.0f)
+	{
+		const float SeekDelta = 1.0f / 30.0f; // 30fps seek steps
+		NiagaraComp->SetSeekDelta(SeekDelta);
+		NiagaraComp->SeekToDesiredAge(SeekTime);
+
+		// Tick the world to process the seek
+		UWorld* World = NiagaraComp->GetWorld();
+		if (World)
+		{
+			World->TimeSeconds = SeekTime;
+			World->UnpausedTimeSeconds = SeekTime;
+			World->RealTimeSeconds = SeekTime;
+			World->DeltaRealTimeSeconds = SeekDelta;
+			World->DeltaTimeSeconds = SeekDelta;
+			World->Tick(ELevelTick::LEVELTICK_PauseTick, 0.0f);
+		}
+
+		NiagaraComp->TickComponent(SeekDelta, ELevelTick::LEVELTICK_All, nullptr);
+
+		if (World)
+		{
+			World->SendAllEndOfFrameUpdates();
+			if (FNiagaraWorldManager* WorldManager = FNiagaraWorldManager::Get(World))
+			{
+				WorldManager->FlushComputeAndDeferredQueues(false);
+			}
+		}
+	}
+
+	// Create render target
+	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	RT->InitAutoFormat(ResX, ResY);
+	RT->ClearColor = FLinearColor::Black;
+	RT->UpdateResourceImmediate(true);
+
+	// Create scene capture component (same as Baker)
+	USceneCaptureComponent2D* CaptureComp = NewObject<USceneCaptureComponent2D>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	CaptureComp->bTickInEditor = false;
+	CaptureComp->SetComponentTickEnabled(false);
+	CaptureComp->SetVisibility(true);
+	CaptureComp->bCaptureEveryFrame = false;
+	CaptureComp->bCaptureOnMovement = false;
+	CaptureComp->TextureTarget = RT;
+	CaptureComp->CaptureSource = CaptureSource;
+	CaptureComp->ProjectionType = ECameraProjectionMode::Perspective;
+	CaptureComp->FOVAngle = FOV;
+	CaptureComp->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
+
+	// Register with the preview scene's world
+	UWorld* World = PreviewScene->GetWorld();
+	CaptureComp->RegisterComponentWithWorld(World);
+	CaptureComp->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
+
+	// Capture and save
+	bool bSuccess = RenderAndSaveCapture(CaptureComp, RT, ResX, ResY, OutputPath);
+
+	// Cleanup
+	CaptureComp->TextureTarget = nullptr;
+	CaptureComp->UnregisterComponent();
+	PreviewScene->RemoveComponent(NiagaraComp);
+
+	return bSuccess;
+}
+
+bool FMonolithEditorActions::CaptureMaterialFrame(
+	UMaterialInterface* Material,
+	const FString& MeshType,
+	const FVector& CameraLocation,
+	const FRotator& CameraRotation,
+	float FOV,
+	int32 ResX, int32 ResY,
+	const FString& OutputPath,
+	ESceneCaptureSource CaptureSource)
+{
+	if (!Material)
+	{
+		return false;
+	}
+
+	// Create preview scene
+	TSharedPtr<FAdvancedPreviewScene> PreviewScene =
+		MakeShareable(new FAdvancedPreviewScene(FPreviewScene::ConstructionValues()));
+	PreviewScene->SetFloorVisibility(false);
+
+	// Determine mesh to use
+	FString MeshPath;
+	if (MeshType.Equals(TEXT("sphere"), ESearchCase::IgnoreCase))
+	{
+		MeshPath = TEXT("/Engine/BasicShapes/Sphere");
+	}
+	else if (MeshType.Equals(TEXT("cube"), ESearchCase::IgnoreCase))
+	{
+		MeshPath = TEXT("/Engine/BasicShapes/Cube");
+	}
+	else if (MeshType.Equals(TEXT("cylinder"), ESearchCase::IgnoreCase))
+	{
+		MeshPath = TEXT("/Engine/BasicShapes/Cylinder");
+	}
+	else // default: plane
+	{
+		MeshPath = TEXT("/Engine/BasicShapes/Plane");
+	}
+
+	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *MeshPath);
+	if (!Mesh)
+	{
+		UE_LOG(LogMonolith, Error, TEXT("CaptureMaterialFrame: Failed to load mesh %s"), *MeshPath);
+		return false;
+	}
+
+	// Create static mesh component
+	UStaticMeshComponent* MeshComp = NewObject<UStaticMeshComponent>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	MeshComp->SetStaticMesh(Mesh);
+	MeshComp->SetMaterial(0, const_cast<UMaterialInterface*>(Material));
+	// Scale plane to reasonable size (default is 100x100 cm)
+	MeshComp->SetRelativeScale3D(FVector(2.0f, 2.0f, 1.0f));
+
+	PreviewScene->AddComponent(MeshComp, MeshComp->GetRelativeTransform());
+
+	// Create render target
+	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	RT->InitAutoFormat(ResX, ResY);
+	RT->ClearColor = FLinearColor(0.18f, 0.18f, 0.18f); // mid-gray background
+	RT->UpdateResourceImmediate(true);
+
+	// Create scene capture
+	USceneCaptureComponent2D* CaptureComp = NewObject<USceneCaptureComponent2D>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	CaptureComp->bTickInEditor = false;
+	CaptureComp->SetComponentTickEnabled(false);
+	CaptureComp->SetVisibility(true);
+	CaptureComp->bCaptureEveryFrame = false;
+	CaptureComp->bCaptureOnMovement = false;
+	CaptureComp->TextureTarget = RT;
+	CaptureComp->CaptureSource = CaptureSource;
+	CaptureComp->ProjectionType = ECameraProjectionMode::Perspective;
+	CaptureComp->FOVAngle = FOV;
+	CaptureComp->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
+
+	UWorld* World = PreviewScene->GetWorld();
+	CaptureComp->RegisterComponentWithWorld(World);
+	CaptureComp->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
+
+	// Capture and save
+	bool bSuccess = RenderAndSaveCapture(CaptureComp, RT, ResX, ResY, OutputPath);
+
+	// Cleanup
+	CaptureComp->TextureTarget = nullptr;
+	CaptureComp->UnregisterComponent();
+	PreviewScene->RemoveComponent(MeshComp);
+
+	return bSuccess;
+}
+
+// --- Capture action handlers ---
+
+FMonolithActionResult FMonolithEditorActions::HandleCaptureScenePreview(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	// Parse required params
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString AssetType = Params->GetStringField(TEXT("asset_type"));
+
+	if (AssetPath.IsEmpty() || AssetType.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("asset_path and asset_type are required"));
+	}
+
+	// Parse optional params
+	float SeekTime = 0.0f;
+	if (Params->HasField(TEXT("seek_time")))
+	{
+		SeekTime = (float)Params->GetNumberField(TEXT("seek_time"));
+	}
+
+	FString PreviewMesh = TEXT("plane");
+	if (Params->HasField(TEXT("preview_mesh")))
+	{
+		PreviewMesh = Params->GetStringField(TEXT("preview_mesh"));
+	}
+
+	int32 ResX = 512, ResY = 512;
+	if (Params->HasField(TEXT("resolution")))
+	{
+		const TArray<TSharedPtr<FJsonValue>>& ResArray = Params->GetArrayField(TEXT("resolution"));
+		if (ResArray.Num() >= 2)
+		{
+			ResX = (int32)ResArray[0]->AsNumber();
+			ResY = (int32)ResArray[1]->AsNumber();
+		}
+	}
+
+	// Parse camera
+	FVector CameraLocation(200.0f, 0.0f, 100.0f);
+	FRotator CameraRotation(0.0f, 180.0f, 0.0f);
+	float FOV = 60.0f;
+
+	if (Params->HasField(TEXT("camera")))
+	{
+		const TSharedPtr<FJsonObject>* CameraObj = nullptr;
+		TSharedPtr<FJsonObject> ParsedCamera;
+
+		// Handle both object and string-serialized (Claude Code quirk)
+		if (!Params->TryGetObjectField(TEXT("camera"), CameraObj))
+		{
+			FString CameraStr = Params->GetStringField(TEXT("camera"));
+			if (!CameraStr.IsEmpty())
+			{
+				ParsedCamera = FMonolithJsonUtils::Parse(CameraStr);
+				CameraObj = &ParsedCamera;
+			}
+		}
+
+		if (CameraObj && (*CameraObj).IsValid())
+		{
+			if ((*CameraObj)->HasField(TEXT("location")))
+			{
+				const TArray<TSharedPtr<FJsonValue>>& Loc = (*CameraObj)->GetArrayField(TEXT("location"));
+				if (Loc.Num() >= 3)
+				{
+					CameraLocation = FVector(Loc[0]->AsNumber(), Loc[1]->AsNumber(), Loc[2]->AsNumber());
+				}
+			}
+			if ((*CameraObj)->HasField(TEXT("rotation")))
+			{
+				const TArray<TSharedPtr<FJsonValue>>& Rot = (*CameraObj)->GetArrayField(TEXT("rotation"));
+				if (Rot.Num() >= 3)
+				{
+					CameraRotation = FRotator(Rot[0]->AsNumber(), Rot[1]->AsNumber(), Rot[2]->AsNumber());
+				}
+			}
+			if ((*CameraObj)->HasField(TEXT("fov")))
+			{
+				FOV = (float)(*CameraObj)->GetNumberField(TEXT("fov"));
+			}
+		}
+	}
+
+	// Generate output path
+	FString OutputPath;
+	if (Params->HasField(TEXT("output_path")))
+	{
+		OutputPath = Params->GetStringField(TEXT("output_path"));
+		if (FPaths::IsRelative(OutputPath))
+		{
+			OutputPath = FPaths::ProjectDir() / OutputPath;
+		}
+	}
+	else
+	{
+		FString Timestamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
+		FString SafeName = FPaths::GetBaseFilename(AssetPath);
+		OutputPath = FPaths::ProjectDir() / TEXT("Saved/Screenshots/Monolith") /
+			FString::Printf(TEXT("%s_%s.png"), *Timestamp, *SafeName);
+	}
+
+	// UE's FHttpServerModule dispatches handlers on the game thread via FTicker,
+	// so we're already on the game thread here. Call capture functions directly.
+	check(IsInGameThread());
+
+	double StartTime = FPlatformTime::Seconds();
+	bool bSuccess = false;
+
+	if (AssetType.Equals(TEXT("niagara"), ESearchCase::IgnoreCase))
+	{
+		UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *AssetPath);
+		if (!System)
+		{
+			return FMonolithActionResult::Error(
+				FString::Printf(TEXT("Failed to load Niagara system: %s"), *AssetPath));
+		}
+		bSuccess = CaptureNiagaraFrame(System, SeekTime, CameraLocation, CameraRotation,
+			FOV, ResX, ResY, OutputPath);
+	}
+	else if (AssetType.Equals(TEXT("material"), ESearchCase::IgnoreCase))
+	{
+		UMaterialInterface* Material = LoadObject<UMaterialInterface>(nullptr, *AssetPath);
+		if (!Material)
+		{
+			return FMonolithActionResult::Error(
+				FString::Printf(TEXT("Failed to load material: %s"), *AssetPath));
+		}
+		bSuccess = CaptureMaterialFrame(Material, PreviewMesh, CameraLocation, CameraRotation,
+			FOV, ResX, ResY, OutputPath);
+	}
+	else
+	{
+		return FMonolithActionResult::Error(
+			FString::Printf(TEXT("Unsupported asset_type: %s (supported: niagara, material)"), *AssetType));
+	}
+
+	double ElapsedMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+
+	if (!bSuccess)
+	{
+		return FMonolithActionResult::Error(TEXT("Capture failed — check log for details"));
+	}
+
+	// Return result
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("output_file"), OutputPath);
+	TSharedPtr<FJsonObject> ResObj = MakeShared<FJsonObject>();
+	ResObj->SetNumberField(TEXT("width"), ResX);
+	ResObj->SetNumberField(TEXT("height"), ResY);
+	Result->SetObjectField(TEXT("resolution"), ResObj);
+	Result->SetNumberField(TEXT("seek_time"), SeekTime);
+	Result->SetNumberField(TEXT("capture_time_ms"), ElapsedMs);
+
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleCaptureSequenceFrames(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString AssetType = Params->GetStringField(TEXT("asset_type"));
+
+	if (AssetPath.IsEmpty() || AssetType.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("asset_path and asset_type are required"));
+	}
+
+	if (!Params->HasField(TEXT("timestamps")))
+	{
+		return FMonolithActionResult::Error(TEXT("timestamps array is required"));
+	}
+
+	// Parse timestamps
+	TArray<float> Timestamps;
+	const TArray<TSharedPtr<FJsonValue>>& TimestampArray = Params->GetArrayField(TEXT("timestamps"));
+	for (const auto& Val : TimestampArray)
+	{
+		Timestamps.Add((float)Val->AsNumber());
+	}
+	Timestamps.Sort();
+
+	if (Timestamps.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("timestamps array is empty"));
+	}
+
+	// Parse optional params (same as capture_scene_preview)
+	int32 ResX = 512, ResY = 512;
+	if (Params->HasField(TEXT("resolution")))
+	{
+		const TArray<TSharedPtr<FJsonValue>>& ResArray = Params->GetArrayField(TEXT("resolution"));
+		if (ResArray.Num() >= 2)
+		{
+			ResX = (int32)ResArray[0]->AsNumber();
+			ResY = (int32)ResArray[1]->AsNumber();
+		}
+	}
+
+	FVector CameraLocation(200.0f, 0.0f, 100.0f);
+	FRotator CameraRotation(0.0f, 180.0f, 0.0f);
+	float FOV = 60.0f;
+	// Same camera parsing as HandleCaptureScenePreview (with string fallback)
+	if (Params->HasField(TEXT("camera")))
+	{
+		const TSharedPtr<FJsonObject>* CameraObj = nullptr;
+		TSharedPtr<FJsonObject> ParsedCamera;
+		if (!Params->TryGetObjectField(TEXT("camera"), CameraObj))
+		{
+			FString CameraStr = Params->GetStringField(TEXT("camera"));
+			if (!CameraStr.IsEmpty())
+			{
+				ParsedCamera = FMonolithJsonUtils::Parse(CameraStr);
+				CameraObj = &ParsedCamera;
+			}
+		}
+		if (CameraObj && (*CameraObj).IsValid())
+		{
+			if ((*CameraObj)->HasField(TEXT("location")))
+			{
+				const TArray<TSharedPtr<FJsonValue>>& Loc = (*CameraObj)->GetArrayField(TEXT("location"));
+				if (Loc.Num() >= 3) CameraLocation = FVector(Loc[0]->AsNumber(), Loc[1]->AsNumber(), Loc[2]->AsNumber());
+			}
+			if ((*CameraObj)->HasField(TEXT("rotation")))
+			{
+				const TArray<TSharedPtr<FJsonValue>>& Rot = (*CameraObj)->GetArrayField(TEXT("rotation"));
+				if (Rot.Num() >= 3) CameraRotation = FRotator(Rot[0]->AsNumber(), Rot[1]->AsNumber(), Rot[2]->AsNumber());
+			}
+			if ((*CameraObj)->HasField(TEXT("fov")))
+			{
+				FOV = (float)(*CameraObj)->GetNumberField(TEXT("fov"));
+			}
+		}
+	}
+
+	FString OutputDir;
+	if (Params->HasField(TEXT("output_dir")))
+	{
+		OutputDir = Params->GetStringField(TEXT("output_dir"));
+		if (FPaths::IsRelative(OutputDir))
+		{
+			OutputDir = FPaths::ProjectDir() / OutputDir;
+		}
+	}
+	else
+	{
+		FString Timestamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
+		FString SafeName = FPaths::GetBaseFilename(AssetPath);
+		OutputDir = FPaths::ProjectDir() / TEXT("Saved/Screenshots/Monolith") /
+			FString::Printf(TEXT("%s_%s"), *Timestamp, *SafeName);
+	}
+
+	FString FilenamePrefix = TEXT("frame");
+	if (Params->HasField(TEXT("filename_prefix")))
+	{
+		FilenamePrefix = Params->GetStringField(TEXT("filename_prefix"));
+	}
+
+	// Currently only supports Niagara for multi-frame
+	if (!AssetType.Equals(TEXT("niagara"), ESearchCase::IgnoreCase))
+	{
+		return FMonolithActionResult::Error(TEXT("capture_sequence_frames currently only supports asset_type: niagara"));
+	}
+
+	// Already on game thread (UE HTTP server dispatches via FTicker)
+	check(IsInGameThread());
+
+	UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *AssetPath);
+	if (!System)
+	{
+		return FMonolithActionResult::Error(
+			FString::Printf(TEXT("Failed to load: %s"), *AssetPath));
+	}
+
+	double StartTime = FPlatformTime::Seconds();
+	TArray<TSharedPtr<FJsonValue>> FrameResults;
+
+	for (int32 i = 0; i < Timestamps.Num(); i++)
+	{
+		float T = Timestamps[i];
+		FString FramePath = OutputDir / FString::Printf(TEXT("%s_%03d_t%.2f.png"),
+			*FilenamePrefix, i, T);
+
+		bool bOk = CaptureNiagaraFrame(System, T, CameraLocation, CameraRotation,
+			FOV, ResX, ResY, FramePath);
+
+		TSharedPtr<FJsonObject> FrameObj = MakeShared<FJsonObject>();
+		FrameObj->SetNumberField(TEXT("timestamp"), T);
+		FrameObj->SetStringField(TEXT("file"), FramePath);
+		FrameObj->SetBoolField(TEXT("success"), bOk);
+		FrameResults.Add(MakeShared<FJsonValueObject>(FrameObj));
+	}
+
+	double ElapsedMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetArrayField(TEXT("frames"), FrameResults);
+	Result->SetNumberField(TEXT("total_capture_time_ms"), ElapsedMs);
+
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleImportTexture(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	FString SourcePath = Params->GetStringField(TEXT("source_path"));
+	FString Destination = Params->GetStringField(TEXT("destination"));
+
+	if (SourcePath.IsEmpty() || Destination.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("source_path and destination are required"));
+	}
+
+	// Verify source file exists
+	if (!FPaths::FileExists(SourcePath))
+	{
+		return FMonolithActionResult::Error(
+			FString::Printf(TEXT("Source file not found: %s"), *SourcePath));
+	}
+
+	// Import using AssetTools
+	UAutomatedAssetImportData* ImportData = NewObject<UAutomatedAssetImportData>();
+	ImportData->Filenames.Add(SourcePath);
+	ImportData->DestinationPath = FPackageName::GetLongPackagePath(Destination);
+	ImportData->bReplaceExisting = true;
+
+	FAssetToolsModule& AssetToolsModule =
+		FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+	TArray<UObject*> ImportedAssets = AssetToolsModule.Get().ImportAssetsAutomated(ImportData);
+
+	if (ImportedAssets.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("Import failed — no assets imported"));
+	}
+
+	UTexture2D* Texture = Cast<UTexture2D>(ImportedAssets[0]);
+	if (!Texture)
+	{
+		return FMonolithActionResult::Error(TEXT("Imported asset is not a Texture2D"));
+	}
+
+	// Apply optional settings
+	if (Params->HasField(TEXT("settings")))
+	{
+		const TSharedPtr<FJsonObject>* SettingsObj;
+		// Handle string-serialized params (Claude Code quirk)
+		TSharedPtr<FJsonObject> ParsedSettings;
+		if (Params->TryGetObjectField(TEXT("settings"), SettingsObj))
+		{
+			ParsedSettings = *SettingsObj;
+		}
+		else
+		{
+			FString SettingsStr = Params->GetStringField(TEXT("settings"));
+			if (!SettingsStr.IsEmpty())
+			{
+				ParsedSettings = FMonolithJsonUtils::Parse(SettingsStr);
+			}
+		}
+
+		if (ParsedSettings.IsValid())
+		{
+			// Compression
+			if (ParsedSettings->HasField(TEXT("compression")))
+			{
+				FString Comp = ParsedSettings->GetStringField(TEXT("compression"));
+				if (Comp == TEXT("TC_Normalmap")) Texture->CompressionSettings = TC_Normalmap;
+				else if (Comp == TEXT("TC_Masks")) Texture->CompressionSettings = TC_Masks;
+				else if (Comp == TEXT("TC_HDR")) Texture->CompressionSettings = TC_HDR;
+				else if (Comp == TEXT("TC_VectorDisplacementmap")) Texture->CompressionSettings = TC_VectorDisplacementmap;
+				else Texture->CompressionSettings = TC_Default;
+			}
+
+			// sRGB
+			if (ParsedSettings->HasField(TEXT("srgb")))
+			{
+				Texture->SRGB = ParsedSettings->GetBoolField(TEXT("srgb"));
+			}
+
+			// Tiling
+			if (ParsedSettings->HasField(TEXT("tiling")))
+			{
+				if (ParsedSettings->GetBoolField(TEXT("tiling")))
+				{
+					Texture->AddressX = TA_Wrap;
+					Texture->AddressY = TA_Wrap;
+				}
+			}
+
+			// Max size
+			if (ParsedSettings->HasField(TEXT("max_size")))
+			{
+				int32 MaxSize = (int32)ParsedSettings->GetNumberField(TEXT("max_size"));
+				if (MaxSize > 0)
+				{
+					Texture->MaxTextureSize = MaxSize;
+				}
+			}
+
+			// LOD group
+			if (ParsedSettings->HasField(TEXT("lod_group")))
+			{
+				FString LODGroup = ParsedSettings->GetStringField(TEXT("lod_group"));
+				if (LODGroup == TEXT("TEXTUREGROUP_WorldNormalMap")) Texture->LODGroup = TEXTUREGROUP_WorldNormalMap;
+				else if (LODGroup == TEXT("TEXTUREGROUP_Effects")) Texture->LODGroup = TEXTUREGROUP_Effects;
+				else if (LODGroup == TEXT("TEXTUREGROUP_EffectsNotFiltered")) Texture->LODGroup = TEXTUREGROUP_EffectsNotFiltered;
+				// Default: TEXTUREGROUP_World (already default)
+			}
+		}
+	}
+
+	Texture->UpdateResource();
+	Texture->PostEditChange();
+	Texture->MarkPackageDirty();
+
+	// Save the package
+	UPackage* Package = Texture->GetOutermost();
+	FString PackageFilename = FPackageName::LongPackageNameToFilename(
+		Package->GetName(), FPackageName::GetAssetPackageExtension());
+	FSavePackageArgs SaveArgs;
+	UPackage::SavePackage(Package, Texture, *PackageFilename, SaveArgs);
+
+	// Return result
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("asset_path"), Destination);
+	Result->SetNumberField(TEXT("size_x"), Texture->GetSizeX());
+	Result->SetNumberField(TEXT("size_y"), Texture->GetSizeY());
+	Result->SetStringField(TEXT("format"), GPixelFormats[Texture->GetPixelFormat()].Name);
+
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleStitchFlipbook(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	// --- Extract required params ---
+	FString DestPath = Params->GetStringField(TEXT("dest_path"));
+	if (DestPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("dest_path is required"));
+	}
+
+	// Parse frame_paths array
+	const TArray<TSharedPtr<FJsonValue>>* FramePathsArray = nullptr;
+	if (!Params->TryGetArrayField(TEXT("frame_paths"), FramePathsArray) || !FramePathsArray || FramePathsArray->Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("frame_paths array is required and must not be empty"));
+	}
+
+	TArray<FString> FramePaths;
+	for (const auto& Val : *FramePathsArray)
+	{
+		FString Path;
+		if (Val->TryGetString(Path) && !Path.IsEmpty())
+		{
+			FramePaths.Add(Path);
+		}
+	}
+
+	if (FramePaths.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("No valid file paths in frame_paths"));
+	}
+
+	// Parse grid [cols, rows]
+	const TArray<TSharedPtr<FJsonValue>>* GridArray = nullptr;
+	if (!Params->TryGetArrayField(TEXT("grid"), GridArray) || !GridArray || GridArray->Num() != 2)
+	{
+		return FMonolithActionResult::Error(TEXT("grid must be an array of [columns, rows]"));
+	}
+	int32 GridCols = static_cast<int32>((*GridArray)[0]->AsNumber());
+	int32 GridRows = static_cast<int32>((*GridArray)[1]->AsNumber());
+
+	if (GridCols <= 0 || GridRows <= 0)
+	{
+		return FMonolithActionResult::Error(TEXT("grid columns and rows must be positive"));
+	}
+
+	int32 ExpectedFrames = GridCols * GridRows;
+	if (FramePaths.Num() != ExpectedFrames)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("frame_paths has %d entries but grid %dx%d expects %d"),
+			FramePaths.Num(), GridCols, GridRows, ExpectedFrames));
+	}
+
+	// Optional params
+	bool bSRGB = !Params->HasField(TEXT("srgb")) || Params->GetBoolField(TEXT("srgb"));
+	bool bNoMipmaps = !Params->HasField(TEXT("no_mipmaps")) || Params->GetBoolField(TEXT("no_mipmaps"));
+	bool bDeleteSources = !Params->HasField(TEXT("delete_sources")) || Params->GetBoolField(TEXT("delete_sources"));
+
+	FString LODGroupStr = TEXT("TEXTUREGROUP_Effects");
+	if (Params->HasField(TEXT("lod_group")))
+	{
+		LODGroupStr = Params->GetStringField(TEXT("lod_group"));
+	}
+
+	// --- Load all frame images ---
+	IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+
+	int32 FrameWidth = 0;
+	int32 FrameHeight = 0;
+	TArray<TArray<FColor>> FramePixels;
+	FramePixels.SetNum(FramePaths.Num());
+
+	for (int32 i = 0; i < FramePaths.Num(); i++)
+	{
+		const FString& FilePath = FramePaths[i];
+
+		if (!FPaths::FileExists(FilePath))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Frame file not found: %s"), *FilePath));
+		}
+
+		TArray<uint8> FileData;
+		if (!FFileHelper::LoadFileToArray(FileData, *FilePath))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Failed to read frame file: %s"), *FilePath));
+		}
+
+		TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+		if (!ImageWrapper.IsValid() || !ImageWrapper->SetCompressed(FileData.GetData(), FileData.Num()))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Failed to decode PNG: %s"), *FilePath));
+		}
+
+		int32 W = ImageWrapper->GetWidth();
+		int32 H = ImageWrapper->GetHeight();
+
+		// Validate all frames are same size
+		if (i == 0)
+		{
+			FrameWidth = W;
+			FrameHeight = H;
+		}
+		else if (W != FrameWidth || H != FrameHeight)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Frame %d (%s) is %dx%d but frame 0 is %dx%d — all frames must be the same size"),
+				i, *FilePath, W, H, FrameWidth, FrameHeight));
+		}
+
+		TArray<uint8> RawData;
+		if (!ImageWrapper->GetRaw(ERGBFormat::BGRA, 8, RawData))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Failed to decompress frame %d: %s"), i, *FilePath));
+		}
+
+		// Convert raw bytes to FColor array
+		FramePixels[i].SetNum(W * H);
+		FMemory::Memcpy(FramePixels[i].GetData(), RawData.GetData(), W * H * sizeof(FColor));
+	}
+
+	// --- Compose atlas ---
+	int32 AtlasWidth = FrameWidth * GridCols;
+	int32 AtlasHeight = FrameHeight * GridRows;
+	TArray<FColor> AtlasPixels;
+	AtlasPixels.SetNumZeroed(AtlasWidth * AtlasHeight);
+
+	for (int32 FrameIdx = 0; FrameIdx < FramePaths.Num(); FrameIdx++)
+	{
+		int32 Col = FrameIdx % GridCols;
+		int32 Row = FrameIdx / GridCols;
+		int32 OffsetX = Col * FrameWidth;
+		int32 OffsetY = Row * FrameHeight;
+
+		const TArray<FColor>& Src = FramePixels[FrameIdx];
+		for (int32 Y = 0; Y < FrameHeight; Y++)
+		{
+			for (int32 X = 0; X < FrameWidth; X++)
+			{
+				int32 SrcIdx = Y * FrameWidth + X;
+				int32 DstIdx = (OffsetY + Y) * AtlasWidth + (OffsetX + X);
+				AtlasPixels[DstIdx] = Src[SrcIdx];
+			}
+		}
+	}
+
+	// --- Create UTexture2D ---
+	FString PackagePath = FPackageName::GetLongPackagePath(DestPath);
+	FString AssetName = FPackageName::GetLongPackageAssetName(DestPath);
+
+	// Ensure unique package name
+	FString PackageName = PackagePath / AssetName;
+	UPackage* Package = CreatePackage(*PackageName);
+	if (!Package)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to create package: %s"), *PackageName));
+	}
+	Package->FullyLoad();
+
+	UTexture2D* Texture = NewObject<UTexture2D>(Package, *AssetName, RF_Public | RF_Standalone);
+	if (!Texture)
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to create UTexture2D"));
+	}
+
+	// Configure platform data
+	FTexturePlatformData* PlatformData = new FTexturePlatformData();
+	PlatformData->SizeX = AtlasWidth;
+	PlatformData->SizeY = AtlasHeight;
+	PlatformData->PixelFormat = PF_B8G8R8A8;
+	PlatformData->SetNumSlices(1);
+
+	FTexture2DMipMap* Mip = new FTexture2DMipMap();
+	Mip->SizeX = AtlasWidth;
+	Mip->SizeY = AtlasHeight;
+	PlatformData->Mips.Add(Mip);
+
+	// Copy pixel data into mip
+	Mip->BulkData.Lock(LOCK_READ_WRITE);
+	void* MipData = Mip->BulkData.Realloc(AtlasWidth * AtlasHeight * sizeof(FColor));
+	FMemory::Memcpy(MipData, AtlasPixels.GetData(), AtlasWidth * AtlasHeight * sizeof(FColor));
+	Mip->BulkData.Unlock();
+
+	Texture->SetPlatformData(PlatformData);
+
+	// Apply texture settings
+	Texture->Source.Init(AtlasWidth, AtlasHeight, 1, 1, TSF_BGRA8, nullptr);
+	{
+		uint8* SourceData = Texture->Source.LockMip(0);
+		FMemory::Memcpy(SourceData, AtlasPixels.GetData(), AtlasWidth * AtlasHeight * sizeof(FColor));
+		Texture->Source.UnlockMip(0);
+	}
+
+	Texture->SRGB = bSRGB;
+	Texture->CompressionSettings = TC_Default;
+	Texture->AddressX = TA_Clamp;
+	Texture->AddressY = TA_Clamp;
+
+	if (bNoMipmaps)
+	{
+		Texture->MipGenSettings = TMGS_NoMipmaps;
+	}
+
+	// LOD group
+	if (LODGroupStr == TEXT("TEXTUREGROUP_Effects"))
+	{
+		Texture->LODGroup = TEXTUREGROUP_Effects;
+	}
+	else if (LODGroupStr == TEXT("TEXTUREGROUP_EffectsNotFiltered"))
+	{
+		Texture->LODGroup = TEXTUREGROUP_EffectsNotFiltered;
+	}
+	else if (LODGroupStr == TEXT("TEXTUREGROUP_World"))
+	{
+		Texture->LODGroup = TEXTUREGROUP_World;
+	}
+
+	Texture->UpdateResource();
+	Texture->PostEditChange();
+	Texture->MarkPackageDirty();
+
+	// Save
+	FString PackageFilename = FPackageName::LongPackageNameToFilename(
+		Package->GetName(), FPackageName::GetAssetPackageExtension());
+	FSavePackageArgs SaveArgs;
+	bool bSaved = UPackage::SavePackage(Package, Texture, *PackageFilename, SaveArgs);
+
+	if (!bSaved)
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to save flipbook texture package"));
+	}
+
+	// --- Delete source files if requested ---
+	int32 DeletedCount = 0;
+	if (bDeleteSources)
+	{
+		for (const FString& FilePath : FramePaths)
+		{
+			if (IFileManager::Get().Delete(*FilePath))
+			{
+				DeletedCount++;
+			}
+		}
+	}
+
+	// --- Return result ---
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("texture_path"), DestPath);
+
+	TArray<TSharedPtr<FJsonValue>> ResArray;
+	ResArray.Add(MakeShared<FJsonValueNumber>(AtlasWidth));
+	ResArray.Add(MakeShared<FJsonValueNumber>(AtlasHeight));
+	Result->SetArrayField(TEXT("resolution"), ResArray);
+
+	Result->SetNumberField(TEXT("frame_count"), FramePaths.Num());
+	Result->SetNumberField(TEXT("frame_width"), FrameWidth);
+	Result->SetNumberField(TEXT("frame_height"), FrameHeight);
+
+	TArray<TSharedPtr<FJsonValue>> GridResult;
+	GridResult.Add(MakeShared<FJsonValueNumber>(GridCols));
+	GridResult.Add(MakeShared<FJsonValueNumber>(GridRows));
+	Result->SetArrayField(TEXT("grid"), GridResult);
+
+	if (bDeleteSources)
+	{
+		Result->SetNumberField(TEXT("sources_deleted"), DeletedCount);
+	}
+
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleGetViewportInfo(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	// Get the active level editor viewport
+	FLevelEditorViewportClient* ViewportClient = nullptr;
+	if (GEditor && GEditor->GetLevelViewportClients().Num() > 0)
+	{
+		ViewportClient = GEditor->GetLevelViewportClients()[0];
+	}
+
+	if (!ViewportClient)
+	{
+		return FMonolithActionResult::Error(TEXT("No active viewport found"));
+	}
+
+	FVector CamLocation = ViewportClient->GetViewLocation();
+	FRotator CamRotation = ViewportClient->GetViewRotation();
+	float FOV = ViewportClient->ViewFOV;
+
+	FIntPoint ViewportSize = ViewportClient->Viewport->GetSizeXY();
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetNumberField(TEXT("active_viewport"), 0);
+
+	TSharedPtr<FJsonObject> ResObj = MakeShared<FJsonObject>();
+	ResObj->SetNumberField(TEXT("width"), ViewportSize.X);
+	ResObj->SetNumberField(TEXT("height"), ViewportSize.Y);
+	Result->SetObjectField(TEXT("resolution"), ResObj);
+
+	TArray<TSharedPtr<FJsonValue>> LocArr;
+	LocArr.Add(MakeShared<FJsonValueNumber>(CamLocation.X));
+	LocArr.Add(MakeShared<FJsonValueNumber>(CamLocation.Y));
+	LocArr.Add(MakeShared<FJsonValueNumber>(CamLocation.Z));
+	Result->SetArrayField(TEXT("camera_location"), LocArr);
+
+	TArray<TSharedPtr<FJsonValue>> RotArr;
+	RotArr.Add(MakeShared<FJsonValueNumber>(CamRotation.Pitch));
+	RotArr.Add(MakeShared<FJsonValueNumber>(CamRotation.Yaw));
+	RotArr.Add(MakeShared<FJsonValueNumber>(CamRotation.Roll));
+	Result->SetArrayField(TEXT("camera_rotation"), RotArr);
+
+	Result->SetNumberField(TEXT("fov"), FOV);
+	Result->SetBoolField(TEXT("realtime"), ViewportClient->IsRealtime());
+
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithEditorActions::HandleDeleteAssets(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	const TArray<TSharedPtr<FJsonValue>>* AssetPathsArray = nullptr;
+	if (!Params->TryGetArrayField(TEXT("asset_paths"), AssetPathsArray) || !AssetPathsArray || AssetPathsArray->Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("asset_paths array is required and must not be empty"));
+	}
+
+	TArray<FString> AssetPaths;
+	for (const auto& Val : *AssetPathsArray)
+	{
+		FString Path;
+		if (Val->TryGetString(Path) && !Path.IsEmpty())
+		{
+			AssetPaths.Add(Path);
+		}
+	}
+
+	if (AssetPaths.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("No valid paths in asset_paths"));
+	}
+
+	// Safety: only allow deletion under /Game/AgentTraining/
+	for (const FString& Path : AssetPaths)
+	{
+		if (!Path.StartsWith(TEXT("/Game/AgentTraining/")))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Refusing to delete %s — only assets under /Game/AgentTraining/ can be deleted"),
+				*Path));
+		}
+	}
+
+	// Load and delete each asset
+	TArray<UObject*> ObjectsToDelete;
+	TArray<FString> NotFound;
+	TArray<FString> Deleted;
+
+	for (const FString& Path : AssetPaths)
+	{
+		UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *Path);
+		if (Asset)
+		{
+			ObjectsToDelete.Add(Asset);
+			Deleted.Add(Path);
+		}
+		else
+		{
+			NotFound.Add(Path);
+		}
+	}
+
+	int32 NumDeleted = 0;
+	if (ObjectsToDelete.Num() > 0)
+	{
+		NumDeleted = ObjectTools::DeleteObjects(ObjectsToDelete, /*bShowConfirmation=*/false);
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetNumberField(TEXT("deleted"), NumDeleted);
+	Result->SetNumberField(TEXT("requested"), AssetPaths.Num());
+
+	if (NotFound.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> NotFoundArr;
+		for (const FString& P : NotFound)
+		{
+			NotFoundArr.Add(MakeShared<FJsonValueString>(P));
+		}
+		Result->SetArrayField(TEXT("not_found"), NotFoundArr);
+	}
+
+	return FMonolithActionResult::Success(Result);
 }

@@ -8,6 +8,7 @@ type: project
 
 | Version | Date | Tag | Zip size | Actions |
 |---------|------|-----|----------|---------|
+| 0.9.0 | 2026-03-19 | pending | — | 290 |
 | 0.8.0 | 2026-03-15 | pending | — | 220 |
 | 0.7.3 | 2026-03-15 | v0.7.3 | 1.7 MB | 218 |
 | 0.7.2 | 2026-03-13 | v0.7.2 | — | 177 |
@@ -18,6 +19,16 @@ type: project
 | 0.5.x | 2026-03-08/09 | — | — | ~122 |
 | 0.2.0 | 2026-03-08 | — | — | — |
 | 0.1.0 | 2026-03-07 | — | — | 119 |
+
+## v0.9.0 release (2026-03-19)
+
+- Version bump committed (c5f399e). DLL build pending — user will build then zip + push.
+- Key changes: +69 actions (Blueprint 47→67, Material 25→47, Niagara 47→64, Animation 62→74). 60 bug fixes. 202 tests all pass.
+- IKRig/Retargeter/Control Rig/AnimBP writes, full Material instance CRUD, Niagara dynamic inputs/event handlers/simulation stages.
+- After UBT build: push origin/master, make_release.ps1, gh release create v0.9.0
+- **Wiki DONE (2026-03-19):** All 5 pages updated and pushed to origin/master (commit ddeddb9).
+  - Changelog.md, Home.md, Connecting-Your-AI.md, Tool-Reference.md, Test-Status.md
+- **GitHub About section still needs update:** "220 actions" → "290 actions"
 
 ## v0.8.0 release prep (2026-03-15)
 
@@ -40,7 +51,7 @@ type: project
 
 - `make_release.ps1` sets `"Installed": true` in the .uplugin inside the zip
 - Zip lands at `D:\Unreal Projects\Leviathan\Plugins\Monolith-vX.Y.Z.zip` (one level above the plugin folder)
-- Wiki is at `D:\Unreal Projects\Leviathan\monolith.wiki\` — separate git repo
+- Wiki local clone: `D:\Unreal Projects\Leviathan\Plugins\Monolith\wiki\` (cloned 2026-03-19, remote: git@github.com:tumourlove/monolith.wiki.git)
 - After a big feature expansion, check these wiki pages for stale action counts:
   - `Connecting-Your-AI.md` — has action count in the "How It Works" section
   - `Test-Status.md` — header summary, per-module table, and footer note

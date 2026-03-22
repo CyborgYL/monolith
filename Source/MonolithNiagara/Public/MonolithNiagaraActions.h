@@ -123,6 +123,9 @@ public:
 	static FMonolithActionResult HandleValidateSystem(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddSimulationStage(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Composite Helpers (1 new) ---
+	static FMonolithActionResult HandleSetSpawnShape(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);
 

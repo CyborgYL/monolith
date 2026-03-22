@@ -81,6 +81,9 @@ public:
 	static FMonolithActionResult BatchRecompile(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult ImportTexture(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Wave 8: Compound workflows ---
+	static FMonolithActionResult CreatePbrMaterialFromDisk(const TSharedPtr<FJsonObject>& Params);
+
 private:
 	/** Load a UMaterial from an asset path. Returns nullptr on failure. */
 	static UMaterial* LoadBaseMaterial(const FString& AssetPath);

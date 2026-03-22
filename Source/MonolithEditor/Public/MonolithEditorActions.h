@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "MonolithToolRegistry.h"
 #include "Misc/OutputDevice.h"
+#include "Components/SceneCaptureComponent2D.h" // ESceneCaptureSource
 
 struct FMonolithLogEntry
 {
@@ -60,6 +61,14 @@ public:
 	static FMonolithActionResult HandleGetLogStats(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetCrashContext(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Capture actions ---
+	static FMonolithActionResult HandleCaptureScenePreview(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCaptureSequenceFrames(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleImportTexture(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetViewportInfo(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleStitchFlipbook(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleDeleteAssets(const TSharedPtr<FJsonObject>& Params);
+
 	static void OnLiveCodingPatchComplete();
 
 private:
@@ -70,4 +79,22 @@ private:
 	static bool bIsCompiling;
 	static bool bPatchApplied;
 	static double LastCompileEndTimestamp;
+
+	// Capture helpers
+	static bool CaptureNiagaraFrame(
+		class UNiagaraSystem* System, float SeekTime,
+		const FVector& CameraLocation, const FRotator& CameraRotation, float FOV,
+		int32 ResX, int32 ResY, const FString& OutputPath,
+		ESceneCaptureSource CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR);
+
+	static bool CaptureMaterialFrame(
+		class UMaterialInterface* Material, const FString& MeshType,
+		const FVector& CameraLocation, const FRotator& CameraRotation, float FOV,
+		int32 ResX, int32 ResY, const FString& OutputPath,
+		ESceneCaptureSource CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR);
+
+	static bool RenderAndSaveCapture(
+		class USceneCaptureComponent2D* CaptureComp,
+		class UTextureRenderTarget2D* RT,
+		int32 ResX, int32 ResY, const FString& OutputPath);
 };

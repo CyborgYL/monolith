@@ -1,6 +1,6 @@
 # Monolith — Technical Specification
 
-**Version:** 0.7.0 (Beta)
+**Version:** 0.9.0 (Beta)
 **Wiki:** https://github.com/tumourlove/monolith/wiki
 **Engine:** Unreal Engine 5.7+
 **Platform:** Windows, macOS, Linux
@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 12 MCP tools (220 total actions), cutting AI assistant context consumption by ~95%.
+Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 13 MCP tools (340 total actions across 10 domains), cutting AI assistant context consumption by ~95%.
 
 ### What It Replaces
 
@@ -35,14 +35,15 @@ Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate M
 ```
 Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, settings, auto-updater
-  MonolithBlueprint     — Blueprint inspection, variable/component/graph CRUD, node operations, compile (46 actions)
-  MonolithMaterial      — Material inspection + graph editing + CRUD (25 actions)
-  MonolithAnimation     — Animation sequences, montages, ABPs, curves, notifies, skeletons, PoseSearch (62 actions)
-  MonolithNiagara       — Niagara particle systems, HLSL module/function creation (47 actions)
-  MonolithEditor        — Build triggers, live compile, log capture, compile output, crash context (13 actions)
+  MonolithBlueprint     — Blueprint inspection, variable/component/graph CRUD, node operations, compile (66 actions)
+  MonolithMaterial      — Material inspection + graph editing + CRUD (48 actions)
+  MonolithAnimation     — Animation sequences, montages, ABPs, curves, notifies, skeletons, PoseSearch (74 actions)
+  MonolithNiagara       — Niagara particle systems, HLSL module/function creation (65 actions)
+  MonolithEditor        — Build triggers, live compile, log capture, compile output, crash context, scene capture, texture import (19 actions)
   MonolithConfig        — Config/INI resolution and search (6 actions)
   MonolithIndex         — SQLite FTS5 deep project indexer, 14 internal indexers (5 MCP actions)
   MonolithSource        — Engine source + API lookup (11 actions)
+  MonolithUI            — Widget blueprint CRUD, templates, styling, animation, settings scaffolding, accessibility (42 actions)
 ```
 
 ### Discovery/Dispatch Pattern
@@ -63,13 +64,18 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | Module | Loading Phase | Type |
 |--------|--------------|------|
 | MonolithCore | PostEngineInit | Editor |
-| All others (8) | Default | Editor |
+| All others (9) | Default | Editor |
 
 ### Plugin Dependencies
 
 - Niagara
 - SQLiteCore
 - EnhancedInput
+- EditorScriptingUtilities
+- PoseSearch
+- IKRig
+- ControlRig
+- RigVM
 
 ---
 
@@ -88,7 +94,7 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | `FMonolithToolRegistry` | Central singleton action registry. `TMap<FString, FRegisteredAction>` keyed by "namespace.action". Thread-safe — releases lock before executing handlers. Validates required params from schema before dispatch (skips `asset_path` — `GetAssetPath()` handles aliases itself). Returns descriptive error listing missing + provided keys |
 | `FMonolithJsonUtils` | Static JSON-RPC 2.0 helpers. Standard error codes (-32700 through -32603). Declares `LogMonolith` category |
 | `FMonolithAssetUtils` | Asset loading with 4-tier fallback: StaticLoadObject(resolved) -> PackageName.ObjectName -> FindObject+_C suffix -> ForEachObjectWithPackage |
-| `UMonolithSettings` | UDeveloperSettings (config=Monolith). ServerPort, bAutoUpdateEnabled, DatabasePathOverride, EngineSourceDBPathOverride, EngineSourcePath, 8 module enable toggles (functional — checked at registration time), LogVerbosity. Settings UI customized via `FMonolithSettingsCustomization` (IDetailCustomization) with re-index buttons for project and source databases |
+| `UMonolithSettings` | UDeveloperSettings (config=Monolith). ServerPort, bAutoUpdateEnabled, DatabasePathOverride, EngineSourceDBPathOverride, EngineSourcePath, 9 module enable toggles (functional — checked at registration time), LogVerbosity. Settings UI customized via `FMonolithSettingsCustomization` (IDetailCustomization) with re-index buttons for project and source databases |
 | `UMonolithUpdateSubsystem` | UEditorSubsystem. GitHub Releases auto-updater. Shows dialog window with full release notes on update detection. Downloads zip, cross-platform extraction (PowerShell on Windows, unzip on Mac/Linux). Stages to Saved/Monolith/Staging/, hot-swaps on editor exit via FCoreDelegates::OnPreExit. Current version always from compiled MONOLITH_VERSION (version.json only stores pending/staging state). Release zips include pre-compiled DLLs. |
 | `FMonolithCoreTools` | Registers 4 core actions |
 
@@ -111,11 +117,11 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithBlueprintModule` | Registers 47 blueprint actions |
+| `FMonolithBlueprintModule` | Registers 66 blueprint actions |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
-#### Actions (47 — namespace: "blueprint")
+#### Actions (66 — namespace: "blueprint")
 
 **Read Actions (13)**
 | Action | Params | Description |
@@ -197,10 +203,10 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithMaterialModule` | Registers 25 material actions |
+| `FMonolithMaterialModule` | Registers 48 material actions |
 | `FMonolithMaterialActions` | Static handlers + helpers for loading materials and serializing expressions |
 
-#### Actions (25 — namespace: "material")
+#### Actions (48 — namespace: "material")
 
 **Read Actions (10)**
 | Action | Description |
@@ -245,10 +251,10 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithAnimationModule` | Registers 62 animation actions (57 animation + 5 PoseSearch) |
+| `FMonolithAnimationModule` | Registers 74 animation actions (69 animation + 5 PoseSearch) |
 | `FMonolithAnimationActions` | Static handlers organized in 15 groups |
 
-#### Actions (62 — namespace: "animation")
+#### Actions (74 — namespace: "animation")
 
 **Sequence Info (4) — read-only**
 | Action | Description |
@@ -374,7 +380,7 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithNiagaraModule` | Registers 47 Niagara actions |
+| `FMonolithNiagaraModule` | Registers 65 Niagara actions |
 | `FMonolithNiagaraActions` | Static handlers + extensive private helpers |
 | `MonolithNiagaraHelpers` | 6 reimplemented NiagaraEditor functions (non-exported APIs) |
 
@@ -389,7 +395,7 @@ These exist because Epic's `FNiagaraStackGraphUtilities` functions lack `NIAGARA
 5. `GetParametersForContext` — System user store params
 6. `GetStackFunctionInputs` — Full input enumeration via engine's `FNiagaraStackGraphUtilities::GetStackFunctionInputs` with `FCompileConstantResolver`. Returns all input types (floats, vectors, colors, data interfaces, enums, bools) — not just static switch pins
 
-#### Actions (47 — namespace: "niagara")
+#### Actions (65 — namespace: "niagara")
 
 > **Note:** All Niagara actions accept `asset_path` (preferred) or `system_path` (backward compatible) for the system asset path parameter.
 >
@@ -490,12 +496,12 @@ All marked with "UE 5.7 FIX" comments:
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithEditorModule` | Creates FMonolithLogCapture, attaches to GLog, registers 13 actions |
+| `FMonolithEditorModule` | Creates FMonolithLogCapture, attaches to GLog, registers 19 actions |
 | `FMonolithLogCapture` | FOutputDevice subclass. Ring buffer (10,000 entries max). Thread-safe. Tracks counts by verbosity |
 | `FMonolithEditorActions` | Static handlers for build and log operations. Hooks into `ILiveCodingModule::GetOnPatchCompleteDelegate()` to capture compile results and timestamps |
 | `FMonolithSettingsCustomization` | IDetailCustomization for UMonolithSettings. Adds re-index buttons for project and source databases in Project Settings UI |
 
-#### Actions (13 — namespace: "editor")
+#### Actions (19 — namespace: "editor")
 
 | Action | Description |
 |--------|-------------|
@@ -512,6 +518,12 @@ All marked with "UE 5.7 FIX" comments:
 | `get_log_stats` | Log stats: total, fatal, error, warning, log, verbose counts |
 | `get_compile_output` | Structured compile report: result, time, log lines from compile categories (LogLiveCoding, LogCompile, LogLinker), error/warning counts, patch status. Time-windowed to last compile |
 | `get_crash_context` | CrashContext.runtime-xml + Ensures.log + 20 recent errors. Truncated at 4096 chars |
+| `capture_scene_preview` | Capture screenshot of Niagara or material asset in preview scene. Params: `asset_path`, `asset_type`, `seek_time`, `camera`, `resolution`, `output_path` |
+| `capture_sequence_frames` | Multi-frame temporal capture at specified timestamps. Returns array of frame PNGs. Params: `asset_path`, `timestamps[]`, `camera`, `resolution` |
+| `import_texture` | Import external image (PNG/TGA/EXR/HDR) as UTexture2D with settings (compression, sRGB, tiling, LOD group). Params: `source_path`, `destination`, `settings` |
+| `stitch_flipbook` | Stitch multiple texture assets into a flipbook atlas. Params: `frames[]`, `columns`, `save_path` |
+| `delete_assets` | Delete one or more assets by path. Params: `asset_paths[]`, `force` |
+| `get_viewport_info` | Get active editor viewport camera location, rotation, FOV, resolution, realtime state |
 
 ---
 
@@ -619,6 +631,102 @@ All marked with "UE 5.7 FIX" comments:
 | `trigger_project_reindex` | none | Trigger incremental project-only C++ source re-index (updates project symbols in EngineSource.db without a full rebuild) |
 
 **DB Location:** `Plugins/Monolith/Saved/EngineSource.db`
+
+---
+
+### 3.10 MonolithUI
+
+**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, UMGEditor, UMG, Slate, SlateCore, Json, JsonUtilities
+
+#### Classes
+
+| Class | Responsibility |
+|-------|---------------|
+| `FMonolithUIModule` | Registers 42 UI actions |
+| `FMonolithUIActions` | Widget blueprint CRUD: create, inspect, add/remove widgets, property writes, compile |
+| `FMonolithUISlotActions` | Layout slot operations: slot properties, anchor presets, widget movement |
+| `FMonolithUITemplateActions` | High-level HUD/menu/panel scaffold templates (8 templates) |
+| `FMonolithUIStylingActions` | Visual styling: brush, font, color scheme, text, image, batch style |
+| `FMonolithUIAnimationActions` | UMG widget animation CRUD: list, inspect, create, add/remove keyframes |
+| `FMonolithUIBindingActions` | Event/property binding inspection, list view setup, widget binding queries |
+| `FMonolithUISettingsActions` | Settings/save/audio/input remapping subsystem scaffolding (5 scaffolds) |
+| `FMonolithUIAccessibilityActions` | Accessibility subsystem scaffold, audit, colorblind mode, text scale |
+
+#### Actions (42 — namespace: "ui")
+
+**Widget CRUD (7)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `create_widget_blueprint` | `save_path`, `parent_class` | Create a new Widget Blueprint asset |
+| `get_widget_tree` | `asset_path` | Get the full widget hierarchy tree |
+| `add_widget` | `asset_path`, `widget_class`, `parent_slot` | Add a widget to the widget tree |
+| `remove_widget` | `asset_path`, `widget_name` | Remove a widget from the widget tree |
+| `set_widget_property` | `asset_path`, `widget_name`, `property_name`, `value` | Set a property on a widget via reflection |
+| `compile_widget` | `asset_path` | Compile the Widget Blueprint and return errors/warnings |
+| `list_widget_types` | none | List all available widget classes that can be instantiated |
+
+**Slot Operations (3)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `set_slot_property` | `asset_path`, `widget_name`, `property_name`, `value` | Set a layout slot property (padding, alignment, size, etc.) |
+| `set_anchor_preset` | `asset_path`, `widget_name`, `preset` | Apply an anchor preset to a Canvas Panel slot |
+| `move_widget` | `asset_path`, `widget_name`, `new_parent`, `slot_index` | Move a widget to a different parent slot |
+
+**Templates (8)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `create_hud_element` | `save_path`, `element_type` | Scaffold a common HUD element (health bar, crosshair, ammo counter, etc.) |
+| `create_menu` | `save_path`, `menu_type` | Scaffold a menu Widget Blueprint (main menu, pause menu, etc.) |
+| `create_settings_panel` | `save_path` | Scaffold a settings panel with common option categories |
+| `create_dialog` | `save_path`, `dialog_type` | Scaffold a dialog Widget Blueprint (confirmation, info, input prompt) |
+| `create_notification_toast` | `save_path` | Scaffold a notification/toast Widget Blueprint |
+| `create_loading_screen` | `save_path` | Scaffold a loading screen Widget Blueprint with progress bar |
+| `create_inventory_grid` | `save_path`, `columns`, `rows` | Scaffold a grid-based inventory Widget Blueprint |
+| `create_save_slot_list` | `save_path` | Scaffold a save slot list Widget Blueprint |
+
+**Styling (6)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `set_brush` | `asset_path`, `widget_name`, `brush_property`, `texture_path` | Set a brush/image property on a widget |
+| `set_font` | `asset_path`, `widget_name`, `font_asset`, `size` | Set the font and size on a text widget |
+| `set_color_scheme` | `asset_path`, `color_map` | Apply a color scheme (name→LinearColor map) across the widget |
+| `batch_style` | `asset_path`, `style_operations` | Apply multiple styling operations in a single transaction |
+| `set_text` | `asset_path`, `widget_name`, `text` | Set display text on a text widget |
+| `set_image` | `asset_path`, `widget_name`, `texture_path` | Set the texture on an image widget |
+
+**Animation (5)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `list_animations` | `asset_path` | List all UMG animations on a Widget Blueprint |
+| `get_animation_details` | `asset_path`, `animation_name` | Get tracks and keyframes for a named animation |
+| `create_animation` | `asset_path`, `animation_name` | Create a new UMG widget animation |
+| `add_animation_keyframe` | `asset_path`, `animation_name`, `widget_name`, `property`, `time`, `value` | Add a keyframe to a widget animation track |
+| `remove_animation` | `asset_path`, `animation_name` | Remove a UMG widget animation |
+
+**Bindings (4)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `list_widget_events` | `asset_path` | List all bindable events on a Widget Blueprint |
+| `list_widget_properties` | `asset_path`, `widget_name` | List all bindable properties on a widget |
+| `setup_list_view` | `asset_path`, `list_view_name`, `entry_widget_path` | Configure a List View widget with an entry widget class |
+| `get_widget_bindings` | `asset_path` | Get all active property and event bindings on a Widget Blueprint |
+
+**Settings Scaffolding (5)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `scaffold_game_user_settings` | `save_path`, `class_name` | Scaffold a UGameUserSettings subclass with common settings properties |
+| `scaffold_save_game` | `save_path`, `class_name` | Scaffold a USaveGame subclass with save slot infrastructure |
+| `scaffold_save_subsystem` | `save_path`, `class_name` | Scaffold a save game subsystem (UGameInstanceSubsystem) |
+| `scaffold_audio_settings` | `save_path`, `class_name` | Scaffold an audio settings manager with volume/mix controls |
+| `scaffold_input_remapping` | `save_path`, `class_name` | Scaffold an input remapping system backed by Enhanced Input |
+
+**Accessibility (4)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `scaffold_accessibility_subsystem` | `save_path`, `class_name` | Scaffold a UGameInstanceSubsystem implementing accessibility features |
+| `audit_accessibility` | `asset_path` | Audit a Widget Blueprint for common accessibility issues (missing tooltips, low contrast, small text) |
+| `set_colorblind_mode` | `asset_path`, `mode` | Apply a colorblind-safe palette mode (deuteranopia, protanopia, tritanopia) |
+| `set_text_scale` | `asset_path`, `scale` | Apply a global text scale factor to all text widgets in the blueprint |
 
 ---
 
@@ -738,19 +846,20 @@ python Saved/monolith_offline.py <namespace> <action> [args...]
 
 ---
 
-## 6. Skills (9 bundled)
+## 6. Skills (10 bundled)
 
 | Skill | Trigger Words | Entry Point | Actions |
 |-------|--------------|-------------|---------|
-| unreal-animation | animation, montage, ABP, blend space, notify, curves, compression, PoseSearch | `animation_query()` | 67 |
-| unreal-blueprints | Blueprint, BP, event graph, node, variable | `blueprint_query()` | 46 |
-| unreal-build | build, compile, Live Coding, hot reload, rebuild | `editor_query()` | 13 |
+| unreal-animation | animation, montage, ABP, blend space, notify, curves, compression, PoseSearch | `animation_query()` | 74 |
+| unreal-blueprints | Blueprint, BP, event graph, node, variable | `blueprint_query()` | 66 |
+| unreal-build | build, compile, Live Coding, hot reload, rebuild | `editor_query()` | 19 |
 | unreal-cpp | C++, header, include, UCLASS, Build.cs, linker error | `source_query()` + `config_query()` | 11+6 |
-| unreal-debugging | build error, crash, log, debug, stack trace | `editor_query()` | 13 |
-| unreal-materials | material, shader, PBR, texture, material graph | `material_query()` | 25 |
-| unreal-niagara | Niagara, particle, VFX, emitter | `niagara_query()` | 46 |
+| unreal-debugging | build error, crash, log, debug, stack trace | `editor_query()` | 19 |
+| unreal-materials | material, shader, PBR, texture, material graph | `material_query()` | 48 |
+| unreal-niagara | Niagara, particle, VFX, emitter | `niagara_query()` | 65 |
 | unreal-performance | performance, optimization, FPS, frame time | Cross-domain | config + material + niagara |
 | unreal-project-search | find asset, search project, dependencies | `project_query()` | 5 |
+| unreal-ui | UI, HUD, widget, menu, settings, save game, accessibility, font, toast, dialog | `ui_query()` | 42 |
 
 All skills follow a common structure: YAML frontmatter, Discovery section, Asset Path Conventions table, action tables, workflow examples, and rules.
 
@@ -776,6 +885,7 @@ All skills follow a common structure: YAML frontmatter, Discovery section, Asset
 | bConfigEnabled | True | Enable Config module |
 | bIndexEnabled | True | Enable Index module |
 | bSourceEnabled | True | Enable Source module |
+| bUIEnabled | True | Enable UI module |
 | LogVerbosity | 3 (Log) | 0=Silent, 1=Error, 2=Warning, 3=Log, 4=Verbose |
 
 **Note:** Module enable toggles are functional — each module checks its toggle at registration time and skips action registration if disabled.
@@ -812,12 +922,14 @@ YourProject/Plugins/Monolith/
   Skills/
     unreal-animation/unreal-animation.md
     unreal-blueprints/unreal-blueprints.md
+    unreal-build/unreal-build.md
     unreal-cpp/unreal-cpp.md
     unreal-debugging/unreal-debugging.md
     unreal-materials/unreal-materials.md
     unreal-niagara/unreal-niagara.md
     unreal-performance/unreal-performance.md
     unreal-project-search/unreal-project-search.md
+    unreal-ui/unreal-ui.md
   Templates/
     .mcp.json.example
     CLAUDE.md.example
@@ -838,6 +950,7 @@ YourProject/Plugins/Monolith/
     MonolithConfig/                (4 source files)
     MonolithIndex/                 (12+ source files)
     MonolithSource/                (8 source files)
+    MonolithUI/                    (17 source files — 9 .cpp + 8 .h)
   Saved/
     .gitkeep
     monolith_offline.py              (Offline CLI — query DBs without the editor)
@@ -905,14 +1018,15 @@ See `TODO.md` for the full list. Key architectural constraints:
 | Module | Namespace | Actions |
 |--------|-----------|---------|
 | MonolithCore | monolith | 4 |
-| MonolithBlueprint | blueprint | 47 |
-| MonolithMaterial | material | 25 |
-| MonolithAnimation | animation | 62 |
-| MonolithNiagara | niagara | 47 |
-| MonolithEditor | editor | 13 |
+| MonolithBlueprint | blueprint | 66 |
+| MonolithMaterial | material | 48 |
+| MonolithAnimation | animation | 74 |
+| MonolithNiagara | niagara | 65 |
+| MonolithEditor | editor | 19 |
 | MonolithConfig | config | 6 |
 | MonolithIndex | project | 5 |
 | MonolithSource | source | 11 |
-| **Total** | | **220** |
+| MonolithUI | ui | 42 |
+| **Total** | | **340** |
 
-**Note:** PoseSearch's 5 actions are included in Animation's 62 — they are not additive. The original Python server had higher counts (~231 tools) due to fragmented action design.
+**Note:** PoseSearch's 5 actions are included in Animation's 74 — they are not additive. The original Python server had higher counts (~231 tools) due to fragmented action design.

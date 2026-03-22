@@ -1,6 +1,16 @@
 # Monolith — TODO
 
-Last updated: 2026-03-16
+Last updated: 2026-03-22
+
+---
+
+### MonolithUI Module (2026-03-22)
+
+- [x] **NEW: MonolithUI module** — IMPLEMENTED (2026-03-22). 42 actions across 8 action classes in the `ui` namespace (`ui_query` tool). Widget blueprint CRUD, slot layout, HUD/menu templates, styling, UMG animation CRUD, binding inspection, settings scaffolding, accessibility.
+- [x] **MonolithUI — MCP testing** — DONE (2026-03-22). All 42 actions PASS. Full test results in TESTING.md.
+- [ ] **MonolithUI — Phase 3 deprecation warnings** — `GetBindings` and `FMovieSceneBinding::GetName` may generate deprecation warnings in UE 5.7. Audit and update call sites.
+- [x] **MonolithUI — agent skill file** — DONE (2026-03-22). `unreal-ui` skill created in `.claude/skills/` and `Plugins/Monolith/Skills/`, added to `interface-architect` agent definition.
+- [x] **MonolithUI — bUIEnabled settings toggle** — DONE (2026-03-22). `UMonolithSettings::bUIEnabled` wired to registration gating (confirmed in SPEC.md settings table).
 
 ---
 
@@ -93,11 +103,11 @@ Priority features identified for future waves:
 ## Completed
 
 - [x] Core infrastructure (HTTP server, registry, settings, JSON utils, asset utils)
-- [x] All 9 domain modules compiling clean on UE 5.7
+- [x] All 10 domain modules compiling clean on UE 5.7
 - [x] SQLite FTS5 project indexer with 14 indexers (Blueprint, Material, Generic, Dependency, Animation, Niagara, DataTable, Level, GameplayTag, Config, Cpp, UserDefinedEnum, UserDefinedStruct, InputAction)
 - [x] Python tree-sitter engine source indexer
 - [x] Auto-updater via GitHub Releases
-- [x] 9 Claude Code skills (including unreal-build)
+- [x] 10 Claude Code skills (including unreal-build and unreal-ui)
 - [x] Templates (.mcp.json, CLAUDE.md)
 - [x] README, LICENSE, ATTRIBUTION
 - [x] HTTP body null-termination fix
@@ -227,3 +237,4 @@ Priority features identified for future waves:
 - [x] **Animation Waves 1-7: 39 new actions** — IMPLEMENTED (2026-03-10). Total animation module: 62 actions + 5 PoseSearch = 67. Waves: 8 read actions, 4 notify CRUD, 5 curve CRUD, 6 skeleton+blendspace, 6 creation+montage, 5 PoseSearch, 5 modifiers+composites. Build errors fixed: BlendParameters private, GetTargetSkeleton removed, UMirrorDataTable forward-decl, GetBoneAnimationTracks deprecated, OpenBracket FText.
 - [x] **Blueprint module upgrade: 6 → 46 actions** — IMPLEMENTED (2026-03-13). Added 40 new write actions across 5 categories: Variable CRUD (7), Component CRUD (6), Graph Management (9), Node & Pin Operations (6), Compile & Create (5). Also expanded Read Actions to 13 (added get_components, get_component_details, get_functions, get_event_dispatchers, get_parent_class, get_interfaces, get_construction_script). Total plugin actions: 177 → 217.
 - [x] **Offline CLI (`monolith_offline.py`)** — IMPLEMENTED (2026-03-13). Pure Python (stdlib only) CLI that queries `EngineSource.db` and `ProjectIndex.db` directly without the editor running. 14 actions across 2 namespaces: `source` (9 actions, mirrors `source_query`) and `project` (5 actions, mirrors `project_query`). Read-only, zero footprint, zero dependencies. Fallback for when MCP/editor is unavailable. Location: `Saved/monolith_offline.py`.
+- [x] **NEW: MonolithUI module** — IMPLEMENTED (2026-03-22). New module at `Source/MonolithUI/`. 42 actions in `ui` namespace (`ui_query` tool). 8 action classes: FMonolithUIActions (7), FMonolithUISlotActions (3), FMonolithUITemplateActions (8), FMonolithUIStylingActions (6), FMonolithUIAnimationActions (5), FMonolithUIBindingActions (4), FMonolithUISettingsActions (5), FMonolithUIAccessibilityActions (4).

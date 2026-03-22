@@ -758,12 +758,14 @@ UNiagaraRendererProperties* FMonolithNiagaraActions::GetRenderer(UNiagaraSystem*
 FNiagaraTypeDefinition FMonolithNiagaraActions::ResolveNiagaraType(const FString& TypeName)
 {
 	FString L = TypeName.ToLower();
-	if (L == TEXT("float")) return FNiagaraTypeDefinition::GetFloatDef();
-	if (L == TEXT("int") || L == TEXT("int32")) return FNiagaraTypeDefinition::GetIntDef();
-	if (L == TEXT("bool")) return FNiagaraTypeDefinition::GetBoolDef();
-	if (L == TEXT("vec2") || L == TEXT("vector2d") || L == TEXT("vector2")) return FNiagaraTypeDefinition::GetVec2Def();
-	if (L == TEXT("vec3") || L == TEXT("vector") || L == TEXT("vector3")) return FNiagaraTypeDefinition::GetVec3Def();
-	if (L == TEXT("vec4") || L == TEXT("vector4")) return FNiagaraTypeDefinition::GetVec4Def();
+	// Bug fix: agents use "NiagaraFloat", "NiagaraBool", "Vector3f" etc. — handle the Niagara-prefixed
+	// and HLSL-suffixed forms so they map correctly instead of silently falling back to float.
+	if (L == TEXT("float") || L == TEXT("niagarafloat")) return FNiagaraTypeDefinition::GetFloatDef();
+	if (L == TEXT("int") || L == TEXT("int32") || L == TEXT("niagaraint") || L == TEXT("niagaraint32")) return FNiagaraTypeDefinition::GetIntDef();
+	if (L == TEXT("bool") || L == TEXT("niagarabool")) return FNiagaraTypeDefinition::GetBoolDef();
+	if (L == TEXT("vec2") || L == TEXT("vector2d") || L == TEXT("vector2") || L == TEXT("vector2f") || L == TEXT("float2")) return FNiagaraTypeDefinition::GetVec2Def();
+	if (L == TEXT("vec3") || L == TEXT("vector") || L == TEXT("vector3") || L == TEXT("vector3f") || L == TEXT("float3")) return FNiagaraTypeDefinition::GetVec3Def();
+	if (L == TEXT("vec4") || L == TEXT("vector4") || L == TEXT("vector4f") || L == TEXT("float4")) return FNiagaraTypeDefinition::GetVec4Def();
 	if (L == TEXT("color") || L == TEXT("linearcolor")) return FNiagaraTypeDefinition::GetColorDef();
 	if (L == TEXT("position")) return FNiagaraTypeDefinition::GetPositionDef();
 	if (L == TEXT("quat") || L == TEXT("quaternion")) return FNiagaraTypeDefinition::GetQuatDef();
@@ -1312,7 +1314,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	// --- Wave 3: DI Curve & Configuration (2 new) ---
-	Registry.RegisterAction(TEXT("niagara"), TEXT("configure_curve_keys"), TEXT("Set keys on an existing curve DI attached to a module input"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("configure_curve_keys"), TEXT("Set keys on a DataInterface curve input (NiagaraDataInterfaceCurve/ColorCurve). For plain float inputs use set_curve_value instead"),
 		FMonolithActionHandler::CreateStatic(&HandleConfigureCurveKeys),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Niagara system asset path"))
@@ -1420,6 +1422,18 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("name"), TEXT("string"), TEXT("Stage name"))
 			.Optional(TEXT("iteration_source"), TEXT("string"), TEXT("particles or data_interface (default: particles)"))
 			.Optional(TEXT("num_iterations"), TEXT("integer"), TEXT("Number of iterations (default: 1)"))
+			.Build());
+
+	// --- Composite Helpers (1 new) ---
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_spawn_shape"),
+		TEXT("Add a spawn shape (Cylinder, Sphere, Box, Cone, Torus) to an emitter with automatic switch setup"),
+		FMonolithActionHandler::CreateStatic(&HandleSetSpawnShape),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Niagara system asset path"))
+			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
+			.Required(TEXT("shape"), TEXT("string"), TEXT("Shape type: Cylinder, Sphere, Box, Cone, Torus"))
+			.Optional(TEXT("params"), TEXT("object"), TEXT("Shape parameters (radius, height, surface_only, etc.)"))
+			.Optional(TEXT("replace_existing"), TEXT("bool"), TEXT("Remove existing location module if present (default: true)"))
 			.Build());
 }
 
@@ -2133,6 +2147,16 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddModule(const TSharedPtr<
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("node_guid"), NewNode->NodeGuid.ToString());
+
+	// Warn when adding ShapeLocation modules — they need InitializeParticle Position Mode set
+	FString ScriptBaseName = FPaths::GetBaseFilename(ModuleScriptPath);
+	if (ScriptBaseName.Contains(TEXT("ShapeLocation")))
+	{
+		R->SetStringField(TEXT("warning"),
+			TEXT("ShapeLocation requires InitializeParticle 'Position Mode' set to 'Simulation Position'. "
+			     "Call set_static_switch_value on InitializeParticle if particles fail to spawn."));
+	}
+
 	return SuccessObj(R);
 }
 
@@ -4219,6 +4243,18 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 		if (!Op.IsValid()) { Fail++; continue; }
 
 		FString OpName = Op->GetStringField(TEXT("op"));
+		if (OpName.IsEmpty()) OpName = Op->GetStringField(TEXT("action"));
+		if (OpName.IsEmpty()) OpName = Op->GetStringField(TEXT("operation"));
+		if (OpName.IsEmpty())
+		{
+			Fail++;
+			auto FailObj = MakeShared<FJsonObject>();
+			FailObj->SetBoolField(TEXT("success"), false);
+			FailObj->SetNumberField(TEXT("index"), i);
+			FailObj->SetStringField(TEXT("error"), TEXT("Missing 'op' field in operation object. Use 'op' as the key name."));
+			Results.Add(MakeShared<FJsonValueObject>(FailObj));
+			continue;
+		}
 		TSharedRef<FJsonObject> RO = MakeShared<FJsonObject>();
 		RO->SetNumberField(TEXT("index"), i);
 		RO->SetStringField(TEXT("op"), OpName);
@@ -4267,6 +4303,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 		else if (OpName == TEXT("get_emitter_summary")) SubResult = HandleGetEmitterSummary(SubParams);
 		else if (OpName == TEXT("list_emitter_properties")) SubResult = HandleListEmitterProperties(SubParams);
 		else if (OpName == TEXT("get_module_input_value")) SubResult = HandleGetModuleInputValue(SubParams);
+		else if (OpName == TEXT("get_module_inputs")) SubResult = HandleGetModuleInputs(SubParams);
 		// Wave 3
 		else if (OpName == TEXT("configure_curve_keys")) SubResult = HandleConfigureCurveKeys(SubParams);
 		else if (OpName == TEXT("configure_data_interface")) SubResult = HandleConfigureDataInterface(SubParams);
@@ -4284,6 +4321,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 		else if (OpName == TEXT("add_event_handler")) SubResult = HandleAddEventHandler(SubParams);
 		else if (OpName == TEXT("validate_system")) SubResult = HandleValidateSystem(SubParams);
 		else if (OpName == TEXT("add_simulation_stage")) SubResult = HandleAddSimulationStage(SubParams);
+		// Composite
+		else if (OpName == TEXT("set_spawn_shape")) SubResult = HandleSetSpawnShape(SubParams);
 
 		RO->SetBoolField(TEXT("success"), SubResult.bSuccess);
 		if (!SubResult.bSuccess) RO->SetStringField(TEXT("error"), SubResult.ErrorMessage);
@@ -5810,7 +5849,10 @@ FMonolithActionResult FMonolithNiagaraActions::HandleConfigureCurveKeys(const TS
 		if (bMatch) { InputType = In.GetType(); MatchedFullName = In.GetName(); bFound = true; break; }
 	}
 	if (!bFound) return FMonolithActionResult::Error(FString::Printf(TEXT("Input '%s' not found"), *InputName));
-	if (!InputType.IsDataInterface()) return FMonolithActionResult::Error(TEXT("Input is not a DataInterface type. Use set_module_input_di to create one first."));
+	if (!InputType.IsDataInterface()) return FMonolithActionResult::Error(FString::Printf(
+		TEXT("Input '%s' is a plain value type (%s), not a DataInterface curve. Use set_curve_value to animate it: "
+			 "{\"op\": \"set_curve_value\", \"input\": \"%s\", \"keys\": [{\"time\": 0, \"value\": 0}, ...]}"),
+		*InputName, *InputType.GetName(), *InputName));
 
 	// Find existing DI
 	UNiagaraDataInterface* DI = FindDIFromOverridePin(MN, MatchedFullName, InputType);
@@ -5923,7 +5965,11 @@ FMonolithActionResult FMonolithNiagaraActions::HandleConfigureCurveKeys(const TS
 	}
 	else
 	{
-		// Float curve — set interp on each key
+		// Plain {time, value} format — normalize keys first, then check DI type.
+		// Bug fix: if the DI is a ColorCurve, plain float keys used to build a Config with only
+		// a "keys" field, which ApplyCurveConfig never reads for ColorCurve (it looks for
+		// "red"/"green"/"blue"/"alpha"). The fix: when the target DI is a ColorCurve, fan the
+		// scalar value out to all four RGBA channels so the caller doesn't have to.
 		TArray<TSharedPtr<FJsonValue>> FloatKeys;
 		for (const TSharedPtr<FJsonValue>& KV : Keys)
 		{
@@ -5935,7 +5981,22 @@ FMonolithActionResult FMonolithNiagaraActions::HandleConfigureCurveKeys(const TS
 			NK->SetStringField(TEXT("interp_mode"), InterpMode == RCIM_Linear ? TEXT("linear") : InterpMode == RCIM_Constant ? TEXT("constant") : TEXT("cubic"));
 			FloatKeys.Add(MakeShared<FJsonValueObject>(NK));
 		}
-		Config->SetField(TEXT("keys"), MakeShared<FJsonValueArray>(FloatKeys));
+
+		if (Cast<UNiagaraDataInterfaceColorCurve>(DI))
+		{
+			// ColorCurve DI but plain scalar keys provided — fan the value out to all RGBA
+			// channels. This is the most common intent: "fade all channels by the same curve".
+			// Callers who want per-channel control should use r/g/b/a key fields instead.
+			TSharedRef<FJsonValueArray> ChannelKeys = MakeShared<FJsonValueArray>(FloatKeys);
+			Config->SetField(TEXT("red"),   ChannelKeys);
+			Config->SetField(TEXT("green"), ChannelKeys);
+			Config->SetField(TEXT("blue"),  ChannelKeys);
+			Config->SetField(TEXT("alpha"), ChannelKeys);
+		}
+		else
+		{
+			Config->SetField(TEXT("keys"), MakeShared<FJsonValueArray>(FloatKeys));
+		}
 	}
 
 	bool bApplied = MonolithNiagaraHelpers::ApplyCurveConfig(DI, Config);
@@ -6893,4 +6954,222 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddSimulationStage(const TS
 	R->SetStringField(TEXT("stage_id"), NewStage->GetMergeId().ToString());
 	R->SetStringField(TEXT("iteration_source"), IterSourceStr);
 	return FMonolithActionResult::Success(R);
+}
+
+// ============================================================================
+// Action: set_spawn_shape
+// Composite: removes existing location modules, sets InitializeParticle position
+// mode, adds the requested shape location module, and sets any shape parameters.
+// ============================================================================
+
+FMonolithActionResult FMonolithNiagaraActions::HandleSetSpawnShape(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = GetAssetPath(Params);
+	FString EmitterName = Params->GetStringField(TEXT("emitter"));
+	FString Shape = Params->GetStringField(TEXT("shape"));
+	bool bReplaceExisting = true;
+	Params->TryGetBoolField(TEXT("replace_existing"), bReplaceExisting);
+
+	if (AssetPath.IsEmpty() || EmitterName.IsEmpty() || Shape.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("asset_path, emitter, and shape are required"));
+
+	Shape = Shape.ToLower();
+
+	// Map shape name → module script path
+	TMap<FString, FString> ShapeToModule;
+	ShapeToModule.Add(TEXT("cylinder"), TEXT("/Niagara/Modules/Spawn/Location/CylinderLocation.CylinderLocation"));
+	ShapeToModule.Add(TEXT("sphere"),   TEXT("/Niagara/Modules/Spawn/Location/SphereLocation.SphereLocation"));
+	ShapeToModule.Add(TEXT("box"),      TEXT("/Niagara/Modules/Spawn/Location/BoxLocation.BoxLocation"));
+	ShapeToModule.Add(TEXT("cone"),     TEXT("/Niagara/Modules/Spawn/Location/ConeLocation.ConeLocation"));
+	ShapeToModule.Add(TEXT("torus"),    TEXT("/Niagara/Modules/Spawn/Location/TorusLocation.TorusLocation"));
+	ShapeToModule.Add(TEXT("shape"),         TEXT("/Niagara/Modules/Spawn/Location/V2/ShapeLocation.ShapeLocation"));
+	ShapeToModule.Add(TEXT("shapev2"),       TEXT("/Niagara/Modules/Spawn/Location/V2/ShapeLocation.ShapeLocation"));
+	ShapeToModule.Add(TEXT("shapelocation"), TEXT("/Niagara/Modules/Spawn/Location/V2/ShapeLocation.ShapeLocation"));
+
+	FString* ModulePath = ShapeToModule.Find(Shape);
+	if (!ModulePath)
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Invalid shape '%s'. Valid values: Cylinder, Sphere, Box, Cone, Torus, Shape (V2), ShapeLocation"), *Shape));
+
+	TArray<FString> Warnings;
+
+	// -------------------------------------------------------------------------
+	// Step 1: Remove existing location modules if replace_existing is true
+	// -------------------------------------------------------------------------
+	if (bReplaceExisting)
+	{
+		TSharedPtr<FJsonObject> GetModParams = MakeShared<FJsonObject>();
+		GetModParams->SetStringField(TEXT("asset_path"), AssetPath);
+		GetModParams->SetStringField(TEXT("emitter"), EmitterName);
+		GetModParams->SetStringField(TEXT("usage"), TEXT("particle_spawn"));
+
+		FMonolithActionResult ModResult = HandleGetOrderedModules(GetModParams);
+		if (ModResult.bSuccess && ModResult.Result.IsValid())
+		{
+			// Known location module name substrings (covers individual + ShapeLocation V2)
+			TArray<FString> LocationKeywords = {
+				TEXT("CylinderLocation"), TEXT("SphereLocation"), TEXT("BoxLocation"),
+				TEXT("ConeLocation"), TEXT("TorusLocation"), TEXT("ShapeLocation")
+			};
+
+			const TArray<TSharedPtr<FJsonValue>>* ModulesArr;
+			if (ModResult.Result->TryGetArrayField(TEXT("modules"), ModulesArr))
+			{
+				for (const TSharedPtr<FJsonValue>& ModVal : *ModulesArr)
+				{
+					const TSharedPtr<FJsonObject> Mod = ModVal->AsObject();
+					if (!Mod.IsValid()) continue;
+
+					FString ModName = Mod->GetStringField(TEXT("module_name"));
+					FString NodeGuid = Mod->GetStringField(TEXT("node_guid"));
+
+					for (const FString& Keyword : LocationKeywords)
+					{
+						if (ModName.Contains(Keyword))
+						{
+							TSharedPtr<FJsonObject> RemoveParams = MakeShared<FJsonObject>();
+							RemoveParams->SetStringField(TEXT("asset_path"), AssetPath);
+							RemoveParams->SetStringField(TEXT("emitter"), EmitterName);
+							RemoveParams->SetStringField(TEXT("module_node"), NodeGuid);
+							HandleRemoveModule(RemoveParams);
+							Warnings.Add(FString::Printf(TEXT("Removed existing location module: %s"), *ModName));
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// Step 2: Set InitializeParticle's Position Mode to "Simulation Position"
+	// -------------------------------------------------------------------------
+	{
+		TSharedPtr<FJsonObject> GetModParams = MakeShared<FJsonObject>();
+		GetModParams->SetStringField(TEXT("asset_path"), AssetPath);
+		GetModParams->SetStringField(TEXT("emitter"), EmitterName);
+		GetModParams->SetStringField(TEXT("usage"), TEXT("particle_spawn"));
+
+		FMonolithActionResult ModResult = HandleGetOrderedModules(GetModParams);
+		if (ModResult.bSuccess && ModResult.Result.IsValid())
+		{
+			const TArray<TSharedPtr<FJsonValue>>* ModulesArr;
+			if (ModResult.Result->TryGetArrayField(TEXT("modules"), ModulesArr))
+			{
+				for (const TSharedPtr<FJsonValue>& ModVal : *ModulesArr)
+				{
+					const TSharedPtr<FJsonObject> Mod = ModVal->AsObject();
+					if (!Mod.IsValid()) continue;
+
+					FString ModName = Mod->GetStringField(TEXT("module_name"));
+					if (ModName.Contains(TEXT("InitializeParticle")))
+					{
+						FString NodeGuid = Mod->GetStringField(TEXT("node_guid"));
+						TSharedPtr<FJsonObject> SwitchParams = MakeShared<FJsonObject>();
+						SwitchParams->SetStringField(TEXT("asset_path"), AssetPath);
+						SwitchParams->SetStringField(TEXT("emitter"), EmitterName);
+						SwitchParams->SetStringField(TEXT("module_node"), NodeGuid);
+						SwitchParams->SetStringField(TEXT("input"), TEXT("Position Mode"));
+						SwitchParams->SetStringField(TEXT("value"), TEXT("Simulation Position"));
+						FMonolithActionResult SwitchResult = HandleSetStaticSwitchValue(SwitchParams);
+						if (!SwitchResult.bSuccess)
+							Warnings.Add(FString::Printf(TEXT("Could not set InitializeParticle Position Mode: %s"), *SwitchResult.ErrorMessage));
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// Step 3: Add the location module to particle_spawn
+	// -------------------------------------------------------------------------
+	TSharedPtr<FJsonObject> AddParams = MakeShared<FJsonObject>();
+	AddParams->SetStringField(TEXT("asset_path"), AssetPath);
+	AddParams->SetStringField(TEXT("emitter"), EmitterName);
+	AddParams->SetStringField(TEXT("module_script"), *ModulePath);
+	AddParams->SetStringField(TEXT("usage"), TEXT("particle_spawn"));
+
+	FMonolithActionResult AddResult = HandleAddModule(AddParams);
+	if (!AddResult.bSuccess)
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to add %s module: %s"), *Shape, *AddResult.ErrorMessage));
+
+	FString NodeGuid;
+	if (AddResult.Result.IsValid())
+		NodeGuid = AddResult.Result->GetStringField(TEXT("node_guid"));
+
+	// -------------------------------------------------------------------------
+	// Step 4: Apply shape parameters if provided
+	// -------------------------------------------------------------------------
+	TArray<FString> ParamsSet;
+	const TSharedPtr<FJsonObject>* ShapeParamsObj;
+	if (!NodeGuid.IsEmpty() && Params->TryGetObjectField(TEXT("params"), ShapeParamsObj) && ShapeParamsObj->IsValid())
+	{
+		for (const auto& Pair : (*ShapeParamsObj)->Values)
+		{
+			// Map friendly param names to module input display names
+			FString InputName = Pair.Key;
+			if (InputName == TEXT("radius"))
+			{
+				if      (Shape == TEXT("cylinder")) InputName = TEXT("Cylinder Radius");
+				else if (Shape == TEXT("sphere"))   InputName = TEXT("Sphere Radius");
+				else if (Shape == TEXT("torus"))    InputName = TEXT("Torus Radius");
+			}
+			else if (InputName == TEXT("height"))
+			{
+				if      (Shape == TEXT("cylinder")) InputName = TEXT("Cylinder Height");
+				else if (Shape == TEXT("cone"))     InputName = TEXT("Cone Height");
+			}
+			else if (InputName == TEXT("half_extent") && Shape == TEXT("box"))
+			{
+				InputName = TEXT("Box Half Extents");
+			}
+			// All other keys (surface_only, inner_radius, etc.) are passed through as-is
+
+			TSharedPtr<FJsonObject> SetParams = MakeShared<FJsonObject>();
+			SetParams->SetStringField(TEXT("asset_path"), AssetPath);
+			SetParams->SetStringField(TEXT("emitter"), EmitterName);
+			SetParams->SetStringField(TEXT("module_node"), NodeGuid);
+			SetParams->SetStringField(TEXT("input"), InputName);
+			SetParams->SetField(TEXT("value"), Pair.Value);
+
+			FMonolithActionResult SetResult = HandleSetModuleInputValue(SetParams);
+			if (SetResult.bSuccess)
+				ParamsSet.Add(Pair.Key);
+			else
+				Warnings.Add(FString::Printf(TEXT("Failed to set param '%s': %s"), *Pair.Key, *SetResult.ErrorMessage));
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// Step 5: Compile
+	// -------------------------------------------------------------------------
+	TSharedPtr<FJsonObject> CompileParams = MakeShared<FJsonObject>();
+	CompileParams->SetStringField(TEXT("asset_path"), AssetPath);
+	HandleRequestCompile(CompileParams);
+
+	// -------------------------------------------------------------------------
+	// Build result
+	// -------------------------------------------------------------------------
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("shape"), Shape);
+	Result->SetStringField(TEXT("module_node_guid"), NodeGuid);
+	Result->SetStringField(TEXT("location_module"), *ModulePath);
+
+	TArray<TSharedPtr<FJsonValue>> ParamsArr;
+	for (const FString& P : ParamsSet)
+		ParamsArr.Add(MakeShared<FJsonValueString>(P));
+	Result->SetArrayField(TEXT("params_set"), ParamsArr);
+
+	if (Warnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarnArr;
+		for (const FString& W : Warnings)
+			WarnArr.Add(MakeShared<FJsonValueString>(W));
+		Result->SetArrayField(TEXT("warnings"), WarnArr);
+	}
+
+	return FMonolithActionResult::Success(Result);
 }
