@@ -17,14 +17,14 @@ struct FNiagaraParameterStore;
 
 /**
  * Niagara domain action handlers for Monolith.
- * 69 actions across system, module, parameter, renderer, DI, diagnostics, and advanced domains.
- * Waves 1-6 + Phase 3 dynamic input features (5 new actions).
+ * 89 actions across system, module, parameter, renderer, DI, diagnostics, NPC, effect type, and advanced domains.
+ * Waves 1-6 + Phases 3-7.
  * Fixed for UE 5.7 API compatibility.
  */
 class FMonolithNiagaraActions
 {
 public:
-	/** Register all 64 niagara actions with the tool registry */
+	/** Register all niagara actions with the tool registry */
 	static void RegisterActions(FMonolithToolRegistry& Registry);
 
 	// --- System (8) ---
@@ -169,6 +169,11 @@ public:
 
 	// --- Phase 6B: Preview (1 new) ---
 	static FMonolithActionResult HandlePreviewSystem(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Phase 7: Advanced Features (3 new) ---
+	static FMonolithActionResult HandleDiffSystems(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSaveEmitterAsTemplate(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCloneModuleOverrides(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);

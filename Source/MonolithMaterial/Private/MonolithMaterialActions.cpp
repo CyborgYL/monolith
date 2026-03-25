@@ -44,6 +44,11 @@
 #include "AssetToolsModule.h"
 #include "AssetImportTask.h"
 #include "Engine/Texture2D.h"
+#include "Engine/TextureCollection.h"
+#include "Engine/Font.h"
+#include "VT/RuntimeVirtualTexture.h"
+#include "SparseVolumeTexture/SparseVolumeTexture.h"
+#include "Materials/MaterialParameterCollection.h"
 #include "MaterialGraph/MaterialGraphNode.h"
 
 // ============================================================================
@@ -6835,7 +6840,7 @@ FMonolithActionResult FMonolithMaterialActions::SetFunctionMetadata(const TShare
 	MatFunc->MarkPackageDirty();
 
 	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
-	AR.AssetTagsChanged(MatFunc);
+	AR.AssetTagsFinalized(*MatFunc);
 
 	auto ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
