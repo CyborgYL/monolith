@@ -28,6 +28,11 @@ public:
 	static FMonolithActionResult HandleAddEventNode(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddCommentNode(const TSharedPtr<FJsonObject>& Params);
 
+	// Phase 3A — Timeline read/edit
+	static FMonolithActionResult HandleGetTimelineData(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddTimelineTrack(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetTimelineKeys(const TSharedPtr<FJsonObject>& Params);
+
 	// Wave 7 — Advanced
 	static FMonolithActionResult HandlePromotePinToVariable(const TSharedPtr<FJsonObject>& Params);
 };

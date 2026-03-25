@@ -16,8 +16,13 @@
 #include "Materials/MaterialFunction.h"
 #include "Materials/MaterialFunctionMaterialLayer.h"
 #include "Materials/MaterialFunctionMaterialLayerBlend.h"
+#include "Materials/MaterialFunctionInstance.h"
 #include "Materials/MaterialExpressionFunctionInput.h"
 #include "Materials/MaterialExpressionFunctionOutput.h"
+#include "Materials/MaterialExpressionStaticBoolParameter.h"
+#include "Materials/MaterialExpressionStaticSwitchParameter.h"
+#include "Materials/MaterialExpressionScalarParameter.h"
+#include "Materials/MaterialExpressionVectorParameter.h"
 #include "MaterialExpressionIO.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "EditorAssetLibrary.h"
@@ -41,6 +46,11 @@
 #include "AssetToolsModule.h"
 #include "AssetImportTask.h"
 #include "Engine/Texture2D.h"
+#include "Engine/TextureCollection.h"
+#include "Engine/Font.h"
+#include "VT/RuntimeVirtualTexture.h"
+#include "SparseVolumeTexture/SparseVolumeTexture.h"
+#include "Materials/MaterialParameterCollection.h"
 #include "MaterialGraph/MaterialGraphNode.h"
 
 // ============================================================================
@@ -469,6 +479,7 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("description"), TEXT("string"), TEXT("Description shown in the material editor"))
 			.Optional(TEXT("expose_to_library"), TEXT("bool"), TEXT("Expose to the material function library"), TEXT("true"))
 			.Optional(TEXT("library_categories"), TEXT("array"), TEXT("Array of category strings for library organization"))
+			.Optional(TEXT("type"), TEXT("string"), TEXT("Function type: MaterialFunction (default), MaterialLayer, or MaterialLayerBlend"), TEXT("MaterialFunction"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("material"), TEXT("build_function_graph"),
@@ -485,6 +496,40 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::GetFunctionInfo),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material function asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("export_function_graph"),
+		TEXT("Export complete material function graph to JSON (expressions, connections, inputs, outputs, properties)"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::ExportFunctionGraph),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("MaterialFunction asset path"))
+			.Optional(TEXT("include_properties"), TEXT("bool"), TEXT("Include full property reflection data per expression"), TEXT("true"))
+			.Optional(TEXT("include_positions"), TEXT("bool"), TEXT("Include editor node positions"), TEXT("true"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("set_function_metadata"),
+		TEXT("Update material function metadata (description, categories, library exposure)"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::SetFunctionMetadata),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("MaterialFunction asset path"))
+			.Optional(TEXT("description"), TEXT("string"), TEXT("Function description text"))
+			.Optional(TEXT("expose_to_library"), TEXT("bool"), TEXT("Expose in material function library"))
+			.Optional(TEXT("library_categories"), TEXT("array"), TEXT("Library category strings"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("update_material_function"),
+		TEXT("Recompile material function and cascade changes to all referencing materials/instances"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::UpdateMaterialFunction),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("MaterialFunction or MaterialFunctionInstance asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("delete_function_expression"),
+		TEXT("Delete expression(s) from a material function"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::DeleteFunctionExpression),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("MaterialFunction asset path"))
+			.Required(TEXT("expression_name"), TEXT("string"), TEXT("Expression name or comma-separated names to delete"))
 			.Build());
 
 	// --- Wave 7: Batch & Advanced ---
@@ -547,6 +592,57 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("max_texture_size"), TEXT("integer"), TEXT("Max texture resolution"), TEXT("2048"))
 			.Optional(TEXT("opacity_from_alpha"), TEXT("bool"), TEXT("Wire basecolor alpha to Opacity (decals)"), TEXT("false"))
 			.Optional(TEXT("replace_existing"), TEXT("bool"), TEXT("Replace existing material and textures"), TEXT("false"))
+			.Build());
+
+	// --- Wave 9: Function instances ---
+
+	Registry.RegisterAction(TEXT("material"), TEXT("create_function_instance"),
+		TEXT("Create a material function instance with parent and optional parameter overrides"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::CreateFunctionInstance),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path for new MFI"))
+			.Required(TEXT("parent"), TEXT("string"), TEXT("Parent material function or instance asset path"))
+			.Optional(TEXT("scalar_overrides"), TEXT("object"), TEXT("Scalar param overrides {name: value}"))
+			.Optional(TEXT("vector_overrides"), TEXT("object"), TEXT("Vector param overrides {name: {r,g,b,a}}"))
+			.Optional(TEXT("texture_overrides"), TEXT("object"), TEXT("Texture param overrides {name: texture_path}"))
+			.Optional(TEXT("static_switch_overrides"), TEXT("object"), TEXT("Static switch overrides {name: bool}"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("set_function_instance_parameter"),
+		TEXT("Set or update a parameter override on a material function instance"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::SetFunctionInstanceParameter),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("MFI asset path"))
+			.Required(TEXT("parameter_name"), TEXT("string"), TEXT("Parameter name to override"))
+			.Optional(TEXT("scalar_value"), TEXT("number"), TEXT("Scalar parameter value"))
+			.Optional(TEXT("vector_value"), TEXT("object"), TEXT("Vector value {r,g,b,a}"))
+			.Optional(TEXT("texture_value"), TEXT("string"), TEXT("Texture asset path"))
+			.Optional(TEXT("switch_value"), TEXT("bool"), TEXT("Static switch value"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("get_function_instance_info"),
+		TEXT("Get material function instance info including parent chain and parameter overrides"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::GetFunctionInstanceInfo),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("MFI asset path"))
+			.Build());
+
+	// --- Wave 10: Function utilities ---
+
+	Registry.RegisterAction(TEXT("material"), TEXT("layout_function_expressions"),
+		TEXT("Auto-arrange expression layout in a material function"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::LayoutFunctionExpressions),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("MaterialFunction asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("rename_function_parameter_group"),
+		TEXT("Rename a parameter group across all parameters in a material function"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::RenameFunctionParameterGroup),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("MaterialFunction asset path"))
+			.Required(TEXT("old_group"), TEXT("string"), TEXT("Current group name"))
+			.Required(TEXT("new_group"), TEXT("string"), TEXT("New group name"))
 			.Build());
 }
 
@@ -1458,10 +1554,7 @@ FMonolithActionResult FMonolithMaterialActions::ExportMaterialGraph(const TShare
 			NodeJson->SetStringField(TEXT("id"), Expr->GetName());
 
 			FString ClassName = Expr->GetClass()->GetName();
-			if (ClassName.StartsWith(TEXT("MaterialExpression")))
-			{
-				ClassName = ClassName.Mid(18);
-			}
+			ClassName.RemoveFromStart(TEXT("MaterialExpression"));
 			NodeJson->SetStringField(TEXT("class"), ClassName);
 
 			if (bIncludePositions)
@@ -5831,8 +5924,9 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 
 // ============================================================================
 // Action: create_material_function
-// Params: { "asset_path", "description"?, "expose_to_library"?, "library_categories"? }
-// Creates a new UMaterialFunction asset.
+// Params: { "asset_path", "description"?, "expose_to_library"?, "library_categories"?, "type"? }
+// Creates a new UMaterialFunction, UMaterialFunctionMaterialLayer, or
+// UMaterialFunctionMaterialLayerBlend asset depending on the "type" param.
 // ============================================================================
 
 FMonolithActionResult FMonolithMaterialActions::CreateMaterialFunction(const TSharedPtr<FJsonObject>& Params)
@@ -5864,6 +5958,24 @@ FMonolithActionResult FMonolithMaterialActions::CreateMaterialFunction(const TSh
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
 	}
 
+	// Resolve function class from type param
+	FString FuncType = TEXT("MaterialFunction");
+	Params->TryGetStringField(TEXT("type"), FuncType);
+
+	UClass* FuncClass = UMaterialFunction::StaticClass();
+	if (FuncType == TEXT("MaterialLayer"))
+	{
+		FuncClass = UMaterialFunctionMaterialLayer::StaticClass();
+	}
+	else if (FuncType == TEXT("MaterialLayerBlend"))
+	{
+		FuncClass = UMaterialFunctionMaterialLayerBlend::StaticClass();
+	}
+	else if (FuncType != TEXT("MaterialFunction"))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Unknown function type '%s' — valid values: MaterialFunction, MaterialLayer, MaterialLayerBlend"), *FuncType));
+	}
+
 	// Create package and material function
 	UPackage* Pkg = CreatePackage(*AssetPath);
 	if (!Pkg)
@@ -5871,7 +5983,7 @@ FMonolithActionResult FMonolithMaterialActions::CreateMaterialFunction(const TSh
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
 	}
 
-	UMaterialFunction* NewFunc = NewObject<UMaterialFunction>(Pkg, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional);
+	UMaterialFunction* NewFunc = Cast<UMaterialFunction>(NewObject<UObject>(Pkg, FuncClass, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional));
 	if (!NewFunc)
 	{
 		return FMonolithActionResult::Error(TEXT("Failed to create UMaterialFunction object"));
@@ -5915,6 +6027,7 @@ FMonolithActionResult FMonolithMaterialActions::CreateMaterialFunction(const TSh
 	auto ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), NewFunc->GetPathName());
 	ResultJson->SetStringField(TEXT("asset_name"), AssetName);
+	ResultJson->SetStringField(TEXT("type"), FuncType);
 	ResultJson->SetStringField(TEXT("description"), NewFunc->Description);
 	ResultJson->SetBoolField(TEXT("expose_to_library"), bExposeToLibrary);
 
@@ -6336,6 +6449,516 @@ FMonolithActionResult FMonolithMaterialActions::GetFunctionInfo(const TSharedPtr
 	ResultJson->SetNumberField(TEXT("expression_count"), ExpressionsJson.Num());
 	ResultJson->SetNumberField(TEXT("input_count"), InputsJson.Num());
 	ResultJson->SetNumberField(TEXT("output_count"), OutputsJson.Num());
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ----------------------------------------------------------------------------
+// export_function_graph — Full material function graph export (GitHub #7)
+// ----------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithMaterialActions::ExportFunctionGraph(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	bool bIncludeProperties = true;
+	bool bIncludePositions = true;
+	Params->TryGetBoolField(TEXT("include_properties"), bIncludeProperties);
+	Params->TryGetBoolField(TEXT("include_positions"), bIncludePositions);
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+
+	UMaterialFunction* MatFunc = Cast<UMaterialFunction>(LoadedAsset);
+	if (!MatFunc)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset '%s' is not a MaterialFunction"), *AssetPath));
+	}
+
+	TConstArrayView<TObjectPtr<UMaterialExpression>> Expressions = MatFunc->GetExpressions();
+
+	// Build expression ID map
+	TMap<UMaterialExpression*, FString> ExprToId;
+	for (const TObjectPtr<UMaterialExpression>& Expr : Expressions)
+	{
+		if (Expr)
+		{
+			ExprToId.Add(Expr, Expr->GetName());
+		}
+	}
+
+	// --- Metadata ---
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetStringField(TEXT("description"), MatFunc->Description);
+	ResultJson->SetStringField(TEXT("user_exposed_caption"), MatFunc->UserExposedCaption);
+	ResultJson->SetBoolField(TEXT("expose_to_library"), MatFunc->bExposeToLibrary);
+
+	// Determine specific type
+	if (Cast<UMaterialFunctionMaterialLayer>(LoadedAsset))
+	{
+		ResultJson->SetStringField(TEXT("type"), TEXT("MaterialLayer"));
+	}
+	else if (Cast<UMaterialFunctionMaterialLayerBlend>(LoadedAsset))
+	{
+		ResultJson->SetStringField(TEXT("type"), TEXT("MaterialLayerBlend"));
+	}
+	else
+	{
+		ResultJson->SetStringField(TEXT("type"), TEXT("MaterialFunction"));
+	}
+
+	// Library categories
+	TArray<TSharedPtr<FJsonValue>> CatsJson;
+	for (const FText& Cat : MatFunc->LibraryCategoriesText)
+	{
+		CatsJson.Add(MakeShared<FJsonValueString>(Cat.ToString()));
+	}
+	ResultJson->SetArrayField(TEXT("library_categories"), CatsJson);
+
+	// --- Separate inputs/outputs from regular nodes ---
+	const UEnum* InputTypeEnum = StaticEnum<EFunctionInputType>();
+
+	TArray<TSharedPtr<FJsonValue>> InputsJson;
+	TArray<TSharedPtr<FJsonValue>> OutputsJson;
+	TArray<TSharedPtr<FJsonValue>> NodesArray;
+	TArray<TSharedPtr<FJsonValue>> CustomHlslArray;
+
+	for (const TObjectPtr<UMaterialExpression>& Expr : Expressions)
+	{
+		if (!Expr)
+		{
+			continue;
+		}
+
+		// --- Function Inputs ---
+		if (const auto* FuncInput = Cast<UMaterialExpressionFunctionInput>(Expr))
+		{
+			auto InputJson = MakeShared<FJsonObject>();
+			InputJson->SetStringField(TEXT("id"), Expr->GetName());
+			InputJson->SetStringField(TEXT("name"), FuncInput->InputName.ToString());
+			InputJson->SetNumberField(TEXT("sort_priority"), FuncInput->SortPriority);
+			InputJson->SetStringField(TEXT("description"), FuncInput->Description);
+			InputJson->SetBoolField(TEXT("use_preview_value_as_default"), FuncInput->bUsePreviewValueAsDefault);
+
+			if (InputTypeEnum)
+			{
+				FString TypeStr = InputTypeEnum->GetNameStringByIndex(static_cast<int32>(FuncInput->InputType));
+				TypeStr.RemoveFromStart(TEXT("FunctionInput_"));
+				InputJson->SetStringField(TEXT("type"), TypeStr);
+			}
+
+			// Preview value as 4-element array
+			TArray<TSharedPtr<FJsonValue>> PreviewArr;
+			PreviewArr.Add(MakeShared<FJsonValueNumber>(FuncInput->PreviewValue.X));
+			PreviewArr.Add(MakeShared<FJsonValueNumber>(FuncInput->PreviewValue.Y));
+			PreviewArr.Add(MakeShared<FJsonValueNumber>(FuncInput->PreviewValue.Z));
+			PreviewArr.Add(MakeShared<FJsonValueNumber>(FuncInput->PreviewValue.W));
+			InputJson->SetArrayField(TEXT("preview_value"), PreviewArr);
+
+			// Blend input relevance
+			InputJson->SetNumberField(TEXT("blend_input_relevance"), static_cast<int32>(FuncInput->BlendInputRelevance));
+
+			if (bIncludePositions)
+			{
+				TArray<TSharedPtr<FJsonValue>> PosArr;
+				PosArr.Add(MakeShared<FJsonValueNumber>(Expr->MaterialExpressionEditorX));
+				PosArr.Add(MakeShared<FJsonValueNumber>(Expr->MaterialExpressionEditorY));
+				InputJson->SetArrayField(TEXT("pos"), PosArr);
+			}
+
+			InputsJson.Add(MakeShared<FJsonValueObject>(InputJson));
+			continue;
+		}
+
+		// --- Function Outputs ---
+		if (const auto* FuncOutput = Cast<UMaterialExpressionFunctionOutput>(Expr))
+		{
+			auto OutputJson = MakeShared<FJsonObject>();
+			OutputJson->SetStringField(TEXT("id"), Expr->GetName());
+			OutputJson->SetStringField(TEXT("name"), FuncOutput->OutputName.ToString());
+			OutputJson->SetNumberField(TEXT("sort_priority"), FuncOutput->SortPriority);
+			OutputJson->SetStringField(TEXT("description"), FuncOutput->Description);
+
+			if (bIncludePositions)
+			{
+				TArray<TSharedPtr<FJsonValue>> PosArr;
+				PosArr.Add(MakeShared<FJsonValueNumber>(Expr->MaterialExpressionEditorX));
+				PosArr.Add(MakeShared<FJsonValueNumber>(Expr->MaterialExpressionEditorY));
+				OutputJson->SetArrayField(TEXT("pos"), PosArr);
+			}
+
+			OutputsJson.Add(MakeShared<FJsonValueObject>(OutputJson));
+			continue;
+		}
+
+		// --- Custom HLSL nodes ---
+		const UMaterialExpressionCustom* CustomExpr = Cast<UMaterialExpressionCustom>(Expr);
+		if (CustomExpr)
+		{
+			auto NodeJson = MakeShared<FJsonObject>();
+			NodeJson->SetStringField(TEXT("id"), Expr->GetName());
+
+			if (bIncludePositions)
+			{
+				TArray<TSharedPtr<FJsonValue>> PosArr;
+				PosArr.Add(MakeShared<FJsonValueNumber>(Expr->MaterialExpressionEditorX));
+				PosArr.Add(MakeShared<FJsonValueNumber>(Expr->MaterialExpressionEditorY));
+				NodeJson->SetArrayField(TEXT("pos"), PosArr);
+			}
+
+			NodeJson->SetStringField(TEXT("code"), CustomExpr->Code);
+			NodeJson->SetStringField(TEXT("description"), CustomExpr->Description);
+			NodeJson->SetStringField(TEXT("output_type"), CustomOutputTypeToString(CustomExpr->OutputType));
+
+			TArray<TSharedPtr<FJsonValue>> CustInputsArr;
+			for (const FCustomInput& CustInput : CustomExpr->Inputs)
+			{
+				auto CustInputJson = MakeShared<FJsonObject>();
+				CustInputJson->SetStringField(TEXT("name"), CustInput.InputName.ToString());
+				CustInputsArr.Add(MakeShared<FJsonValueObject>(CustInputJson));
+			}
+			NodeJson->SetArrayField(TEXT("inputs"), CustInputsArr);
+
+			TArray<TSharedPtr<FJsonValue>> AddOutputsArr;
+			for (const FCustomOutput& AddOut : CustomExpr->AdditionalOutputs)
+			{
+				auto OutJson = MakeShared<FJsonObject>();
+				OutJson->SetStringField(TEXT("name"), AddOut.OutputName.ToString());
+				OutJson->SetStringField(TEXT("type"), CustomOutputTypeToString(AddOut.OutputType));
+				AddOutputsArr.Add(MakeShared<FJsonValueObject>(OutJson));
+			}
+			NodeJson->SetArrayField(TEXT("additional_outputs"), AddOutputsArr);
+
+			CustomHlslArray.Add(MakeShared<FJsonValueObject>(NodeJson));
+		}
+		else
+		{
+			// --- Regular expression nodes ---
+			auto NodeJson = MakeShared<FJsonObject>();
+			NodeJson->SetStringField(TEXT("id"), Expr->GetName());
+
+			FString ClassName = Expr->GetClass()->GetName();
+			ClassName.RemoveFromStart(TEXT("MaterialExpression"));
+			NodeJson->SetStringField(TEXT("class"), ClassName);
+
+			if (bIncludePositions)
+			{
+				TArray<TSharedPtr<FJsonValue>> PosArr;
+				PosArr.Add(MakeShared<FJsonValueNumber>(Expr->MaterialExpressionEditorX));
+				PosArr.Add(MakeShared<FJsonValueNumber>(Expr->MaterialExpressionEditorY));
+				NodeJson->SetArrayField(TEXT("pos"), PosArr);
+			}
+
+			// Parameter enrichment
+			if (auto* Param = Cast<UMaterialExpressionParameter>(Expr))
+			{
+				NodeJson->SetStringField(TEXT("parameter_name"), Param->ParameterName.ToString());
+				NodeJson->SetStringField(TEXT("group"), Param->Group.ToString());
+				NodeJson->SetNumberField(TEXT("sort_priority"), Param->SortPriority);
+			}
+
+			// Static switch (must check before StaticBool since switch inherits from it)
+			if (auto* SwitchParam = Cast<UMaterialExpressionStaticSwitchParameter>(Expr))
+			{
+				NodeJson->SetBoolField(TEXT("default_value"), SwitchParam->DefaultValue != 0);
+				NodeJson->SetBoolField(TEXT("dynamic_branch"), SwitchParam->DynamicBranch != 0);
+			}
+			else if (auto* StaticBoolParam = Cast<UMaterialExpressionStaticBoolParameter>(Expr))
+			{
+				NodeJson->SetBoolField(TEXT("default_value"), StaticBoolParam->DefaultValue != 0);
+				NodeJson->SetBoolField(TEXT("dynamic_branch"), StaticBoolParam->DynamicBranch != 0);
+			}
+
+			// Comment text
+			if (const auto* Comment = Cast<UMaterialExpressionComment>(Expr))
+			{
+				NodeJson->SetStringField(TEXT("text"), Comment->Text);
+			}
+
+			// Function call reference
+			if (const auto* FuncCall = Cast<UMaterialExpressionMaterialFunctionCall>(Expr))
+			{
+				if (FuncCall->MaterialFunction)
+				{
+					NodeJson->SetStringField(TEXT("function"), FuncCall->MaterialFunction->GetPathName());
+				}
+			}
+
+			// Full property reflection
+			if (bIncludeProperties)
+			{
+				auto PropsJson = MakeShared<FJsonObject>();
+				for (TFieldIterator<FProperty> PropIt(Expr->GetClass()); PropIt; ++PropIt)
+				{
+					FProperty* Prop = *PropIt;
+					if (!Prop || Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient))
+					{
+						continue;
+					}
+					if (Prop->GetOwnerClass() == UMaterialExpression::StaticClass())
+					{
+						continue;
+					}
+					FString ValueStr;
+					const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Expr);
+					Prop->ExportTextItem_Direct(ValueStr, ValuePtr, nullptr, nullptr, PPF_None);
+					if (!ValueStr.IsEmpty())
+					{
+						PropsJson->SetStringField(Prop->GetName(), ValueStr);
+					}
+				}
+				NodeJson->SetObjectField(TEXT("props"), PropsJson);
+			}
+
+			NodesArray.Add(MakeShared<FJsonValueObject>(NodeJson));
+		}
+	}
+
+	// Sort inputs and outputs by sort priority
+	InputsJson.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+	{
+		return A->AsObject()->GetNumberField(TEXT("sort_priority")) < B->AsObject()->GetNumberField(TEXT("sort_priority"));
+	});
+	OutputsJson.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+	{
+		return A->AsObject()->GetNumberField(TEXT("sort_priority")) < B->AsObject()->GetNumberField(TEXT("sort_priority"));
+	});
+
+	// --- Build connections (traverse ALL expressions including Input/Output) ---
+	TArray<TSharedPtr<FJsonValue>> ConnectionsArray;
+	for (const TObjectPtr<UMaterialExpression>& Expr : Expressions)
+	{
+		if (!Expr)
+		{
+			continue;
+		}
+		for (int32 i = 0; ; ++i)
+		{
+			FExpressionInput* ExprInput = Expr->GetInput(i);
+			if (!ExprInput)
+			{
+				break;
+			}
+			if (!ExprInput->Expression)
+			{
+				continue;
+			}
+
+			auto ConnJson = MakeShared<FJsonObject>();
+			FString* FromId = ExprToId.Find(ExprInput->Expression);
+			ConnJson->SetStringField(TEXT("from"), FromId ? *FromId : ExprInput->Expression->GetName());
+
+			FString FromPin;
+			const TArray<FExpressionOutput>& SourceOutputs = ExprInput->Expression->Outputs;
+			if (SourceOutputs.IsValidIndex(ExprInput->OutputIndex))
+			{
+				FromPin = SourceOutputs[ExprInput->OutputIndex].OutputName.ToString();
+			}
+			ConnJson->SetStringField(TEXT("from_pin"), FromPin);
+			ConnJson->SetStringField(TEXT("to"), Expr->GetName());
+			ConnJson->SetStringField(TEXT("to_pin"), Expr->GetInputName(i).ToString());
+
+			ConnectionsArray.Add(MakeShared<FJsonValueObject>(ConnJson));
+		}
+	}
+
+	// --- Assemble result ---
+	ResultJson->SetArrayField(TEXT("inputs"), InputsJson);
+	ResultJson->SetArrayField(TEXT("outputs"), OutputsJson);
+	ResultJson->SetArrayField(TEXT("nodes"), NodesArray);
+	ResultJson->SetArrayField(TEXT("custom_hlsl_nodes"), CustomHlslArray);
+	ResultJson->SetArrayField(TEXT("connections"), ConnectionsArray);
+	ResultJson->SetNumberField(TEXT("expression_count"), Expressions.Num());
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ----------------------------------------------------------------------------
+// set_function_metadata — Update description, library exposure, and categories
+// ----------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithMaterialActions::SetFunctionMetadata(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+
+	UMaterialFunction* MatFunc = Cast<UMaterialFunction>(LoadedAsset);
+	if (!MatFunc)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset '%s' is not a MaterialFunction"), *AssetPath));
+	}
+
+	MatFunc->Modify();
+
+	TArray<FString> UpdatedFields;
+
+	FString DescriptionValue;
+	if (Params->TryGetStringField(TEXT("description"), DescriptionValue))
+	{
+		MatFunc->Description = DescriptionValue;
+		UpdatedFields.Add(TEXT("description"));
+	}
+
+	bool bExposeValue;
+	if (Params->TryGetBoolField(TEXT("expose_to_library"), bExposeValue))
+	{
+		MatFunc->bExposeToLibrary = bExposeValue;
+		UpdatedFields.Add(TEXT("expose_to_library"));
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* CategoriesArray;
+	if (Params->TryGetArrayField(TEXT("library_categories"), CategoriesArray))
+	{
+		MatFunc->LibraryCategoriesText.Empty();
+		for (const TSharedPtr<FJsonValue>& CatVal : *CategoriesArray)
+		{
+			FString CatStr;
+			if (CatVal.IsValid() && CatVal->TryGetString(CatStr))
+			{
+				MatFunc->LibraryCategoriesText.Add(FText::FromString(CatStr));
+			}
+		}
+		UpdatedFields.Add(TEXT("library_categories"));
+	}
+
+	MatFunc->MarkPackageDirty();
+
+	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+	AR.AssetTagsFinalized(*MatFunc);
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetBoolField(TEXT("modified"), true);
+
+	TArray<TSharedPtr<FJsonValue>> UpdatedFieldsJson;
+	for (const FString& Field : UpdatedFields)
+	{
+		UpdatedFieldsJson.Add(MakeShared<FJsonValueString>(Field));
+	}
+	ResultJson->SetArrayField(TEXT("updated_fields"), UpdatedFieldsJson);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ----------------------------------------------------------------------------
+// update_material_function — Recompile function and cascade to all references
+// ----------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithMaterialActions::UpdateMaterialFunction(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+
+	UMaterialFunctionInterface* MatFuncInterface = Cast<UMaterialFunctionInterface>(LoadedAsset);
+	if (!MatFuncInterface)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset '%s' is not a MaterialFunction or MaterialFunctionInstance"), *AssetPath));
+	}
+
+	// UpdateMaterialFunction handles ForceRecompileForRendering, MarkPackageDirty,
+	// iterating in-memory UMaterialFunctionInstance objects, and rebuilding editors/viewports.
+	UMaterialEditingLibrary::UpdateMaterialFunction(MatFuncInterface, nullptr);
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetBoolField(TEXT("updated"), true);
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ----------------------------------------------------------------------------
+// delete_function_expression — Delete one or more expressions from a MaterialFunction
+// ----------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithMaterialActions::DeleteFunctionExpression(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString ExpressionNameParam = Params->GetStringField(TEXT("expression_name"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+
+	// Reject function instances — DeleteMaterialExpressionInFunction requires UMaterialFunction*, not UMaterialFunctionInterface*
+	if (Cast<UMaterialFunctionInstance>(LoadedAsset))
+	{
+		return FMonolithActionResult::Error(TEXT("Cannot delete expressions from a function instance — modify the base function instead"));
+	}
+
+	UMaterialFunction* MatFunc = Cast<UMaterialFunction>(LoadedAsset);
+	if (!MatFunc)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset '%s' is not a MaterialFunction"), *AssetPath));
+	}
+
+	// Parse comma-separated expression names, trim whitespace
+	TArray<FString> NamesToDelete;
+	ExpressionNameParam.ParseIntoArray(NamesToDelete, TEXT(","));
+	for (FString& Name : NamesToDelete)
+	{
+		Name = Name.TrimStartAndEnd();
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("DeleteFunctionExpression")));
+	MatFunc->Modify();
+
+	// Build name→expression map for O(1) lookups instead of O(N) per name
+	TMap<FString, UMaterialExpression*> NameToExpr;
+	for (UMaterialExpression* Expr : MatFunc->GetExpressions())
+	{
+		if (Expr)
+		{
+			NameToExpr.Add(Expr->GetName(), Expr);
+		}
+	}
+
+	int32 DeletedCount = 0;
+	TArray<FString> NotFound;
+
+	for (const FString& Name : NamesToDelete)
+	{
+		UMaterialExpression** FoundPtr = NameToExpr.Find(Name);
+		if (!FoundPtr || !(*FoundPtr))
+		{
+			NotFound.Add(Name);
+			continue;
+		}
+
+		// Breaks all connections automatically
+		UMaterialEditingLibrary::DeleteMaterialExpressionInFunction(MatFunc, *FoundPtr);
+		NameToExpr.Remove(Name);
+		++DeletedCount;
+	}
+
+	GEditor->EndTransaction();
+	MatFunc->MarkPackageDirty();
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetNumberField(TEXT("deleted"), DeletedCount);
+
+	TArray<TSharedPtr<FJsonValue>> NotFoundJson;
+	for (const FString& Name : NotFound)
+	{
+		NotFoundJson.Add(MakeShared<FJsonValueString>(Name));
+	}
+	ResultJson->SetArrayField(TEXT("not_found"), NotFoundJson);
 
 	return FMonolithActionResult::Success(ResultJson);
 }
@@ -7325,6 +7948,790 @@ FMonolithActionResult FMonolithMaterialActions::CreatePbrMaterialFromDisk(const 
 	{
 		ResultJson->SetArrayField(TEXT("texture_errors"), TextureErrors);
 	}
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: create_function_instance
+// Creates a UMaterialFunctionInstance (or layer/blend subclass) with a parent
+// function and optional parameter overrides.
+// ============================================================================
+FMonolithActionResult FMonolithMaterialActions::CreateFunctionInstance(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString ParentPath = Params->GetStringField(TEXT("parent"));
+
+	// Check if asset already exists
+	UObject* Existing = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (Existing)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+	}
+
+	// Extract package path and asset name
+	FString AssetName;
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+	{
+		return FMonolithActionResult::Error(TEXT("Invalid asset path"));
+	}
+	AssetName = AssetPath.Mid(LastSlash + 1);
+
+	// Load parent as UMaterialFunctionInterface
+	UObject* ParentObj = UEditorAssetLibrary::LoadAsset(ParentPath);
+	UMaterialFunctionInterface* ParentFunc = ParentObj ? Cast<UMaterialFunctionInterface>(ParentObj) : nullptr;
+	if (!ParentFunc)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load parent function at '%s'"), *ParentPath));
+	}
+
+	// Create package
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg)
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to create package"));
+	}
+
+	// Determine correct instance class based on parent's usage
+	EMaterialFunctionUsage Usage = ParentFunc->GetMaterialFunctionUsage();
+	FString TypeName;
+	UMaterialFunctionInstance* MFI = nullptr;
+
+	switch (Usage)
+	{
+	case EMaterialFunctionUsage::MaterialLayer:
+		MFI = NewObject<UMaterialFunctionMaterialLayerInstance>(Pkg, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional);
+		TypeName = TEXT("MaterialFunctionMaterialLayerInstance");
+		break;
+	case EMaterialFunctionUsage::MaterialLayerBlend:
+		MFI = NewObject<UMaterialFunctionMaterialLayerBlendInstance>(Pkg, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional);
+		TypeName = TEXT("MaterialFunctionMaterialLayerBlendInstance");
+		break;
+	default:
+		MFI = NewObject<UMaterialFunctionInstance>(Pkg, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional);
+		TypeName = TEXT("MaterialFunctionInstance");
+		break;
+	}
+
+	if (!MFI)
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to create MaterialFunctionInstance object"));
+	}
+
+	// Set parent — this sets Parent, caches Base, syncs usage
+	MFI->SetParent(ParentFunc);
+
+	// Build parameter lookup from base function expressions.
+	// UpdateParameterSet() only syncs names on EXISTING entries — it does NOT populate
+	// empty arrays. We must manually create entries with the correct ExpressionGUIDs.
+	UMaterialFunction* BaseFunc = MFI->GetBaseFunction();
+	TMap<FName, FGuid> ScalarParamGUIDs;
+	TMap<FName, FGuid> VectorParamGUIDs;
+	TMap<FName, FGuid> TextureParamGUIDs;
+	TMap<FName, FGuid> SwitchParamGUIDs;
+
+	if (BaseFunc)
+	{
+		for (UMaterialExpression* Expr : BaseFunc->GetExpressions())
+		{
+			if (auto* SP = Cast<UMaterialExpressionScalarParameter>(Expr))
+			{
+				ScalarParamGUIDs.Add(SP->ParameterName, SP->ExpressionGUID);
+			}
+			else if (auto* VP = Cast<UMaterialExpressionVectorParameter>(Expr))
+			{
+				VectorParamGUIDs.Add(VP->ParameterName, VP->ExpressionGUID);
+			}
+			else if (auto* TP = Cast<UMaterialExpressionTextureSampleParameter>(Expr))
+			{
+				TextureParamGUIDs.Add(TP->ParameterName, TP->ExpressionGUID);
+			}
+			else if (auto* SWP = Cast<UMaterialExpressionStaticSwitchParameter>(Expr))
+			{
+				SwitchParamGUIDs.Add(SWP->ParameterName, SWP->ExpressionGUID);
+			}
+			else if (auto* SBP = Cast<UMaterialExpressionStaticBoolParameter>(Expr))
+			{
+				// StaticBoolParameter without switch — still a switch override in MFI
+				if (!Cast<UMaterialExpressionStaticSwitchParameter>(Expr))
+				{
+					SwitchParamGUIDs.Add(SBP->ParameterName, SBP->ExpressionGUID);
+				}
+			}
+		}
+	}
+
+	// Track override counts and errors
+	int32 ScalarCount = 0;
+	int32 VectorCount = 0;
+	int32 TextureCount = 0;
+	int32 SwitchCount = 0;
+	TArray<TSharedPtr<FJsonValue>> Errors;
+
+	// Apply scalar overrides — create entries with GUIDs from base function
+	const TSharedPtr<FJsonObject>* ScalarOverrides = nullptr;
+	if (Params->TryGetObjectField(TEXT("scalar_overrides"), ScalarOverrides))
+	{
+		for (const auto& Pair : (*ScalarOverrides)->Values)
+		{
+			FName ParamName(*Pair.Key);
+			FGuid* FoundGUID = ScalarParamGUIDs.Find(ParamName);
+			if (!FoundGUID)
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Scalar param '%s' not found in parent"), *Pair.Key)));
+				continue;
+			}
+			FScalarParameterValue NewEntry;
+			NewEntry.ParameterInfo = FMaterialParameterInfo(ParamName);
+			NewEntry.ExpressionGUID = *FoundGUID;
+			NewEntry.ParameterValue = static_cast<float>(Pair.Value->AsNumber());
+			MFI->ScalarParameterValues.Add(NewEntry);
+			ScalarCount++;
+		}
+	}
+
+	// Apply vector overrides
+	const TSharedPtr<FJsonObject>* VectorOverrides = nullptr;
+	if (Params->TryGetObjectField(TEXT("vector_overrides"), VectorOverrides))
+	{
+		for (const auto& Pair : (*VectorOverrides)->Values)
+		{
+			FName ParamName(*Pair.Key);
+			const TSharedPtr<FJsonObject>* ColorObj = nullptr;
+			if (!Pair.Value->TryGetObject(ColorObj))
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Vector param '%s' value must be an object with r,g,b,a"), *Pair.Key)));
+				continue;
+			}
+			FGuid* FoundGUID = VectorParamGUIDs.Find(ParamName);
+			if (!FoundGUID)
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Vector param '%s' not found in parent"), *Pair.Key)));
+				continue;
+			}
+			FLinearColor Color;
+			Color.R = (*ColorObj)->HasField(TEXT("r")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("r"))) : 0.f;
+			Color.G = (*ColorObj)->HasField(TEXT("g")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("g"))) : 0.f;
+			Color.B = (*ColorObj)->HasField(TEXT("b")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("b"))) : 0.f;
+			Color.A = (*ColorObj)->HasField(TEXT("a")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("a"))) : 1.f;
+			FVectorParameterValue NewEntry;
+			NewEntry.ParameterInfo = FMaterialParameterInfo(ParamName);
+			NewEntry.ExpressionGUID = *FoundGUID;
+			NewEntry.ParameterValue = Color;
+			MFI->VectorParameterValues.Add(NewEntry);
+			VectorCount++;
+		}
+	}
+
+	// Apply texture overrides
+	const TSharedPtr<FJsonObject>* TextureOverrides = nullptr;
+	if (Params->TryGetObjectField(TEXT("texture_overrides"), TextureOverrides))
+	{
+		for (const auto& Pair : (*TextureOverrides)->Values)
+		{
+			FName ParamName(*Pair.Key);
+			FString TexPath = Pair.Value->AsString();
+			UTexture* Tex = Cast<UTexture>(UEditorAssetLibrary::LoadAsset(TexPath));
+			if (!Tex)
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Failed to load texture '%s' for param '%s'"), *TexPath, *Pair.Key)));
+				continue;
+			}
+			FGuid* FoundGUID = TextureParamGUIDs.Find(ParamName);
+			if (!FoundGUID)
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Texture param '%s' not found in parent"), *Pair.Key)));
+				continue;
+			}
+			FTextureParameterValue NewEntry;
+			NewEntry.ParameterInfo = FMaterialParameterInfo(ParamName);
+			NewEntry.ExpressionGUID = *FoundGUID;
+			NewEntry.ParameterValue = Tex;
+			MFI->TextureParameterValues.Add(NewEntry);
+			TextureCount++;
+		}
+	}
+
+	// Apply static switch overrides
+	const TSharedPtr<FJsonObject>* SwitchOverrides = nullptr;
+	if (Params->TryGetObjectField(TEXT("static_switch_overrides"), SwitchOverrides))
+	{
+		for (const auto& Pair : (*SwitchOverrides)->Values)
+		{
+			FName ParamName(*Pair.Key);
+			bool bValue = Pair.Value->AsBool();
+			FGuid* FoundGUID = SwitchParamGUIDs.Find(ParamName);
+			if (!FoundGUID)
+			{
+				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Static switch param '%s' not found in parent"), *Pair.Key)));
+				continue;
+			}
+			FStaticSwitchParameter NewEntry;
+			NewEntry.ParameterInfo = FMaterialParameterInfo(ParamName);
+			NewEntry.ExpressionGUID = *FoundGUID;
+			NewEntry.Value = bValue;
+			NewEntry.bOverride = true;
+			MFI->StaticSwitchParameterValues.Add(NewEntry);
+			SwitchCount++;
+		}
+	}
+
+	// Sync names after manual population
+	MFI->UpdateParameterSet();
+
+	// Register with asset registry and mark dirty
+	FAssetRegistryModule::AssetCreated(MFI);
+	Pkg->MarkPackageDirty();
+
+	// Build result JSON
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), MFI->GetPathName());
+	ResultJson->SetStringField(TEXT("parent"), ParentFunc->GetPathName());
+	ResultJson->SetStringField(TEXT("type"), TypeName);
+
+	auto OverridesJson = MakeShared<FJsonObject>();
+	OverridesJson->SetNumberField(TEXT("scalar"), ScalarCount);
+	OverridesJson->SetNumberField(TEXT("vector"), VectorCount);
+	OverridesJson->SetNumberField(TEXT("texture"), TextureCount);
+	OverridesJson->SetNumberField(TEXT("static_switch"), SwitchCount);
+	ResultJson->SetObjectField(TEXT("overrides_applied"), OverridesJson);
+
+	if (Errors.Num() > 0)
+	{
+		ResultJson->SetArrayField(TEXT("errors"), Errors);
+	}
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: set_function_instance_parameter
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::SetFunctionInstanceParameter(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString ParamName = Params->GetStringField(TEXT("parameter_name"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UMaterialFunctionInstance* MFI = LoadedAsset ? Cast<UMaterialFunctionInstance>(LoadedAsset) : nullptr;
+	if (!MFI)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load material function instance at '%s'"), *AssetPath));
+	}
+
+	// Build parameter GUID lookup from base function expressions
+	// UpdateParameterSet() only syncs names on existing entries — doesn't populate empty arrays
+	UMaterialFunction* BaseFunc = MFI->GetBaseFunction();
+	TMap<FName, FGuid> ScalarGUIDs, VectorGUIDs, TextureGUIDs, SwitchGUIDs;
+	if (BaseFunc)
+	{
+		for (UMaterialExpression* Expr : BaseFunc->GetExpressions())
+		{
+			if (auto* SP = Cast<UMaterialExpressionScalarParameter>(Expr))
+				ScalarGUIDs.Add(SP->ParameterName, SP->ExpressionGUID);
+			else if (auto* VP = Cast<UMaterialExpressionVectorParameter>(Expr))
+				VectorGUIDs.Add(VP->ParameterName, VP->ExpressionGUID);
+			else if (auto* TP = Cast<UMaterialExpressionTextureSampleParameter>(Expr))
+				TextureGUIDs.Add(TP->ParameterName, TP->ExpressionGUID);
+			else if (auto* SWP = Cast<UMaterialExpressionStaticSwitchParameter>(Expr))
+				SwitchGUIDs.Add(SWP->ParameterName, SWP->ExpressionGUID);
+			else if (auto* SBP = Cast<UMaterialExpressionStaticBoolParameter>(Expr))
+				SwitchGUIDs.Add(SBP->ParameterName, SBP->ExpressionGUID);
+		}
+	}
+
+	// Determine which param type to set (mutually exclusive)
+	int32 TypeCount = 0;
+	if (Params->HasField(TEXT("scalar_value"))) TypeCount++;
+	if (Params->HasField(TEXT("vector_value"))) TypeCount++;
+	if (Params->HasField(TEXT("texture_value"))) TypeCount++;
+	if (Params->HasField(TEXT("switch_value"))) TypeCount++;
+
+	if (TypeCount == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("Must provide one of: scalar_value, vector_value, texture_value, switch_value"));
+	}
+	if (TypeCount > 1)
+	{
+		return FMonolithActionResult::Error(TEXT("Only one of scalar_value, vector_value, texture_value, switch_value may be specified"));
+	}
+
+	MFI->Modify();
+	FString SetType;
+	FString SetValue;
+	FName ParamFName(*ParamName);
+
+	if (Params->HasField(TEXT("scalar_value")))
+	{
+		float Val = static_cast<float>(Params->GetNumberField(TEXT("scalar_value")));
+		// Try to find existing entry first, then create if not found
+		bool bFound = false;
+		for (FScalarParameterValue& Entry : MFI->ScalarParameterValues)
+		{
+			if (Entry.ParameterInfo.Name == ParamFName)
+			{
+				Entry.ParameterValue = Val;
+				bFound = true;
+				break;
+			}
+		}
+		if (!bFound)
+		{
+			FGuid* FoundGUID = ScalarGUIDs.Find(ParamFName);
+			if (!FoundGUID)
+			{
+				return FMonolithActionResult::Error(FString::Printf(TEXT("Scalar parameter '%s' not found in base function"), *ParamName));
+			}
+			FScalarParameterValue NewEntry;
+			NewEntry.ParameterInfo = FMaterialParameterInfo(ParamFName);
+			NewEntry.ExpressionGUID = *FoundGUID;
+			NewEntry.ParameterValue = Val;
+			MFI->ScalarParameterValues.Add(NewEntry);
+		}
+		SetType = TEXT("scalar");
+		SetValue = FString::SanitizeFloat(Val);
+	}
+	else if (Params->HasField(TEXT("vector_value")))
+	{
+		const TSharedPtr<FJsonObject>* ColorObj = nullptr;
+		if (!Params->TryGetObjectField(TEXT("vector_value"), ColorObj))
+		{
+			return FMonolithActionResult::Error(TEXT("vector_value must be a JSON object with r, g, b, a fields"));
+		}
+
+		FLinearColor Color;
+		Color.R = (*ColorObj)->HasField(TEXT("r")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("r"))) : 0.f;
+		Color.G = (*ColorObj)->HasField(TEXT("g")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("g"))) : 0.f;
+		Color.B = (*ColorObj)->HasField(TEXT("b")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("b"))) : 0.f;
+		Color.A = (*ColorObj)->HasField(TEXT("a")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("a"))) : 1.f;
+
+		bool bFound = false;
+		for (FVectorParameterValue& Entry : MFI->VectorParameterValues)
+		{
+			if (Entry.ParameterInfo.Name == ParamFName)
+			{
+				Entry.ParameterValue = Color;
+				bFound = true;
+				break;
+			}
+		}
+		if (!bFound)
+		{
+			FGuid* FoundGUID = VectorGUIDs.Find(ParamFName);
+			if (!FoundGUID)
+			{
+				return FMonolithActionResult::Error(FString::Printf(TEXT("Vector parameter '%s' not found in base function"), *ParamName));
+			}
+			FVectorParameterValue NewEntry;
+			NewEntry.ParameterInfo = FMaterialParameterInfo(ParamFName);
+			NewEntry.ExpressionGUID = *FoundGUID;
+			NewEntry.ParameterValue = Color;
+			MFI->VectorParameterValues.Add(NewEntry);
+		}
+		SetType = TEXT("vector");
+		SetValue = FString::Printf(TEXT("(%.3f, %.3f, %.3f, %.3f)"), Color.R, Color.G, Color.B, Color.A);
+	}
+	else if (Params->HasField(TEXT("texture_value")))
+	{
+		FString TexPath = Params->GetStringField(TEXT("texture_value"));
+		UTexture* Tex = Cast<UTexture>(UEditorAssetLibrary::LoadAsset(TexPath));
+		if (!Tex)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load texture at '%s'"), *TexPath));
+		}
+
+		bool bFound = false;
+		for (FTextureParameterValue& Entry : MFI->TextureParameterValues)
+		{
+			if (Entry.ParameterInfo.Name == ParamFName)
+			{
+				Entry.ParameterValue = Tex;
+				bFound = true;
+				break;
+			}
+		}
+		if (!bFound)
+		{
+			FGuid* FoundGUID = TextureGUIDs.Find(ParamFName);
+			if (!FoundGUID)
+			{
+				return FMonolithActionResult::Error(FString::Printf(TEXT("Texture parameter '%s' not found in base function"), *ParamName));
+			}
+			FTextureParameterValue NewEntry;
+			NewEntry.ParameterInfo = FMaterialParameterInfo(ParamFName);
+			NewEntry.ExpressionGUID = *FoundGUID;
+			NewEntry.ParameterValue = Tex;
+			MFI->TextureParameterValues.Add(NewEntry);
+		}
+		SetType = TEXT("texture");
+		SetValue = TexPath;
+	}
+	else if (Params->HasField(TEXT("switch_value")))
+	{
+		bool Val = Params->GetBoolField(TEXT("switch_value"));
+
+		bool bFound = false;
+		for (FStaticSwitchParameter& Entry : MFI->StaticSwitchParameterValues)
+		{
+			if (Entry.ParameterInfo.Name == ParamFName)
+			{
+				Entry.bOverride = true;
+				Entry.Value = Val;
+				bFound = true;
+				break;
+			}
+		}
+		if (!bFound)
+		{
+			FGuid* FoundGUID = SwitchGUIDs.Find(ParamFName);
+			if (!FoundGUID)
+			{
+				return FMonolithActionResult::Error(FString::Printf(TEXT("Static switch parameter '%s' not found in base function"), *ParamName));
+			}
+			FStaticSwitchParameter NewEntry;
+			NewEntry.ParameterInfo = FMaterialParameterInfo(ParamFName);
+			NewEntry.ExpressionGUID = *FoundGUID;
+			NewEntry.Value = Val;
+			NewEntry.bOverride = true;
+			MFI->StaticSwitchParameterValues.Add(NewEntry);
+		}
+		SetType = TEXT("static_switch");
+		SetValue = Val ? TEXT("true") : TEXT("false");
+	}
+
+	// Cascade recompile to all materials using this function instance
+	UMaterialEditingLibrary::UpdateMaterialFunction(MFI, nullptr);
+	MFI->MarkPackageDirty();
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetStringField(TEXT("parameter_name"), ParamName);
+	ResultJson->SetStringField(TEXT("type"), SetType);
+	ResultJson->SetStringField(TEXT("value"), SetValue);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: get_function_instance_info
+// Reads parent chain, parameter overrides, inputs/outputs from a MFI
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::GetFunctionInstanceInfo(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+
+	UMaterialFunctionInstance* MFI = Cast<UMaterialFunctionInstance>(LoadedAsset);
+	if (!MFI)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset '%s' is not a MaterialFunctionInstance (type: %s)"), *AssetPath, *LoadedAsset->GetClass()->GetName()));
+	}
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+
+	// --- Parent chain ---
+	if (MFI->Parent)
+	{
+		ResultJson->SetStringField(TEXT("parent"), MFI->Parent->GetPathName());
+	}
+	else
+	{
+		ResultJson->SetField(TEXT("parent"), MakeShared<FJsonValueNull>());
+	}
+
+	UMaterialFunction* BaseFunc = MFI->GetBaseFunction();
+	if (BaseFunc)
+	{
+		ResultJson->SetStringField(TEXT("base"), BaseFunc->GetPathName());
+	}
+	else
+	{
+		ResultJson->SetField(TEXT("base"), MakeShared<FJsonValueNull>());
+	}
+
+	// --- Function usage type ---
+	EMaterialFunctionUsage Usage = MFI->GetMaterialFunctionUsage();
+	const UEnum* UsageEnum = StaticEnum<EMaterialFunctionUsage>();
+	if (UsageEnum)
+	{
+		FString UsageStr = UsageEnum->GetNameStringByIndex(static_cast<int32>(Usage));
+		ResultJson->SetStringField(TEXT("type"), UsageStr);
+	}
+
+	// --- Scalar parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> ScalarArr;
+	for (const auto& Param : MFI->ScalarParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		PJson->SetNumberField(TEXT("value"), Param.ParameterValue);
+		ScalarArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("scalar_overrides"), ScalarArr);
+
+	// --- Vector parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> VectorArr;
+	for (const auto& Param : MFI->VectorParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		auto ValJson = MakeShared<FJsonObject>();
+		ValJson->SetNumberField(TEXT("r"), Param.ParameterValue.R);
+		ValJson->SetNumberField(TEXT("g"), Param.ParameterValue.G);
+		ValJson->SetNumberField(TEXT("b"), Param.ParameterValue.B);
+		ValJson->SetNumberField(TEXT("a"), Param.ParameterValue.A);
+		PJson->SetObjectField(TEXT("value"), ValJson);
+		VectorArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("vector_overrides"), VectorArr);
+
+	// --- DoubleVector parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> DoubleVecArr;
+	for (const auto& Param : MFI->DoubleVectorParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		auto ValJson = MakeShared<FJsonObject>();
+		ValJson->SetNumberField(TEXT("r"), Param.ParameterValue.X);
+		ValJson->SetNumberField(TEXT("g"), Param.ParameterValue.Y);
+		ValJson->SetNumberField(TEXT("b"), Param.ParameterValue.Z);
+		ValJson->SetNumberField(TEXT("a"), Param.ParameterValue.W);
+		PJson->SetObjectField(TEXT("value"), ValJson);
+		DoubleVecArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("double_vector_overrides"), DoubleVecArr);
+
+	// --- Texture parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> TextureArr;
+	for (const auto& Param : MFI->TextureParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		PJson->SetStringField(TEXT("value"), Param.ParameterValue ? Param.ParameterValue->GetPathName() : TEXT("None"));
+		TextureArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("texture_overrides"), TextureArr);
+
+	// --- Texture collection parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> TexCollArr;
+	for (const auto& Param : MFI->TextureCollectionParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		PJson->SetStringField(TEXT("value"), Param.ParameterValue ? Param.ParameterValue->GetPathName() : TEXT("None"));
+		TexCollArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("texture_collection_overrides"), TexCollArr);
+
+	// --- Parameter collection parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> ParamCollArr;
+	for (const auto& Param : MFI->ParameterCollectionParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		PJson->SetStringField(TEXT("value"), Param.ParameterValue ? Param.ParameterValue->GetPathName() : TEXT("None"));
+		ParamCollArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("parameter_collection_overrides"), ParamCollArr);
+
+	// --- Font parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> FontArr;
+	for (const auto& Param : MFI->FontParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		PJson->SetStringField(TEXT("font"), Param.FontValue ? Param.FontValue->GetPathName() : TEXT("None"));
+		PJson->SetNumberField(TEXT("page"), Param.FontPage);
+		FontArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("font_overrides"), FontArr);
+
+	// --- Runtime virtual texture parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> RVTArr;
+	for (const auto& Param : MFI->RuntimeVirtualTextureParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		PJson->SetStringField(TEXT("value"), Param.ParameterValue ? Param.ParameterValue->GetPathName() : TEXT("None"));
+		RVTArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("runtime_virtual_texture_overrides"), RVTArr);
+
+	// --- Sparse volume texture parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> SVTArr;
+	for (const auto& Param : MFI->SparseVolumeTextureParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		PJson->SetStringField(TEXT("value"), Param.ParameterValue ? Param.ParameterValue->GetPathName() : TEXT("None"));
+		SVTArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("sparse_volume_texture_overrides"), SVTArr);
+
+	// --- Static switch parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> SwitchArr;
+	for (const auto& Param : MFI->StaticSwitchParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		PJson->SetBoolField(TEXT("value"), Param.Value);
+		PJson->SetBoolField(TEXT("is_overridden"), Param.bOverride);
+		SwitchArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("static_switch_overrides"), SwitchArr);
+
+	// --- Static component mask parameter overrides ---
+	TArray<TSharedPtr<FJsonValue>> MaskArr;
+	for (const auto& Param : MFI->StaticComponentMaskParameterValues)
+	{
+		auto PJson = MakeShared<FJsonObject>();
+		PJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		PJson->SetBoolField(TEXT("r"), Param.R);
+		PJson->SetBoolField(TEXT("g"), Param.G);
+		PJson->SetBoolField(TEXT("b"), Param.B);
+		PJson->SetBoolField(TEXT("a"), Param.A);
+		PJson->SetBoolField(TEXT("is_overridden"), Param.bOverride);
+		MaskArr.Add(MakeShared<FJsonValueObject>(PJson));
+	}
+	ResultJson->SetArrayField(TEXT("static_component_mask_overrides"), MaskArr);
+
+	// --- Inputs and outputs via GetInputsAndOutputs ---
+	TArray<FFunctionExpressionInput> FuncInputs;
+	TArray<FFunctionExpressionOutput> FuncOutputs;
+	MFI->GetInputsAndOutputs(FuncInputs, FuncOutputs);
+
+	const UEnum* InputTypeEnum = StaticEnum<EFunctionInputType>();
+
+	TArray<TSharedPtr<FJsonValue>> InputsJson;
+	for (const FFunctionExpressionInput& FuncIn : FuncInputs)
+	{
+		if (!FuncIn.ExpressionInput)
+		{
+			continue;
+		}
+		auto InputJson = MakeShared<FJsonObject>();
+		InputJson->SetStringField(TEXT("name"), FuncIn.ExpressionInput->InputName.ToString());
+		InputJson->SetStringField(TEXT("expression_name"), FuncIn.ExpressionInput->GetName());
+		InputJson->SetNumberField(TEXT("sort_priority"), FuncIn.ExpressionInput->SortPriority);
+		if (InputTypeEnum)
+		{
+			FString TypeStr = InputTypeEnum->GetNameStringByIndex(static_cast<int32>(FuncIn.ExpressionInput->InputType));
+			TypeStr.RemoveFromStart(TEXT("FunctionInput_"));
+			InputJson->SetStringField(TEXT("type"), TypeStr);
+		}
+		InputJson->SetStringField(TEXT("description"), FuncIn.ExpressionInput->Description);
+		InputJson->SetBoolField(TEXT("use_preview_value_as_default"), FuncIn.ExpressionInput->bUsePreviewValueAsDefault);
+		InputsJson.Add(MakeShared<FJsonValueObject>(InputJson));
+	}
+
+	InputsJson.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+	{
+		return A->AsObject()->GetNumberField(TEXT("sort_priority")) < B->AsObject()->GetNumberField(TEXT("sort_priority"));
+	});
+
+	TArray<TSharedPtr<FJsonValue>> OutputsJson;
+	for (const FFunctionExpressionOutput& FuncOut : FuncOutputs)
+	{
+		if (!FuncOut.ExpressionOutput)
+		{
+			continue;
+		}
+		auto OutputJson = MakeShared<FJsonObject>();
+		OutputJson->SetStringField(TEXT("name"), FuncOut.ExpressionOutput->OutputName.ToString());
+		OutputJson->SetStringField(TEXT("expression_name"), FuncOut.ExpressionOutput->GetName());
+		OutputJson->SetNumberField(TEXT("sort_priority"), FuncOut.ExpressionOutput->SortPriority);
+		OutputJson->SetStringField(TEXT("description"), FuncOut.ExpressionOutput->Description);
+		OutputsJson.Add(MakeShared<FJsonValueObject>(OutputJson));
+	}
+
+	OutputsJson.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+	{
+		return A->AsObject()->GetNumberField(TEXT("sort_priority")) < B->AsObject()->GetNumberField(TEXT("sort_priority"));
+	});
+
+	ResultJson->SetArrayField(TEXT("inputs"), InputsJson);
+	ResultJson->SetArrayField(TEXT("outputs"), OutputsJson);
+	ResultJson->SetNumberField(TEXT("input_count"), InputsJson.Num());
+	ResultJson->SetNumberField(TEXT("output_count"), OutputsJson.Num());
+
+	// Total override count
+	int32 TotalOverrides = ScalarArr.Num() + VectorArr.Num() + DoubleVecArr.Num()
+		+ TextureArr.Num() + TexCollArr.Num() + ParamCollArr.Num()
+		+ FontArr.Num() + RVTArr.Num() + SVTArr.Num()
+		+ SwitchArr.Num() + MaskArr.Num();
+	ResultJson->SetNumberField(TEXT("total_overrides"), TotalOverrides);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Wave 10 — Function utilities
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::LayoutFunctionExpressions(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+
+	// Reject function instances — layout only works on base functions
+	if (Cast<UMaterialFunctionInstance>(LoadedAsset))
+	{
+		return FMonolithActionResult::Error(TEXT("Cannot layout a function instance — layout the base function instead"));
+	}
+
+	UMaterialFunction* MatFunc = Cast<UMaterialFunction>(LoadedAsset);
+	if (!MatFunc)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset '%s' is not a UMaterialFunction (type: %s)"), *AssetPath, *LoadedAsset->GetClass()->GetName()));
+	}
+
+	UMaterialEditingLibrary::LayoutMaterialFunctionExpressions(MatFunc);
+	MatFunc->MarkPackageDirty();
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetBoolField(TEXT("arranged"), true);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+FMonolithActionResult FMonolithMaterialActions::RenameFunctionParameterGroup(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString OldGroup  = Params->GetStringField(TEXT("old_group"));
+	FString NewGroup  = Params->GetStringField(TEXT("new_group"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+
+	UMaterialFunctionInterface* MatFuncInterface = Cast<UMaterialFunctionInterface>(LoadedAsset);
+	if (!MatFuncInterface)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset '%s' is not a MaterialFunctionInterface (type: %s)"), *AssetPath, *LoadedAsset->GetClass()->GetName()));
+	}
+
+	bool bRenamed = UMaterialEditingLibrary::RenameMaterialFunctionParameterGroup(MatFuncInterface, FName(*OldGroup), FName(*NewGroup));
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetBoolField(TEXT("renamed"), bRenamed);
 
 	return FMonolithActionResult::Success(ResultJson);
 }

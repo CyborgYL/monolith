@@ -8,8 +8,22 @@ __pycache__/
 *.pyc
 Docs/plans/
 Docs/TESTING.md
+Docs/TODO_VFX_Issues.md
 Plans/
 
 # Private training actions — never ship in public releases
 Source/MonolithEditor/Private/MonolithTrainingActions.cpp
 Source/MonolithEditor/Public/MonolithTrainingActions.h
+
+# Agent training infrastructure — local to dev machine, not part of core plugin
+Scripts/vfx_training_harness.py
+Scripts/occult_training_harness.py
+Scripts/fix_occult_system.py
+Scripts/generate_calibration.py
+Scripts/monolith_client.py
+Scripts/extract_recipes.py
+Scripts/pixel_metrics.py
+Scripts/score_history.py
+Scripts/__pycache__/
+TrainingMemory/
+.claude/agent-memory/

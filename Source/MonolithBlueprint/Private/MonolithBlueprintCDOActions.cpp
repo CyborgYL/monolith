@@ -5,6 +5,7 @@
 #include "MonolithAssetUtils.h"
 #include "UObject/UnrealType.h"
 #include "Engine/Blueprint.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
 
@@ -21,6 +22,17 @@ void FMonolithBlueprintCDOActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path (e.g. /Game/Blueprints/BP_MyActor or /Game/Data/DA_MyData)"))
 			.Optional(TEXT("category_filter"), TEXT("string"), TEXT("Only include properties whose category contains this string"))
 			.Optional(TEXT("include_parent_defaults"), TEXT("boolean"), TEXT("If true, include properties inherited from native parent class (default: true)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("set_cdo_property"),
+		TEXT("Set a property value on a Blueprint CDO or UObject asset (DataAsset, GameplayEffect, etc.). "
+			 "Write counterpart to get_cdo_properties. Supports numeric, boolean, string, enum, struct, "
+			 "and any type that supports ImportText."),
+		FMonolithActionHandler::CreateStatic(&HandleSetCDOProperty),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint or UObject asset path (e.g. /Game/Data/DA_MyData)"))
+			.Required(TEXT("property_name"), TEXT("string"), TEXT("Property name to set (case-insensitive fallback)"))
+			.Required(TEXT("value"), TEXT("any"), TEXT("New value — string, number, bool, or ImportText format for structs (e.g. \"(X=1.0,Y=2.0,Z=3.0)\")"))
 			.Build());
 }
 
@@ -248,6 +260,133 @@ FMonolithActionResult FMonolithBlueprintCDOActions::HandleGetCDOProperties(const
 
 	Root->SetArrayField(TEXT("properties"), PropsArr);
 	Root->SetNumberField(TEXT("property_count"), PropsArr.Num());
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// set_cdo_property
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithBlueprintCDOActions::HandleSetCDOProperty(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	if (AssetPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: asset_path"));
+	}
+
+	FString PropertyName = Params->GetStringField(TEXT("property_name"));
+	if (PropertyName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: property_name"));
+	}
+
+	if (!Params->HasField(TEXT("value")))
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: value"));
+	}
+
+	// --- Load asset: Blueprint CDO or generic UObject (same dual-path as get_cdo_properties) ---
+	UObject* TargetObject = nullptr;
+	UClass* TargetClass = nullptr;
+	UBlueprint* BP = nullptr;
+
+	BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (BP && BP->GeneratedClass)
+	{
+		TargetClass = BP->GeneratedClass;
+		TargetObject = TargetClass->GetDefaultObject(false);
+	}
+	else
+	{
+		BP = nullptr; // Not a Blueprint
+		TargetObject = FMonolithAssetUtils::LoadAssetByPath(AssetPath);
+		if (TargetObject)
+		{
+			TargetClass = TargetObject->GetClass();
+		}
+	}
+
+	if (!TargetObject || !TargetClass)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset not found or has no class: %s"), *AssetPath));
+	}
+
+	// --- Find property (exact match, then case-insensitive fallback) ---
+	FProperty* Prop = TargetClass->FindPropertyByName(FName(*PropertyName));
+	if (!Prop)
+	{
+		for (TFieldIterator<FProperty> It(TargetClass); It; ++It)
+		{
+			if (It->GetName().Equals(PropertyName, ESearchCase::IgnoreCase))
+			{
+				Prop = *It;
+				break;
+			}
+		}
+	}
+	if (!Prop)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Property '%s' not found on %s"), *PropertyName, *TargetClass->GetName()));
+	}
+
+	// --- Read old value ---
+	void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(TargetObject);
+
+	FString OldValue;
+	Prop->ExportText_Direct(OldValue, ValuePtr, ValuePtr, TargetObject, PPF_None);
+
+	// --- Convert JSON value to ImportText string ---
+	FString ValStr;
+	const TSharedPtr<FJsonValue>& JsonVal = Params->TryGetField(TEXT("value"));
+	if (JsonVal->Type == EJson::Number)
+	{
+		ValStr = FString::SanitizeFloat(JsonVal->AsNumber());
+	}
+	else if (JsonVal->Type == EJson::Boolean)
+	{
+		ValStr = JsonVal->AsBool() ? TEXT("true") : TEXT("false");
+	}
+	else
+	{
+		ValStr = JsonVal->AsString();
+	}
+
+	// --- Import the value ---
+	const TCHAR* ImportResult = Prop->ImportText_Direct(*ValStr, ValuePtr, TargetObject, PPF_None);
+	if (!ImportResult)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to set property '%s' to value '%s' — ImportText rejected the format. "
+				 "For structs use ImportText syntax e.g. \"(X=1.0,Y=2.0,Z=3.0)\", for enums use the display name."),
+			*PropertyName, *ValStr));
+	}
+
+	// --- Read back new value for confirmation ---
+	FString NewValue;
+	Prop->ExportText_Direct(NewValue, ValuePtr, ValuePtr, TargetObject, PPF_None);
+
+	// --- Mark dirty + notify ---
+	if (BP)
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+	}
+	else
+	{
+		// Notify property change for non-Blueprint UObjects
+		FPropertyChangedEvent ChangedEvent(Prop);
+		TargetObject->PostEditChangeProperty(ChangedEvent);
+		TargetObject->MarkPackageDirty();
+	}
+
+	// --- Build response ---
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("property_name"), Prop->GetName());
+	Root->SetStringField(TEXT("old_value"), OldValue);
+	Root->SetStringField(TEXT("new_value"), NewValue);
 
 	return FMonolithActionResult::Success(Root);
 }

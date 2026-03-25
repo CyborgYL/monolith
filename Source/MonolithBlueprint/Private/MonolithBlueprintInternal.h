@@ -4,6 +4,9 @@
 #include "MonolithToolRegistry.h"
 #include "MonolithAssetUtils.h"
 #include "Engine/Blueprint.h"
+#include "Engine/LevelScriptBlueprint.h"
+#include "Engine/Level.h"
+#include "Engine/World.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
@@ -19,14 +22,63 @@
 #include "EdGraphNode_Comment.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "Editor.h"
+#include "UObject/Package.h"
 
 namespace MonolithBlueprintInternal
 {
+	/**
+	 * Try to resolve a Level Blueprint from a level asset path.
+	 * Level Blueprints are ULevelScriptBlueprint sub-objects of ULevel,
+	 * not top-level assets, so standard LoadAssetByPath<UBlueprint> won't find them.
+	 */
+	inline UBlueprint* TryLoadLevelBlueprint(const FString& AssetPath)
+	{
+		// Support "$current" sentinel — return the level BP of the currently-open level
+		if (AssetPath == TEXT("$current"))
+		{
+			if (!GEditor) return nullptr;
+			UWorld* World = GEditor->GetEditorWorldContext().World();
+			if (!World || !World->PersistentLevel) return nullptr;
+			// bDontCreate=false → create the level script BP if it doesn't exist yet
+			return World->PersistentLevel->GetLevelScriptBlueprint(false);
+		}
+
+		// Try loading the level package
+		UPackage* LevelPackage = LoadPackage(nullptr, *AssetPath, LOAD_NoWarn);
+		if (!LevelPackage) return nullptr;
+
+		// Find the UWorld in the package, then get its PersistentLevel
+		UWorld* World = nullptr;
+		ForEachObjectWithPackage(LevelPackage, [&World](UObject* Obj)
+		{
+			if (UWorld* W = Cast<UWorld>(Obj))
+			{
+				World = W;
+				return false; // stop iteration
+			}
+			return true; // continue
+		});
+
+		if (!World || !World->PersistentLevel) return nullptr;
+
+		// bDontCreate=true → don't create, just return nullptr if no level BP exists
+		return World->PersistentLevel->GetLevelScriptBlueprint(true);
+	}
+
 	inline UBlueprint* LoadBlueprintFromParams(const TSharedPtr<FJsonObject>& Params, FString& OutAssetPath)
 	{
 		OutAssetPath = Params->GetStringField(TEXT("asset_path"));
 		if (OutAssetPath.IsEmpty()) return nullptr;
-		return FMonolithAssetUtils::LoadAssetByPath<UBlueprint>(OutAssetPath);
+
+		// Try standard Blueprint asset load first
+		UBlueprint* BP = FMonolithAssetUtils::LoadAssetByPath<UBlueprint>(OutAssetPath);
+		if (BP) return BP;
+
+		// Fallback: try as a Level Blueprint
+		// Heuristic: "$current" sentinel, path contains "/Maps/", or standard load failed
+		// (cheap to try — if it's not a level package, LoadPackage just returns null)
+		return TryLoadLevelBlueprint(OutAssetPath);
 	}
 
 	inline void AddGraphArray(
@@ -370,10 +422,28 @@ namespace MonolithBlueprintInternal
 		return nullptr;
 	}
 
-	// Find a pin on a node by name and optional direction
-	inline UEdGraphPin* FindPinOnNode(UEdGraphNode* Node, const FString& PinName, EEdGraphPinDirection Direction = EGPD_MAX)
+	// Build a comma-separated list of non-hidden pin names on a node (for error messages)
+	inline FString GetAvailablePinNames(UEdGraphNode* Node, EEdGraphPinDirection Direction = EGPD_MAX)
+	{
+		if (!Node) return TEXT("(none)");
+		TArray<FString> Names;
+		for (const UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->bHidden) continue;
+			if (Direction != EGPD_MAX && Pin->Direction != Direction) continue;
+			Names.Add(Pin->PinName.ToString());
+		}
+		return Names.Num() > 0 ? FString::Join(Names, TEXT(", ")) : TEXT("(none)");
+	}
+
+	// Find a pin on a node by name and optional direction.
+	// Tries exact match first, then case-insensitive fallback.
+	// If OutAvailablePins is provided, it is populated with available pin names on failure.
+	inline UEdGraphPin* FindPinOnNode(UEdGraphNode* Node, const FString& PinName, EEdGraphPinDirection Direction = EGPD_MAX, FString* OutAvailablePins = nullptr)
 	{
 		if (!Node) return nullptr;
+
+		// Pass 1: exact match
 		for (UEdGraphPin* Pin : Node->Pins)
 		{
 			if (Pin && Pin->PinName.ToString() == PinName)
@@ -381,6 +451,23 @@ namespace MonolithBlueprintInternal
 				if (Direction == EGPD_MAX || Pin->Direction == Direction)
 					return Pin;
 			}
+		}
+
+		// Pass 2: case-insensitive fallback
+		FString PinNameLower = PinName.ToLower();
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (Pin && Pin->PinName.ToString().ToLower() == PinNameLower)
+			{
+				if (Direction == EGPD_MAX || Pin->Direction == Direction)
+					return Pin;
+			}
+		}
+
+		// No match — populate available pins for caller error messages
+		if (OutAvailablePins)
+		{
+			*OutAvailablePins = GetAvailablePinNames(Node, Direction);
 		}
 		return nullptr;
 	}

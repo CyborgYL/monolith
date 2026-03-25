@@ -19,4 +19,16 @@ private:
 	static FMonolithActionResult HandleAddDatabaseSequence(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleRemoveDatabaseSequence(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetDatabaseStats(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 11: PoseSearch Creation (2) ---
+	static FMonolithActionResult HandleCreatePoseSearchSchema(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreatePoseSearchDatabase(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 14: PoseSearch Writes (6) ---
+	static FMonolithActionResult HandleSetDatabaseSequenceProperties(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddSchemaChannel(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveSchemaChannel(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetChannelWeight(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRebuildPoseSearchIndex(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetDatabaseSearchMode(const TSharedPtr<FJsonObject>& Params);
 };

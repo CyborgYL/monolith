@@ -28,6 +28,11 @@
 #include "Animation/AnimData/IAnimationDataController.h"
 #include "Animation/AnimData/CurveIdentifier.h"
 #include "Animation/AnimComposite.h"
+#include "Animation/AimOffsetBlendSpace.h"
+#include "Animation/AimOffsetBlendSpace1D.h"
+#include "Animation/AnimBoneCompressionSettings.h"
+#include "Animation/AnimCurveCompressionSettings.h"
+#include "Animation/AnimInstance.h"
 #include "AnimationModifier.h"
 #include "Rig/IKRigDefinition.h"
 #include "Rig/IKRigSkeleton.h"
@@ -53,6 +58,11 @@
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/Kismet2NameValidators.h"
 #include "K2Node_VariableGet.h"
+#include "PhysicsEngine/PhysicsAsset.h"
+#include "PhysicsEngine/SkeletalBodySetup.h"
+#include "PhysicsEngine/BodySetup.h"
+#include "PhysicsEngine/PhysicsConstraintTemplate.h"
+#include "PhysicsEngine/BodyInstance.h"
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -625,6 +635,275 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&HandleGetAbpLinkedAssets),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Animation Blueprint asset path"))
+			.Build());
+
+	// Wave 11 — Asset Creation + Setup
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_blend_space"),
+		TEXT("Create a new 2D BlendSpace asset with skeleton and optional axis config"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateBlendSpace),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path for the new BlendSpace (e.g. /Game/Anims/BS_Locomotion)"))
+			.Required(TEXT("skeleton_path"), TEXT("string"), TEXT("Skeleton asset path"))
+			.Optional(TEXT("axis_x_name"), TEXT("string"), TEXT("X axis display name (default: None)"))
+			.Optional(TEXT("axis_x_min"), TEXT("number"), TEXT("X axis minimum value (default: 0)"))
+			.Optional(TEXT("axis_x_max"), TEXT("number"), TEXT("X axis maximum value (default: 100)"))
+			.Optional(TEXT("axis_y_name"), TEXT("string"), TEXT("Y axis display name (default: None)"))
+			.Optional(TEXT("axis_y_min"), TEXT("number"), TEXT("Y axis minimum value (default: 0)"))
+			.Optional(TEXT("axis_y_max"), TEXT("number"), TEXT("Y axis maximum value (default: 100)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_blend_space_1d"),
+		TEXT("Create a new 1D BlendSpace asset with skeleton and optional axis config"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateBlendSpace1D),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path for the new BlendSpace1D"))
+			.Required(TEXT("skeleton_path"), TEXT("string"), TEXT("Skeleton asset path"))
+			.Optional(TEXT("axis_name"), TEXT("string"), TEXT("Axis display name (default: None)"))
+			.Optional(TEXT("axis_min"), TEXT("number"), TEXT("Axis minimum value (default: 0)"))
+			.Optional(TEXT("axis_max"), TEXT("number"), TEXT("Axis maximum value (default: 100)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_aim_offset"),
+		TEXT("Create a new 2D AimOffset asset with Yaw/Pitch axis defaults"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateAimOffset),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path for the new AimOffset"))
+			.Required(TEXT("skeleton_path"), TEXT("string"), TEXT("Skeleton asset path"))
+			.Optional(TEXT("axis_x_name"), TEXT("string"), TEXT("X axis display name (default: Yaw)"))
+			.Optional(TEXT("axis_x_min"), TEXT("number"), TEXT("X axis minimum (default: -180)"))
+			.Optional(TEXT("axis_x_max"), TEXT("number"), TEXT("X axis maximum (default: 180)"))
+			.Optional(TEXT("axis_y_name"), TEXT("string"), TEXT("Y axis display name (default: Pitch)"))
+			.Optional(TEXT("axis_y_min"), TEXT("number"), TEXT("Y axis minimum (default: -90)"))
+			.Optional(TEXT("axis_y_max"), TEXT("number"), TEXT("Y axis maximum (default: 90)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_aim_offset_1d"),
+		TEXT("Create a new 1D AimOffset asset with Yaw axis default"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateAimOffset1D),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path for the new AimOffset1D"))
+			.Required(TEXT("skeleton_path"), TEXT("string"), TEXT("Skeleton asset path"))
+			.Optional(TEXT("axis_name"), TEXT("string"), TEXT("Axis display name (default: Yaw)"))
+			.Optional(TEXT("axis_min"), TEXT("number"), TEXT("Axis minimum (default: -180)"))
+			.Optional(TEXT("axis_max"), TEXT("number"), TEXT("Axis maximum (default: 180)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_composite"),
+		TEXT("Create a new AnimComposite asset with skeleton"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateComposite),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path for the new composite"))
+			.Required(TEXT("skeleton_path"), TEXT("string"), TEXT("Skeleton asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_anim_blueprint"),
+		TEXT("Create a new Animation Blueprint asset with skeleton"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateAnimBlueprint),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path for the new ABP (e.g. /Game/ABP/ABP_Character)"))
+			.Required(TEXT("skeleton_path"), TEXT("string"), TEXT("Skeleton asset path"))
+			.Optional(TEXT("parent_class"), TEXT("string"), TEXT("Parent class name (default: AnimInstance)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("compare_skeletons"),
+		TEXT("Compare two skeletons for bone compatibility — useful before retargeting or sharing animations"),
+		FMonolithActionHandler::CreateStatic(&HandleCompareSkeletons),
+		FParamSchemaBuilder()
+			.Required(TEXT("skeleton_a"), TEXT("string"), TEXT("First skeleton asset path"))
+			.Required(TEXT("skeleton_b"), TEXT("string"), TEXT("Second skeleton asset path"))
+			.Build());
+
+	// Wave 12 — Sequence Properties + Sync Markers
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_sequence_properties"),
+		TEXT("Set playback properties on an AnimSequence (rate_scale, loop, interpolation)"),
+		FMonolithActionHandler::CreateStatic(&HandleSetSequenceProperties),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("AnimSequence asset path"))
+			.Optional(TEXT("rate_scale"), TEXT("number"), TEXT("Playback rate scale (default 1.0)"))
+			.Optional(TEXT("loop"), TEXT("bool"), TEXT("Whether the sequence loops"))
+			.Optional(TEXT("interpolation"), TEXT("string"), TEXT("Interpolation type: Linear or Step"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_additive_settings"),
+		TEXT("Configure additive animation settings on a sequence (triggers DDC rebuild)"),
+		FMonolithActionHandler::CreateStatic(&HandleSetAdditiveSettings),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("AnimSequence asset path"))
+			.Optional(TEXT("additive_anim_type"), TEXT("string"), TEXT("NoAdditive, LocalSpace, or MeshSpace"))
+			.Optional(TEXT("ref_pose_type"), TEXT("string"), TEXT("RefPose, AnimScaled, AnimFrame, or LocalAnimFrame"))
+			.Optional(TEXT("ref_frame_index"), TEXT("integer"), TEXT("Reference frame index for AnimFrame/LocalAnimFrame modes"))
+			.Optional(TEXT("ref_pose_seq"), TEXT("string"), TEXT("Reference pose sequence asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_compression_settings"),
+		TEXT("Assign bone and/or curve compression settings assets to a sequence"),
+		FMonolithActionHandler::CreateStatic(&HandleSetCompressionSettings),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("AnimSequence asset path"))
+			.Optional(TEXT("bone_compression"), TEXT("string"), TEXT("Bone compression settings asset path"))
+			.Optional(TEXT("curve_compression"), TEXT("string"), TEXT("Curve compression settings asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_sync_markers"),
+		TEXT("Read all authored sync markers from an animation sequence"),
+		FMonolithActionHandler::CreateStatic(&HandleGetSyncMarkers),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("AnimSequence asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_sync_marker"),
+		TEXT("Add an authored sync marker to a sequence"),
+		FMonolithActionHandler::CreateStatic(&HandleAddSyncMarker),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("AnimSequence asset path"))
+			.Required(TEXT("marker_name"), TEXT("string"), TEXT("Sync marker name (e.g. FootDown)"))
+			.Required(TEXT("time"), TEXT("number"), TEXT("Time in seconds"))
+			.Optional(TEXT("track_index"), TEXT("integer"), TEXT("Track index (default 0)"), TEXT("0"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("remove_sync_marker"),
+		TEXT("Remove sync markers by name (all with that name) or by index"),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveSyncMarker),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("AnimSequence asset path"))
+			.Optional(TEXT("marker_name"), TEXT("string"), TEXT("Remove all markers with this name"))
+			.Optional(TEXT("marker_index"), TEXT("integer"), TEXT("Remove specific marker by index"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("rename_sync_marker"),
+		TEXT("Rename all sync markers with a given name to a new name"),
+		FMonolithActionHandler::CreateStatic(&HandleRenameSyncMarker),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("AnimSequence asset path"))
+			.Required(TEXT("old_name"), TEXT("string"), TEXT("Current marker name"))
+			.Required(TEXT("new_name"), TEXT("string"), TEXT("New marker name"))
+			.Build());
+
+	// Wave 13 — Batch Ops + Montage Completion
+	Registry.RegisterAction(TEXT("animation"), TEXT("batch_execute"),
+		TEXT("Execute multiple animation actions in a single transaction"),
+		FMonolithActionHandler::CreateStatic(&HandleBatchExecute),
+		FParamSchemaBuilder()
+			.Required(TEXT("operations"), TEXT("array"), TEXT("Array of {op, ...params} objects. Params are flat inline, not nested."))
+			.Optional(TEXT("stop_on_error"), TEXT("boolean"), TEXT("Stop on first error (default false)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_montage_anim_segment"),
+		TEXT("Add an animation segment to a montage slot track"),
+		FMonolithActionHandler::CreateStatic(&HandleAddMontageAnimSegment),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Montage asset path"))
+			.Required(TEXT("anim_path"), TEXT("string"), TEXT("AnimSequence to reference"))
+			.Optional(TEXT("slot_index"), TEXT("integer"), TEXT("Slot track index (default 0)"))
+			.Optional(TEXT("start_pos"), TEXT("number"), TEXT("Position in montage timeline (default: auto-append after last segment)"))
+			.Optional(TEXT("anim_start_time"), TEXT("number"), TEXT("Clip start time within source anim (default 0.0)"))
+			.Optional(TEXT("anim_end_time"), TEXT("number"), TEXT("Clip end time within source anim (default: full length)"))
+			.Optional(TEXT("play_rate"), TEXT("number"), TEXT("Playback rate (default 1.0)"))
+			.Optional(TEXT("looping_count"), TEXT("integer"), TEXT("Loop count (default 1)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("clone_notify_setup"),
+		TEXT("Copy all notifies from one animation asset to another with optional time scaling"),
+		FMonolithActionHandler::CreateStatic(&HandleCloneNotifySetup),
+		FParamSchemaBuilder()
+			.Required(TEXT("source_path"), TEXT("string"), TEXT("Source animation asset path"))
+			.Required(TEXT("target_path"), TEXT("string"), TEXT("Target animation asset path"))
+			.Optional(TEXT("time_scale"), TEXT("number"), TEXT("Manual time scale factor (default 1.0)"))
+			.Optional(TEXT("auto_scale"), TEXT("boolean"), TEXT("Auto-compute scale from duration ratio (default false)"))
+			.Optional(TEXT("replace_existing"), TEXT("boolean"), TEXT("Clear target notifies first (default false)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("bulk_add_notify"),
+		TEXT("Add the same notify type to multiple animation assets at once"),
+		FMonolithActionHandler::CreateStatic(&HandleBulkAddNotify),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_paths"), TEXT("array"), TEXT("Array of animation asset paths"))
+			.Required(TEXT("notify_class"), TEXT("string"), TEXT("Notify class name"))
+			.Required(TEXT("time"), TEXT("number"), TEXT("Trigger time"))
+			.Optional(TEXT("time_mode"), TEXT("string"), TEXT("'absolute' or 'normalized' (0.0-1.0, default 'absolute')"))
+			.Optional(TEXT("duration"), TEXT("number"), TEXT("Duration for notify states"))
+			.Optional(TEXT("track_name"), TEXT("string"), TEXT("Notify track name (default '1')"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_montage_from_sections"),
+		TEXT("Create a montage with slot, anim segments, sections, blend, and notifies in one call"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateMontageFromSections),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path for the new montage"))
+			.Required(TEXT("skeleton_path"), TEXT("string"), TEXT("Skeleton asset path"))
+			.Optional(TEXT("slot_name"), TEXT("string"), TEXT("Slot name (default 'DefaultSlot')"))
+			.Optional(TEXT("sections"), TEXT("array"), TEXT("Array of {name, anim_path, start_time?, next_section?}"))
+			.Optional(TEXT("blend"), TEXT("object"), TEXT("{blend_in_time?, blend_out_time?, blend_out_trigger_time?, enable_auto_blend_out?}"))
+			.Optional(TEXT("notifies"), TEXT("array"), TEXT("Array of {notify_class, time, duration?, track_name?}"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("build_sequence_from_poses"),
+		TEXT("Build an AnimSequence from per-frame bone transforms using IAnimationDataController"),
+		FMonolithActionHandler::CreateStatic(&HandleBuildSequenceFromPoses),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Target AnimSequence path (created if missing)"))
+			.Required(TEXT("skeleton_path"), TEXT("string"), TEXT("Skeleton asset path"))
+			.Required(TEXT("frames"), TEXT("array"), TEXT("Array of {bones: [{name, location:[x,y,z], rotation:[x,y,z,w], scale:[x,y,z]}, ...]}"))
+			.Optional(TEXT("frame_rate"), TEXT("number"), TEXT("Frame rate (default 30)"))
+			.Build());
+
+	// Wave 14 — Notify Properties
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_notify_properties"),
+		TEXT("Set UPROPERTY values on a notify object using reflection (ImportText_Direct). Works on both instant and state notifies."),
+		FMonolithActionHandler::CreateStatic(&HandleSetNotifyProperties),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Animation asset path (sequence, montage, composite)"))
+			.Required(TEXT("notify_index"), TEXT("integer"), TEXT("Index of the notify in the Notifies array"))
+			.Required(TEXT("properties"), TEXT("object"), TEXT("Object of property_name:value pairs. Values use UE text import format (same as Details panel copy/paste)."))
+			.Build());
+
+	// Wave 15 — Physics Assets + IK Chains
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_physics_asset_info"),
+		TEXT("Read all bodies, constraints, profiles, and solver settings from a physics asset"),
+		FMonolithActionHandler::CreateStatic(&HandleGetPhysicsAssetInfo),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Physics asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_body_properties"),
+		TEXT("Modify mass, physics type, collision, damping on a physics body identified by bone name"),
+		FMonolithActionHandler::CreateStatic(&HandleSetBodyProperties),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Physics asset path"))
+			.Required(TEXT("bone_name"), TEXT("string"), TEXT("Bone name identifying the body"))
+			.Optional(TEXT("mass"), TEXT("number"), TEXT("Mass override in kg (enables bOverrideMass)"))
+			.Optional(TEXT("physics_type"), TEXT("string"), TEXT("Default, Kinematic, or Simulated"))
+			.Optional(TEXT("collision_enabled"), TEXT("boolean"), TEXT("Enable/disable collision"))
+			.Optional(TEXT("collision_profile"), TEXT("string"), TEXT("Collision profile name"))
+			.Optional(TEXT("linear_damping"), TEXT("number"), TEXT("Linear damping"))
+			.Optional(TEXT("angular_damping"), TEXT("number"), TEXT("Angular damping"))
+			.Optional(TEXT("enable_gravity"), TEXT("boolean"), TEXT("Enable gravity"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_constraint_properties"),
+		TEXT("Modify angular/linear limits on a physics constraint by index or bone pair"),
+		FMonolithActionHandler::CreateStatic(&HandleSetConstraintProperties),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Physics asset path"))
+			.Optional(TEXT("constraint_index"), TEXT("integer"), TEXT("Constraint index (alternative to bone pair)"))
+			.Optional(TEXT("bone_1"), TEXT("string"), TEXT("Child bone name (with bone_2, alternative to constraint_index)"))
+			.Optional(TEXT("bone_2"), TEXT("string"), TEXT("Parent bone name (with bone_1, alternative to constraint_index)"))
+			.Optional(TEXT("swing1_motion"), TEXT("string"), TEXT("Free, Limited, or Locked"))
+			.Optional(TEXT("swing1_limit"), TEXT("number"), TEXT("Swing1 limit in degrees"))
+			.Optional(TEXT("swing2_motion"), TEXT("string"), TEXT("Free, Limited, or Locked"))
+			.Optional(TEXT("swing2_limit"), TEXT("number"), TEXT("Swing2 limit in degrees"))
+			.Optional(TEXT("twist_motion"), TEXT("string"), TEXT("Free, Limited, or Locked"))
+			.Optional(TEXT("twist_limit"), TEXT("number"), TEXT("Twist limit in degrees"))
+			.Optional(TEXT("disable_collision"), TEXT("boolean"), TEXT("Disable collision between constrained bodies"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_retarget_chain"),
+		TEXT("Add a retarget chain to an IK Rig asset"),
+		FMonolithActionHandler::CreateStatic(&HandleAddRetargetChain),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("IK Rig asset path"))
+			.Required(TEXT("chain_name"), TEXT("string"), TEXT("Name for the chain"))
+			.Required(TEXT("start_bone"), TEXT("string"), TEXT("Start bone name"))
+			.Required(TEXT("end_bone"), TEXT("string"), TEXT("End bone name"))
+			.Optional(TEXT("goal_name"), TEXT("string"), TEXT("Goal to associate with this chain"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("remove_retarget_chain"),
+		TEXT("Remove a retarget chain from an IK Rig asset"),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveRetargetChain),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("IK Rig asset path"))
+			.Required(TEXT("chain_name"), TEXT("string"), TEXT("Name of the chain to remove"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_retarget_chain_bones"),
+		TEXT("Update start/end bones of an existing retarget chain in an IK Rig"),
+		FMonolithActionHandler::CreateStatic(&HandleSetRetargetChainBones),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("IK Rig asset path"))
+			.Required(TEXT("chain_name"), TEXT("string"), TEXT("Name of the chain to modify"))
+			.Optional(TEXT("start_bone"), TEXT("string"), TEXT("New start bone name"))
+			.Optional(TEXT("end_bone"), TEXT("string"), TEXT("New end bone name"))
+			.Optional(TEXT("goal_name"), TEXT("string"), TEXT("New goal name"))
+			.Optional(TEXT("new_name"), TEXT("string"), TEXT("Rename the chain"))
 			.Build());
 
 }
@@ -4479,5 +4758,2408 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 	{
 		Root->SetStringField(TEXT("warning"), TEXT("Variable getter node was created but output pin could not be found. Manual wiring may be needed."));
 	}
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Configure BlendSpace axis via reflection (BlendParameters is protected)
+// ---------------------------------------------------------------------------
+
+static bool ConfigureBlendSpaceAxis(UBlendSpace* BS, int32 AxisIndex, const FString& Name, float Min, float Max)
+{
+	FProperty* Prop = UBlendSpace::StaticClass()->FindPropertyByName(TEXT("BlendParameters"));
+	if (!Prop) return false;
+
+	FBlendParameter* BlendParam = reinterpret_cast<FBlendParameter*>(Prop->ContainerPtrToValuePtr<uint8>(BS));
+	BlendParam += AxisIndex;
+	BlendParam->DisplayName = Name;
+	BlendParam->Min = Min;
+	BlendParam->Max = Max;
+	return true;
+}
+
+static void BlendSpaceAxisToJson(UBlendSpace* BS, int32 AxisIndex, const FString& FieldPrefix, TSharedPtr<FJsonObject>& Root)
+{
+	FProperty* Prop = UBlendSpace::StaticClass()->FindPropertyByName(TEXT("BlendParameters"));
+	if (!Prop) return;
+
+	const FBlendParameter* BlendParam = reinterpret_cast<const FBlendParameter*>(Prop->ContainerPtrToValuePtr<const uint8>(BS));
+	BlendParam += AxisIndex;
+
+	TSharedPtr<FJsonObject> AxisObj = MakeShared<FJsonObject>();
+	AxisObj->SetStringField(TEXT("name"), BlendParam->DisplayName);
+	AxisObj->SetNumberField(TEXT("min"), BlendParam->Min);
+	AxisObj->SetNumberField(TEXT("max"), BlendParam->Max);
+	Root->SetObjectField(FieldPrefix, AxisObj);
+}
+
+// ---------------------------------------------------------------------------
+// create_blend_space
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleCreateBlendSpace(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SkeletonPath = Params->GetStringField(TEXT("skeleton_path"));
+
+	USkeleton* Skeleton = FMonolithAssetUtils::LoadAssetByPath<USkeleton>(SkeletonPath);
+	if (!Skeleton) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeleton not found: %s"), *SkeletonPath));
+
+	FString AssetName;
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UBlendSpace* BS = NewObject<UBlendSpace>(Pkg, FName(*AssetName), RF_Public | RF_Standalone);
+	if (!BS) return FMonolithActionResult::Error(TEXT("Failed to create UBlendSpace object"));
+
+	BS->SetSkeleton(Skeleton);
+
+	// Optional axis configuration
+	if (Params->HasField(TEXT("axis_x_name")) || Params->HasField(TEXT("axis_x_min")) || Params->HasField(TEXT("axis_x_max")))
+	{
+		FString XName = Params->HasField(TEXT("axis_x_name")) ? Params->GetStringField(TEXT("axis_x_name")) : TEXT("None");
+		float XMin = Params->HasField(TEXT("axis_x_min")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_x_min"))) : 0.0f;
+		float XMax = Params->HasField(TEXT("axis_x_max")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_x_max"))) : 100.0f;
+		ConfigureBlendSpaceAxis(BS, 0, XName, XMin, XMax);
+	}
+	if (Params->HasField(TEXT("axis_y_name")) || Params->HasField(TEXT("axis_y_min")) || Params->HasField(TEXT("axis_y_max")))
+	{
+		FString YName = Params->HasField(TEXT("axis_y_name")) ? Params->GetStringField(TEXT("axis_y_name")) : TEXT("None");
+		float YMin = Params->HasField(TEXT("axis_y_min")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_y_min"))) : 0.0f;
+		float YMax = Params->HasField(TEXT("axis_y_max")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_y_max"))) : 100.0f;
+		ConfigureBlendSpaceAxis(BS, 1, YName, YMin, YMax);
+	}
+
+	FAssetRegistryModule::AssetCreated(BS);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), BS->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	Root->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+	BlendSpaceAxisToJson(BS, 0, TEXT("axis_x"), Root);
+	BlendSpaceAxisToJson(BS, 1, TEXT("axis_y"), Root);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// create_blend_space_1d
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleCreateBlendSpace1D(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SkeletonPath = Params->GetStringField(TEXT("skeleton_path"));
+
+	USkeleton* Skeleton = FMonolithAssetUtils::LoadAssetByPath<USkeleton>(SkeletonPath);
+	if (!Skeleton) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeleton not found: %s"), *SkeletonPath));
+
+	FString AssetName;
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UBlendSpace1D* BS = NewObject<UBlendSpace1D>(Pkg, FName(*AssetName), RF_Public | RF_Standalone);
+	if (!BS) return FMonolithActionResult::Error(TEXT("Failed to create UBlendSpace1D object"));
+
+	BS->SetSkeleton(Skeleton);
+
+	// Optional axis configuration (1D only uses axis 0)
+	if (Params->HasField(TEXT("axis_name")) || Params->HasField(TEXT("axis_min")) || Params->HasField(TEXT("axis_max")))
+	{
+		FString AxisName = Params->HasField(TEXT("axis_name")) ? Params->GetStringField(TEXT("axis_name")) : TEXT("None");
+		float AxisMin = Params->HasField(TEXT("axis_min")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_min"))) : 0.0f;
+		float AxisMax = Params->HasField(TEXT("axis_max")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_max"))) : 100.0f;
+		ConfigureBlendSpaceAxis(BS, 0, AxisName, AxisMin, AxisMax);
+	}
+
+	FAssetRegistryModule::AssetCreated(BS);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), BS->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	Root->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+	BlendSpaceAxisToJson(BS, 0, TEXT("axis"), Root);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// create_aim_offset
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleCreateAimOffset(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SkeletonPath = Params->GetStringField(TEXT("skeleton_path"));
+
+	USkeleton* Skeleton = FMonolithAssetUtils::LoadAssetByPath<USkeleton>(SkeletonPath);
+	if (!Skeleton) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeleton not found: %s"), *SkeletonPath));
+
+	FString AssetName;
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UAimOffsetBlendSpace* AO = NewObject<UAimOffsetBlendSpace>(Pkg, FName(*AssetName), RF_Public | RF_Standalone);
+	if (!AO) return FMonolithActionResult::Error(TEXT("Failed to create UAimOffsetBlendSpace object"));
+
+	AO->SetSkeleton(Skeleton);
+
+	// Default Yaw/Pitch axes for aim offsets, overridable via params
+	{
+		FString XName = Params->HasField(TEXT("axis_x_name")) ? Params->GetStringField(TEXT("axis_x_name")) : TEXT("Yaw");
+		float XMin = Params->HasField(TEXT("axis_x_min")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_x_min"))) : -180.0f;
+		float XMax = Params->HasField(TEXT("axis_x_max")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_x_max"))) : 180.0f;
+		ConfigureBlendSpaceAxis(AO, 0, XName, XMin, XMax);
+	}
+	{
+		FString YName = Params->HasField(TEXT("axis_y_name")) ? Params->GetStringField(TEXT("axis_y_name")) : TEXT("Pitch");
+		float YMin = Params->HasField(TEXT("axis_y_min")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_y_min"))) : -90.0f;
+		float YMax = Params->HasField(TEXT("axis_y_max")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_y_max"))) : 90.0f;
+		ConfigureBlendSpaceAxis(AO, 1, YName, YMin, YMax);
+	}
+
+	FAssetRegistryModule::AssetCreated(AO);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AO->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	Root->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+	BlendSpaceAxisToJson(AO, 0, TEXT("axis_x"), Root);
+	BlendSpaceAxisToJson(AO, 1, TEXT("axis_y"), Root);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// create_aim_offset_1d
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleCreateAimOffset1D(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SkeletonPath = Params->GetStringField(TEXT("skeleton_path"));
+
+	USkeleton* Skeleton = FMonolithAssetUtils::LoadAssetByPath<USkeleton>(SkeletonPath);
+	if (!Skeleton) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeleton not found: %s"), *SkeletonPath));
+
+	FString AssetName;
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UAimOffsetBlendSpace1D* AO = NewObject<UAimOffsetBlendSpace1D>(Pkg, FName(*AssetName), RF_Public | RF_Standalone);
+	if (!AO) return FMonolithActionResult::Error(TEXT("Failed to create UAimOffsetBlendSpace1D object"));
+
+	AO->SetSkeleton(Skeleton);
+
+	// Default Yaw axis for 1D aim offsets
+	{
+		FString AxisName = Params->HasField(TEXT("axis_name")) ? Params->GetStringField(TEXT("axis_name")) : TEXT("Yaw");
+		float AxisMin = Params->HasField(TEXT("axis_min")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_min"))) : -180.0f;
+		float AxisMax = Params->HasField(TEXT("axis_max")) ? static_cast<float>(Params->GetNumberField(TEXT("axis_max"))) : 180.0f;
+		ConfigureBlendSpaceAxis(AO, 0, AxisName, AxisMin, AxisMax);
+	}
+
+	FAssetRegistryModule::AssetCreated(AO);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AO->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	Root->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+	BlendSpaceAxisToJson(AO, 0, TEXT("axis"), Root);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// create_composite
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleCreateComposite(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SkeletonPath = Params->GetStringField(TEXT("skeleton_path"));
+
+	USkeleton* Skeleton = FMonolithAssetUtils::LoadAssetByPath<USkeleton>(SkeletonPath);
+	if (!Skeleton) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeleton not found: %s"), *SkeletonPath));
+
+	FString AssetName;
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UAnimComposite* Composite = NewObject<UAnimComposite>(Pkg, FName(*AssetName), RF_Public | RF_Standalone);
+	if (!Composite) return FMonolithActionResult::Error(TEXT("Failed to create UAnimComposite object"));
+
+	Composite->SetSkeleton(Skeleton);
+	FAssetRegistryModule::AssetCreated(Composite);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), Composite->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	Root->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// create_anim_blueprint
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleCreateAnimBlueprint(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SkeletonPath = Params->GetStringField(TEXT("skeleton_path"));
+	FString ParentClassName = Params->HasField(TEXT("parent_class")) ? Params->GetStringField(TEXT("parent_class")) : TEXT("AnimInstance");
+
+	USkeleton* Skeleton = FMonolithAssetUtils::LoadAssetByPath<USkeleton>(SkeletonPath);
+	if (!Skeleton) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeleton not found: %s"), *SkeletonPath));
+
+	FString AssetName;
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+
+	// Resolve parent class
+	UClass* ParentClass = nullptr;
+	if (ParentClassName.Equals(TEXT("AnimInstance"), ESearchCase::IgnoreCase) ||
+		ParentClassName.Equals(TEXT("UAnimInstance"), ESearchCase::IgnoreCase))
+	{
+		ParentClass = UAnimInstance::StaticClass();
+	}
+	else
+	{
+		// Try to find the class by name — support both "UMyClass" and "MyClass" forms
+		FString CleanName = ParentClassName;
+		if (CleanName.StartsWith(TEXT("U")))
+		{
+			CleanName = CleanName.Mid(1);
+		}
+		ParentClass = FindFirstObject<UClass>(*CleanName, EFindFirstObjectOptions::NativeFirst);
+		if (!ParentClass)
+		{
+			// Try with full path
+			ParentClass = LoadObject<UClass>(nullptr, *ParentClassName);
+		}
+		if (!ParentClass || !ParentClass->IsChildOf(UAnimInstance::StaticClass()))
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Parent class '%s' not found or not derived from UAnimInstance"), *ParentClassName));
+		}
+	}
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UAnimBlueprint* AnimBP = CastChecked<UAnimBlueprint>(
+		FKismetEditorUtilities::CreateBlueprint(
+			ParentClass,
+			Pkg,
+			FName(*AssetName),
+			BPTYPE_Normal,
+			UAnimBlueprint::StaticClass(),
+			UBlueprintGeneratedClass::StaticClass(),
+			NAME_None
+		)
+	);
+
+	if (!AnimBP)
+		return FMonolithActionResult::Error(TEXT("Failed to create Animation Blueprint via FKismetEditorUtilities::CreateBlueprint"));
+
+	// Set skeleton on the ABP and both generated classes
+	AnimBP->TargetSkeleton = Skeleton;
+	if (UAnimBlueprintGeneratedClass* GenClass = Cast<UAnimBlueprintGeneratedClass>(AnimBP->GeneratedClass))
+	{
+		GenClass->TargetSkeleton = Skeleton;
+	}
+	if (UAnimBlueprintGeneratedClass* SkelGenClass = Cast<UAnimBlueprintGeneratedClass>(AnimBP->SkeletonGeneratedClass))
+	{
+		SkelGenClass->TargetSkeleton = Skeleton;
+	}
+
+	FAssetRegistryModule::AssetCreated(AnimBP);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AnimBP->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	Root->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+	Root->SetStringField(TEXT("parent_class"), ParentClass->GetName());
+	if (AnimBP->GeneratedClass)
+	{
+		Root->SetStringField(TEXT("generated_class"), AnimBP->GeneratedClass->GetPathName());
+	}
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// compare_skeletons
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleCompareSkeletons(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SkeletonPathA = Params->GetStringField(TEXT("skeleton_a"));
+	FString SkeletonPathB = Params->GetStringField(TEXT("skeleton_b"));
+
+	USkeleton* SkeletonA = FMonolithAssetUtils::LoadAssetByPath<USkeleton>(SkeletonPathA);
+	if (!SkeletonA) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeleton A not found: %s"), *SkeletonPathA));
+
+	USkeleton* SkeletonB = FMonolithAssetUtils::LoadAssetByPath<USkeleton>(SkeletonPathB);
+	if (!SkeletonB) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeleton B not found: %s"), *SkeletonPathB));
+
+	const FReferenceSkeleton& RefA = SkeletonA->GetReferenceSkeleton();
+	const FReferenceSkeleton& RefB = SkeletonB->GetReferenceSkeleton();
+
+	// Build bone name sets
+	TSet<FName> BonesA;
+	TSet<FName> BonesB;
+	for (int32 i = 0; i < RefA.GetRawBoneNum(); ++i)
+		BonesA.Add(RefA.GetBoneName(i));
+	for (int32 i = 0; i < RefB.GetRawBoneNum(); ++i)
+		BonesB.Add(RefB.GetBoneName(i));
+
+	// Find matching, missing in A, missing in B
+	TArray<FName> Matching;
+	TArray<FName> MissingInA;
+	TArray<FName> MissingInB;
+
+	for (const FName& Bone : BonesA)
+	{
+		if (BonesB.Contains(Bone))
+			Matching.Add(Bone);
+		else
+			MissingInB.Add(Bone);
+	}
+	for (const FName& Bone : BonesB)
+	{
+		if (!BonesA.Contains(Bone))
+			MissingInA.Add(Bone);
+	}
+
+	// Check hierarchy match for common bones
+	bool bHierarchyMatches = true;
+	for (const FName& Bone : Matching)
+	{
+		int32 IdxA = RefA.FindBoneIndex(Bone);
+		int32 IdxB = RefB.FindBoneIndex(Bone);
+		int32 ParentA = RefA.GetParentIndex(IdxA);
+		int32 ParentB = RefB.GetParentIndex(IdxB);
+
+		// Both root or both have matching parent names
+		FName ParentNameA = (ParentA != INDEX_NONE) ? RefA.GetBoneName(ParentA) : NAME_None;
+		FName ParentNameB = (ParentB != INDEX_NONE) ? RefB.GetBoneName(ParentB) : NAME_None;
+
+		if (ParentNameA != ParentNameB)
+		{
+			bHierarchyMatches = false;
+			break;
+		}
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("skeleton_a"), SkeletonPathA);
+	Root->SetStringField(TEXT("skeleton_b"), SkeletonPathB);
+	Root->SetNumberField(TEXT("bone_count_a"), RefA.GetRawBoneNum());
+	Root->SetNumberField(TEXT("bone_count_b"), RefB.GetRawBoneNum());
+	Root->SetNumberField(TEXT("matching_bones"), Matching.Num());
+	Root->SetBoolField(TEXT("hierarchy_matches"), bHierarchyMatches);
+
+	// Missing in A (bones that B has but A doesn't)
+	TArray<TSharedPtr<FJsonValue>> MissingInAArr;
+	for (const FName& Bone : MissingInA)
+		MissingInAArr.Add(MakeShared<FJsonValueString>(Bone.ToString()));
+	Root->SetArrayField(TEXT("missing_in_a"), MissingInAArr);
+
+	// Missing in B (bones that A has but B doesn't)
+	TArray<TSharedPtr<FJsonValue>> MissingInBArr;
+	for (const FName& Bone : MissingInB)
+		MissingInBArr.Add(MakeShared<FJsonValueString>(Bone.ToString()));
+	Root->SetArrayField(TEXT("missing_in_b"), MissingInBArr);
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 12 — Sequence Properties + Sync Markers
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetSequenceProperties(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
+	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimSequence not found: %s"), *AssetPath));
+
+	bool bAnySet = false;
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Sequence Properties")));
+	Seq->Modify();
+
+	if (Params->HasField(TEXT("rate_scale")))
+	{
+		Seq->RateScale = static_cast<float>(Params->GetNumberField(TEXT("rate_scale")));
+		bAnySet = true;
+	}
+
+	if (Params->HasField(TEXT("loop")))
+	{
+		Seq->bLoop = Params->GetBoolField(TEXT("loop"));
+		bAnySet = true;
+	}
+
+	if (Params->HasField(TEXT("interpolation")))
+	{
+		FString InterpStr = Params->GetStringField(TEXT("interpolation"));
+		if (InterpStr.Equals(TEXT("Linear"), ESearchCase::IgnoreCase))
+			Seq->Interpolation = EAnimInterpolationType::Linear;
+		else if (InterpStr.Equals(TEXT("Step"), ESearchCase::IgnoreCase))
+			Seq->Interpolation = EAnimInterpolationType::Step;
+		else
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid interpolation: '%s' — use Linear or Step"), *InterpStr));
+		}
+		bAnySet = true;
+	}
+
+	if (!bAnySet)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("At least one of rate_scale, loop, or interpolation must be provided"));
+	}
+
+	GEditor->EndTransaction();
+	Seq->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("rate_scale"), Seq->RateScale);
+	Root->SetBoolField(TEXT("loop"), Seq->bLoop);
+	Root->SetStringField(TEXT("interpolation"),
+		Seq->Interpolation == EAnimInterpolationType::Linear ? TEXT("Linear") : TEXT("Step"));
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetAdditiveSettings(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
+	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimSequence not found: %s"), *AssetPath));
+
+	bool bAnySet = false;
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Additive Settings")));
+	Seq->Modify();
+
+	if (Params->HasField(TEXT("additive_anim_type")))
+	{
+		FString TypeStr = Params->GetStringField(TEXT("additive_anim_type"));
+		if (TypeStr.Equals(TEXT("NoAdditive"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+			Seq->AdditiveAnimType = EAdditiveAnimationType::AAT_None;
+		else if (TypeStr.Equals(TEXT("LocalSpace"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("LocalSpaceBase"), ESearchCase::IgnoreCase))
+			Seq->AdditiveAnimType = EAdditiveAnimationType::AAT_LocalSpaceBase;
+		else if (TypeStr.Equals(TEXT("MeshSpace"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("RotationOffsetMeshSpace"), ESearchCase::IgnoreCase))
+			Seq->AdditiveAnimType = EAdditiveAnimationType::AAT_RotationOffsetMeshSpace;
+		else
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid additive_anim_type: '%s' — use NoAdditive, LocalSpace, or MeshSpace"), *TypeStr));
+		}
+		bAnySet = true;
+	}
+
+	if (Params->HasField(TEXT("ref_pose_type")))
+	{
+		FString RefStr = Params->GetStringField(TEXT("ref_pose_type"));
+		if (RefStr.Equals(TEXT("RefPose"), ESearchCase::IgnoreCase))
+			Seq->RefPoseType = EAdditiveBasePoseType::ABPT_RefPose;
+		else if (RefStr.Equals(TEXT("AnimScaled"), ESearchCase::IgnoreCase))
+			Seq->RefPoseType = EAdditiveBasePoseType::ABPT_AnimScaled;
+		else if (RefStr.Equals(TEXT("AnimFrame"), ESearchCase::IgnoreCase))
+			Seq->RefPoseType = EAdditiveBasePoseType::ABPT_AnimFrame;
+		else if (RefStr.Equals(TEXT("LocalAnimFrame"), ESearchCase::IgnoreCase))
+			Seq->RefPoseType = EAdditiveBasePoseType::ABPT_LocalAnimFrame;
+		else
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid ref_pose_type: '%s' — use RefPose, AnimScaled, AnimFrame, or LocalAnimFrame"), *RefStr));
+		}
+		bAnySet = true;
+	}
+
+	if (Params->HasField(TEXT("ref_frame_index")))
+	{
+		Seq->RefFrameIndex = static_cast<int32>(Params->GetNumberField(TEXT("ref_frame_index")));
+		bAnySet = true;
+	}
+
+	if (Params->HasField(TEXT("ref_pose_seq")))
+	{
+		FString RefSeqPath = Params->GetStringField(TEXT("ref_pose_seq"));
+		if (RefSeqPath.IsEmpty())
+		{
+			Seq->RefPoseSeq = nullptr;
+		}
+		else
+		{
+			UAnimSequence* RefSeq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(RefSeqPath);
+			if (!RefSeq)
+			{
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(FString::Printf(TEXT("Reference pose sequence not found: %s"), *RefSeqPath));
+			}
+			Seq->RefPoseSeq = RefSeq;
+		}
+		bAnySet = true;
+	}
+
+	if (!bAnySet)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("At least one of additive_anim_type, ref_pose_type, ref_frame_index, or ref_pose_seq must be provided"));
+	}
+
+	GEditor->EndTransaction();
+
+	// PostEditChangeProperty triggers additive delta recomputation / DDC rebuild
+	FPropertyChangedEvent PropEvent(
+		UAnimSequence::StaticClass()->FindPropertyByName(GET_MEMBER_NAME_CHECKED(UAnimSequence, AdditiveAnimType)),
+		EPropertyChangeType::ValueSet
+	);
+	Seq->PostEditChangeProperty(PropEvent);
+
+	Seq->MarkPackageDirty();
+
+	// Build response
+	FString AdditiveStr;
+	switch (Seq->AdditiveAnimType.GetValue())
+	{
+	case EAdditiveAnimationType::AAT_None:                       AdditiveStr = TEXT("NoAdditive"); break;
+	case EAdditiveAnimationType::AAT_LocalSpaceBase:             AdditiveStr = TEXT("LocalSpace"); break;
+	case EAdditiveAnimationType::AAT_RotationOffsetMeshSpace:    AdditiveStr = TEXT("MeshSpace"); break;
+	default:                                                     AdditiveStr = TEXT("Unknown"); break;
+	}
+
+	FString RefPoseStr;
+	switch (Seq->RefPoseType.GetValue())
+	{
+	case EAdditiveBasePoseType::ABPT_RefPose:        RefPoseStr = TEXT("RefPose"); break;
+	case EAdditiveBasePoseType::ABPT_AnimScaled:     RefPoseStr = TEXT("AnimScaled"); break;
+	case EAdditiveBasePoseType::ABPT_AnimFrame:      RefPoseStr = TEXT("AnimFrame"); break;
+	case EAdditiveBasePoseType::ABPT_LocalAnimFrame: RefPoseStr = TEXT("LocalAnimFrame"); break;
+	default:                                         RefPoseStr = TEXT("None"); break;
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("additive_anim_type"), AdditiveStr);
+	Root->SetStringField(TEXT("ref_pose_type"), RefPoseStr);
+	Root->SetNumberField(TEXT("ref_frame_index"), Seq->RefFrameIndex);
+	Root->SetStringField(TEXT("ref_pose_seq"), Seq->RefPoseSeq ? Seq->RefPoseSeq->GetPathName() : TEXT(""));
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetCompressionSettings(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
+	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimSequence not found: %s"), *AssetPath));
+
+	bool bAnySet = false;
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Compression Settings")));
+	Seq->Modify();
+
+	if (Params->HasField(TEXT("bone_compression")))
+	{
+		FString BoneCompPath = Params->GetStringField(TEXT("bone_compression"));
+		if (BoneCompPath.IsEmpty())
+		{
+			Seq->BoneCompressionSettings = nullptr;
+		}
+		else
+		{
+			UAnimBoneCompressionSettings* BoneComp = FMonolithAssetUtils::LoadAssetByPath<UAnimBoneCompressionSettings>(BoneCompPath);
+			if (!BoneComp)
+			{
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(FString::Printf(TEXT("Bone compression settings not found: %s"), *BoneCompPath));
+			}
+			Seq->BoneCompressionSettings = BoneComp;
+		}
+		bAnySet = true;
+	}
+
+	if (Params->HasField(TEXT("curve_compression")))
+	{
+		FString CurveCompPath = Params->GetStringField(TEXT("curve_compression"));
+		if (CurveCompPath.IsEmpty())
+		{
+			Seq->CurveCompressionSettings = nullptr;
+		}
+		else
+		{
+			UAnimCurveCompressionSettings* CurveComp = FMonolithAssetUtils::LoadAssetByPath<UAnimCurveCompressionSettings>(CurveCompPath);
+			if (!CurveComp)
+			{
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(FString::Printf(TEXT("Curve compression settings not found: %s"), *CurveCompPath));
+			}
+			Seq->CurveCompressionSettings = CurveComp;
+		}
+		bAnySet = true;
+	}
+
+	if (!bAnySet)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("At least one of bone_compression or curve_compression must be provided"));
+	}
+
+	GEditor->EndTransaction();
+	Seq->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("bone_compression"), Seq->BoneCompressionSettings ? Seq->BoneCompressionSettings->GetPathName() : TEXT(""));
+	Root->SetStringField(TEXT("curve_compression"), Seq->CurveCompressionSettings ? Seq->CurveCompressionSettings->GetPathName() : TEXT(""));
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetSyncMarkers(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
+	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimSequence not found: %s"), *AssetPath));
+
+	TArray<TSharedPtr<FJsonValue>> MarkersArr;
+	for (int32 i = 0; i < Seq->AuthoredSyncMarkers.Num(); ++i)
+	{
+		const FAnimSyncMarker& Marker = Seq->AuthoredSyncMarkers[i];
+		TSharedPtr<FJsonObject> MarkerObj = MakeShared<FJsonObject>();
+		MarkerObj->SetStringField(TEXT("name"), Marker.MarkerName.ToString());
+		MarkerObj->SetNumberField(TEXT("time"), Marker.Time);
+		MarkerObj->SetNumberField(TEXT("index"), i);
+#if WITH_EDITORONLY_DATA
+		MarkerObj->SetNumberField(TEXT("track_index"), Marker.TrackIndex);
+		MarkerObj->SetStringField(TEXT("guid"), Marker.Guid.ToString());
+#endif
+		MarkersArr.Add(MakeShared<FJsonValueObject>(MarkerObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("marker_count"), Seq->AuthoredSyncMarkers.Num());
+	Root->SetArrayField(TEXT("markers"), MarkersArr);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleAddSyncMarker(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString MarkerName = Params->GetStringField(TEXT("marker_name"));
+	float Time = static_cast<float>(Params->GetNumberField(TEXT("time")));
+	int32 TrackIndex = Params->HasField(TEXT("track_index")) ? static_cast<int32>(Params->GetNumberField(TEXT("track_index"))) : 0;
+
+	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
+	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimSequence not found: %s"), *AssetPath));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Add Sync Marker")));
+	Seq->Modify();
+
+	FAnimSyncMarker NewMarker;
+	NewMarker.MarkerName = FName(*MarkerName);
+	NewMarker.Time = Time;
+#if WITH_EDITORONLY_DATA
+	NewMarker.TrackIndex = TrackIndex;
+	NewMarker.Guid = FGuid::NewGuid();
+#endif
+
+	int32 NewIndex = Seq->AuthoredSyncMarkers.Add(NewMarker);
+	Seq->RefreshSyncMarkerDataFromAuthored();
+
+	GEditor->EndTransaction();
+	Seq->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("marker_name"), MarkerName);
+	Root->SetNumberField(TEXT("time"), Time);
+	Root->SetNumberField(TEXT("track_index"), TrackIndex);
+	Root->SetNumberField(TEXT("index"), NewIndex);
+	Root->SetNumberField(TEXT("total_markers"), Seq->AuthoredSyncMarkers.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleRemoveSyncMarker(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
+	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimSequence not found: %s"), *AssetPath));
+
+	bool bHasName = Params->HasField(TEXT("marker_name"));
+	bool bHasIndex = Params->HasField(TEXT("marker_index"));
+
+	if (!bHasName && !bHasIndex)
+		return FMonolithActionResult::Error(TEXT("Either marker_name or marker_index must be provided"));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Remove Sync Marker")));
+	Seq->Modify();
+
+	int32 RemovedCount = 0;
+
+	if (bHasIndex)
+	{
+		int32 MarkerIndex = static_cast<int32>(Params->GetNumberField(TEXT("marker_index")));
+		if (!Seq->AuthoredSyncMarkers.IsValidIndex(MarkerIndex))
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid marker_index: %d (have %d markers)"), MarkerIndex, Seq->AuthoredSyncMarkers.Num()));
+		}
+		Seq->AuthoredSyncMarkers.RemoveAt(MarkerIndex);
+		RemovedCount = 1;
+	}
+	else
+	{
+		FString MarkerNameStr = Params->GetStringField(TEXT("marker_name"));
+		FName NameToRemove(*MarkerNameStr);
+
+		TArray<FName> NamesToRemove;
+		NamesToRemove.Add(NameToRemove);
+
+		int32 CountBefore = Seq->AuthoredSyncMarkers.Num();
+		Seq->RemoveSyncMarkers(NamesToRemove);
+		RemovedCount = CountBefore - Seq->AuthoredSyncMarkers.Num();
+	}
+
+	Seq->RefreshSyncMarkerDataFromAuthored();
+
+	GEditor->EndTransaction();
+	Seq->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("removed_count"), RemovedCount);
+	Root->SetNumberField(TEXT("remaining_markers"), Seq->AuthoredSyncMarkers.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleRenameSyncMarker(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString OldName = Params->GetStringField(TEXT("old_name"));
+	FString NewName = Params->GetStringField(TEXT("new_name"));
+
+	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
+	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimSequence not found: %s"), *AssetPath));
+
+	// Count how many markers have the old name before renaming
+	FName OldFName(*OldName);
+	int32 RenamedCount = 0;
+	for (const FAnimSyncMarker& Marker : Seq->AuthoredSyncMarkers)
+	{
+		if (Marker.MarkerName == OldFName)
+			++RenamedCount;
+	}
+
+	if (RenamedCount == 0)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No sync markers found with name '%s'"), *OldName));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Rename Sync Marker")));
+	Seq->Modify();
+
+	Seq->RenameSyncMarkers(FName(*OldName), FName(*NewName));
+	Seq->RefreshSyncMarkerDataFromAuthored();
+
+	GEditor->EndTransaction();
+	Seq->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("old_name"), OldName);
+	Root->SetStringField(TEXT("new_name"), NewName);
+	Root->SetNumberField(TEXT("renamed_count"), RenamedCount);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 13 — Batch Ops + Montage Completion
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleBatchExecute(const TSharedPtr<FJsonObject>& Params)
+{
+	// Parse operations — handle both EJson::Array (normal) and EJson::String (Claude Code quirk)
+	TArray<TSharedPtr<FJsonValue>> Ops;
+	TSharedPtr<FJsonValue> OpsField = Params->TryGetField(TEXT("operations"));
+	if (!OpsField.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required field: operations"));
+	}
+	if (OpsField->Type == EJson::Array)
+	{
+		Ops = OpsField->AsArray();
+	}
+	else if (OpsField->Type == EJson::String)
+	{
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(OpsField->AsString());
+		if (!FJsonSerializer::Deserialize(Reader, Ops))
+		{
+			return FMonolithActionResult::Error(TEXT("Failed to parse operations string as JSON array"));
+		}
+	}
+	else
+	{
+		return FMonolithActionResult::Error(TEXT("'operations' must be an array"));
+	}
+
+	if (Ops.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("operations array is empty"));
+	}
+
+	bool bStopOnError = false;
+	Params->TryGetBoolField(TEXT("stop_on_error"), bStopOnError);
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AnimBatchExec", "Animation Batch Execute"));
+
+	TArray<TSharedPtr<FJsonValue>> Results;
+	int32 Ok = 0, Fail = 0;
+
+	for (int32 i = 0; i < Ops.Num(); ++i)
+	{
+		TSharedPtr<FJsonObject> Op = Ops[i]->AsObject();
+		TSharedRef<FJsonObject> RO = MakeShared<FJsonObject>();
+		RO->SetNumberField(TEXT("index"), i);
+
+		if (!Op.IsValid())
+		{
+			RO->SetStringField(TEXT("op"), TEXT("(invalid)"));
+			RO->SetBoolField(TEXT("success"), false);
+			RO->SetStringField(TEXT("error"), TEXT("Operation entry is not a valid JSON object"));
+			Results.Add(MakeShared<FJsonValueObject>(RO));
+			Fail++;
+			if (bStopOnError) break;
+			continue;
+		}
+
+		FString OpName;
+		if (!Op->TryGetStringField(TEXT("op"), OpName) || OpName.IsEmpty())
+		{
+			FString HintName;
+			Op->TryGetStringField(TEXT("action"), HintName);
+			FString Hint = HintName.IsEmpty()
+				? TEXT("Each operation must have an \"op\" key with the action name, plus flat inline params (not nested under \"params\").")
+				: FString::Printf(TEXT("Use \"op\" key, not \"action\". Found \"action\":\"%s\". Params must be flat inline, not nested."), *HintName);
+			RO->SetStringField(TEXT("op"), TEXT("(missing)"));
+			RO->SetBoolField(TEXT("success"), false);
+			RO->SetStringField(TEXT("error"), Hint);
+			Results.Add(MakeShared<FJsonValueObject>(RO));
+			Fail++;
+			if (bStopOnError) break;
+			continue;
+		}
+		RO->SetStringField(TEXT("op"), OpName);
+
+		// Build sub-params: copy all op fields (asset_path comes from op, not outer params)
+		TSharedRef<FJsonObject> SubParams = MakeShared<FJsonObject>();
+		for (auto& Pair : Op->Values)
+		{
+			if (Pair.Key != TEXT("op"))
+			{
+				SubParams->SetField(Pair.Key, Pair.Value);
+			}
+		}
+
+		FMonolithActionResult SubResult = FMonolithActionResult::Error(FString::Printf(TEXT("Unknown op: %s"), *OpName));
+
+		// Notify ops
+		if      (OpName == TEXT("add_notify"))               SubResult = HandleAddNotify(SubParams);
+		else if (OpName == TEXT("add_notify_state"))          SubResult = HandleAddNotifyState(SubParams);
+		else if (OpName == TEXT("remove_notify"))             SubResult = HandleRemoveNotify(SubParams);
+		else if (OpName == TEXT("set_notify_time"))           SubResult = HandleSetNotifyTime(SubParams);
+		else if (OpName == TEXT("set_notify_duration"))       SubResult = HandleSetNotifyDuration(SubParams);
+		else if (OpName == TEXT("set_notify_track"))          SubResult = HandleSetNotifyTrack(SubParams);
+		else if (OpName == TEXT("set_notify_properties"))     SubResult = HandleSetNotifyProperties(SubParams);
+		// Montage section ops
+		else if (OpName == TEXT("add_montage_section"))       SubResult = HandleAddMontageSection(SubParams);
+		else if (OpName == TEXT("delete_montage_section"))    SubResult = HandleDeleteMontageSection(SubParams);
+		else if (OpName == TEXT("set_section_next"))          SubResult = HandleSetSectionNext(SubParams);
+		else if (OpName == TEXT("set_section_time"))          SubResult = HandleSetSectionTime(SubParams);
+		// Montage slot/blend ops
+		else if (OpName == TEXT("add_montage_slot"))          SubResult = HandleAddMontageSlot(SubParams);
+		else if (OpName == TEXT("set_montage_slot"))          SubResult = HandleSetMontageSlot(SubParams);
+		else if (OpName == TEXT("set_montage_blend"))         SubResult = HandleSetMontageBlend(SubParams);
+		else if (OpName == TEXT("add_montage_anim_segment")) SubResult = HandleAddMontageAnimSegment(SubParams);
+		// Curve ops
+		else if (OpName == TEXT("add_curve"))                 SubResult = HandleAddCurve(SubParams);
+		else if (OpName == TEXT("remove_curve"))              SubResult = HandleRemoveCurve(SubParams);
+		else if (OpName == TEXT("set_curve_keys"))            SubResult = HandleSetCurveKeys(SubParams);
+		// Bone track ops
+		else if (OpName == TEXT("add_bone_track"))            SubResult = HandleAddBoneTrack(SubParams);
+		else if (OpName == TEXT("set_bone_track_keys"))       SubResult = HandleSetBoneTrackKeys(SubParams);
+		else if (OpName == TEXT("remove_bone_track"))         SubResult = HandleRemoveBoneTrack(SubParams);
+		// BlendSpace ops
+		else if (OpName == TEXT("add_blendspace_sample"))     SubResult = HandleAddBlendSpaceSample(SubParams);
+		else if (OpName == TEXT("edit_blendspace_sample"))    SubResult = HandleEditBlendSpaceSample(SubParams);
+		else if (OpName == TEXT("delete_blendspace_sample"))  SubResult = HandleDeleteBlendSpaceSample(SubParams);
+		// Socket ops
+		else if (OpName == TEXT("add_socket"))                SubResult = HandleAddSocket(SubParams);
+		else if (OpName == TEXT("remove_socket"))             SubResult = HandleRemoveSocket(SubParams);
+		else if (OpName == TEXT("set_socket_transform"))      SubResult = HandleSetSocketTransform(SubParams);
+		// Sync marker ops
+		else if (OpName == TEXT("add_sync_marker"))           SubResult = HandleAddSyncMarker(SubParams);
+		else if (OpName == TEXT("remove_sync_marker"))        SubResult = HandleRemoveSyncMarker(SubParams);
+		else if (OpName == TEXT("rename_sync_marker"))        SubResult = HandleRenameSyncMarker(SubParams);
+		// Sequence property ops
+		else if (OpName == TEXT("set_sequence_properties"))   SubResult = HandleSetSequenceProperties(SubParams);
+		else if (OpName == TEXT("set_additive_settings"))     SubResult = HandleSetAdditiveSettings(SubParams);
+		else if (OpName == TEXT("set_compression_settings"))  SubResult = HandleSetCompressionSettings(SubParams);
+		else if (OpName == TEXT("set_root_motion_settings"))  SubResult = HandleSetRootMotionSettings(SubParams);
+		else if (OpName == TEXT("set_blend_space_axis"))      SubResult = HandleSetBlendSpaceAxis(SubParams);
+		// Read ops (useful in batch for gathering info)
+		else if (OpName == TEXT("get_sequence_info"))         SubResult = HandleGetSequenceInfo(SubParams);
+		else if (OpName == TEXT("get_sequence_notifies"))     SubResult = HandleGetSequenceNotifies(SubParams);
+		else if (OpName == TEXT("get_montage_info"))          SubResult = HandleGetMontageInfo(SubParams);
+		else if (OpName == TEXT("get_blend_space_info"))      SubResult = HandleGetBlendSpaceInfo(SubParams);
+		else if (OpName == TEXT("get_sequence_curves"))       SubResult = HandleGetSequenceCurves(SubParams);
+		else if (OpName == TEXT("get_bone_track_keys"))       SubResult = HandleGetBoneTrackKeys(SubParams);
+		else if (OpName == TEXT("get_curve_keys"))            SubResult = HandleGetCurveKeys(SubParams);
+		else if (OpName == TEXT("list_curves"))               SubResult = HandleListCurves(SubParams);
+		else if (OpName == TEXT("get_sync_markers"))          SubResult = HandleGetSyncMarkers(SubParams);
+
+		RO->SetBoolField(TEXT("success"), SubResult.bSuccess);
+		if (!SubResult.bSuccess)
+		{
+			RO->SetStringField(TEXT("error"), SubResult.ErrorMessage);
+		}
+		if (SubResult.bSuccess && SubResult.Result.IsValid())
+		{
+			RO->SetObjectField(TEXT("data"), SubResult.Result);
+		}
+
+		Results.Add(MakeShared<FJsonValueObject>(RO));
+		if (SubResult.bSuccess) Ok++; else Fail++;
+
+		if (!SubResult.bSuccess && bStopOnError) break;
+	}
+
+	GEditor->EndTransaction();
+
+	TSharedRef<FJsonObject> Final = MakeShared<FJsonObject>();
+	Final->SetBoolField(TEXT("success"), Fail == 0);
+	Final->SetNumberField(TEXT("total"), Ops.Num());
+	Final->SetNumberField(TEXT("succeeded"), Ok);
+	Final->SetNumberField(TEXT("failed"), Fail);
+	Final->SetArrayField(TEXT("results"), Results);
+
+	return FMonolithActionResult::Success(Final);
+}
+
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleAddMontageAnimSegment(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString AnimPath = Params->GetStringField(TEXT("anim_path"));
+	int32 SlotIndex = Params->HasField(TEXT("slot_index")) ? static_cast<int32>(Params->GetNumberField(TEXT("slot_index"))) : 0;
+	float PlayRate = Params->HasField(TEXT("play_rate")) ? static_cast<float>(Params->GetNumberField(TEXT("play_rate"))) : 1.0f;
+	int32 LoopingCount = Params->HasField(TEXT("looping_count")) ? static_cast<int32>(Params->GetNumberField(TEXT("looping_count"))) : 1;
+
+	UAnimMontage* Montage = FMonolithAssetUtils::LoadAssetByPath<UAnimMontage>(AssetPath);
+	if (!Montage) return FMonolithActionResult::Error(FString::Printf(TEXT("Montage not found: %s"), *AssetPath));
+
+	if (SlotIndex < 0 || SlotIndex >= Montage->SlotAnimTracks.Num())
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid slot_index %d (montage has %d slots)"), SlotIndex, Montage->SlotAnimTracks.Num()));
+	}
+
+	UAnimSequenceBase* Anim = FMonolithAssetUtils::LoadAssetByPath<UAnimSequenceBase>(AnimPath);
+	if (!Anim) return FMonolithActionResult::Error(FString::Printf(TEXT("Animation not found: %s"), *AnimPath));
+
+	// Auto-calculate StartPos from existing segments if not provided
+	float StartPos = 0.0f;
+	if (Params->HasField(TEXT("start_pos")))
+	{
+		StartPos = static_cast<float>(Params->GetNumberField(TEXT("start_pos")));
+	}
+	else
+	{
+		for (const FAnimSegment& Seg : Montage->SlotAnimTracks[SlotIndex].AnimTrack.AnimSegments)
+		{
+			StartPos = FMath::Max(StartPos, Seg.StartPos + Seg.GetLength());
+		}
+	}
+
+	float AnimStartTime = Params->HasField(TEXT("anim_start_time")) ? static_cast<float>(Params->GetNumberField(TEXT("anim_start_time"))) : 0.0f;
+	float AnimEndTime = Params->HasField(TEXT("anim_end_time")) ? static_cast<float>(Params->GetNumberField(TEXT("anim_end_time"))) : Anim->GetPlayLength();
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Add Montage Anim Segment")));
+	Montage->Modify();
+
+	FAnimSegment NewSeg;
+	NewSeg.SetAnimReference(Anim);
+	NewSeg.StartPos = StartPos;
+	NewSeg.AnimStartTime = AnimStartTime;
+	NewSeg.AnimEndTime = AnimEndTime;
+	NewSeg.AnimPlayRate = PlayRate;
+	NewSeg.LoopingCount = LoopingCount;
+
+	int32 NewIndex = Montage->SlotAnimTracks[SlotIndex].AnimTrack.AnimSegments.Add(NewSeg);
+
+	GEditor->EndTransaction();
+	Montage->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("slot_index"), SlotIndex);
+	Root->SetNumberField(TEXT("segment_index"), NewIndex);
+	Root->SetStringField(TEXT("anim_reference"), AnimPath);
+	Root->SetNumberField(TEXT("start_pos"), StartPos);
+	Root->SetNumberField(TEXT("anim_start_time"), AnimStartTime);
+	Root->SetNumberField(TEXT("anim_end_time"), AnimEndTime);
+	Root->SetNumberField(TEXT("play_rate"), PlayRate);
+	Root->SetNumberField(TEXT("looping_count"), LoopingCount);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleCloneNotifySetup(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SourcePath = Params->GetStringField(TEXT("source_path"));
+	FString TargetPath = Params->GetStringField(TEXT("target_path"));
+	float TimeScale = Params->HasField(TEXT("time_scale")) ? static_cast<float>(Params->GetNumberField(TEXT("time_scale"))) : 1.0f;
+	bool bAutoScale = false;
+	Params->TryGetBoolField(TEXT("auto_scale"), bAutoScale);
+	bool bReplaceExisting = false;
+	Params->TryGetBoolField(TEXT("replace_existing"), bReplaceExisting);
+
+	UAnimSequenceBase* Source = FMonolithAssetUtils::LoadAssetByPath<UAnimSequenceBase>(SourcePath);
+	if (!Source) return FMonolithActionResult::Error(FString::Printf(TEXT("Source animation not found: %s"), *SourcePath));
+
+	UAnimSequenceBase* Target = FMonolithAssetUtils::LoadAssetByPath<UAnimSequenceBase>(TargetPath);
+	if (!Target) return FMonolithActionResult::Error(FString::Printf(TEXT("Target animation not found: %s"), *TargetPath));
+
+	if (Source == Target)
+		return FMonolithActionResult::Error(TEXT("Source and target cannot be the same asset"));
+
+	if (Source->Notifies.Num() == 0)
+		return FMonolithActionResult::Error(TEXT("Source has no notifies to clone"));
+
+	// Compute time scale
+	if (bAutoScale && Source->GetPlayLength() > 0.f)
+	{
+		TimeScale = Target->GetPlayLength() / Source->GetPlayLength();
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Clone Notify Setup")));
+	Target->Modify();
+
+	// Clear existing notifies if requested
+	if (bReplaceExisting)
+	{
+		Target->Notifies.Empty();
+	}
+
+	int32 ClonedCount = 0;
+	int32 SkippedCount = 0;
+
+	for (const FAnimNotifyEvent& SrcEvent : Source->Notifies)
+	{
+		float ScaledTime = SrcEvent.GetTime() * TimeScale;
+
+		// Clamp to target play length
+		if (ScaledTime > Target->GetPlayLength())
+		{
+			ScaledTime = Target->GetPlayLength();
+		}
+
+		if (SrcEvent.Notify)
+		{
+			// Clone instant notify
+			UAnimNotify* ClonedNotify = DuplicateObject<UAnimNotify>(SrcEvent.Notify, Target);
+			if (ClonedNotify)
+			{
+				// Ensure target has a track for this notify
+				FName TrackName = TEXT("1");
+				if (SrcEvent.TrackIndex >= 0 && SrcEvent.TrackIndex < Source->AnimNotifyTracks.Num())
+				{
+					TrackName = Source->AnimNotifyTracks[SrcEvent.TrackIndex].TrackName;
+				}
+
+				// Create track on target if needed
+				bool bTrackFound = false;
+				for (const FAnimNotifyTrack& Track : Target->AnimNotifyTracks)
+				{
+					if (Track.TrackName == TrackName) { bTrackFound = true; break; }
+				}
+				if (!bTrackFound)
+				{
+					Target->AnimNotifyTracks.AddDefaulted();
+					Target->AnimNotifyTracks.Last().TrackName = TrackName;
+				}
+
+				UAnimationBlueprintLibrary::AddAnimationNotifyEventObject(Target, ScaledTime, ClonedNotify, TrackName);
+				ClonedCount++;
+			}
+			else
+			{
+				SkippedCount++;
+			}
+		}
+		else if (SrcEvent.NotifyStateClass)
+		{
+			// Clone state notify
+			UAnimNotifyState* ClonedState = DuplicateObject<UAnimNotifyState>(SrcEvent.NotifyStateClass, Target);
+			if (ClonedState)
+			{
+				float ScaledDuration = SrcEvent.GetDuration() * TimeScale;
+				// Clamp duration so it doesn't exceed target length
+				if (ScaledTime + ScaledDuration > Target->GetPlayLength())
+				{
+					ScaledDuration = Target->GetPlayLength() - ScaledTime;
+				}
+				if (ScaledDuration <= 0.f)
+				{
+					SkippedCount++;
+					continue;
+				}
+
+				FName TrackName = TEXT("1");
+				if (SrcEvent.TrackIndex >= 0 && SrcEvent.TrackIndex < Source->AnimNotifyTracks.Num())
+				{
+					TrackName = Source->AnimNotifyTracks[SrcEvent.TrackIndex].TrackName;
+				}
+
+				bool bTrackFound = false;
+				for (const FAnimNotifyTrack& Track : Target->AnimNotifyTracks)
+				{
+					if (Track.TrackName == TrackName) { bTrackFound = true; break; }
+				}
+				if (!bTrackFound)
+				{
+					Target->AnimNotifyTracks.AddDefaulted();
+					Target->AnimNotifyTracks.Last().TrackName = TrackName;
+				}
+
+				UAnimationBlueprintLibrary::AddAnimationNotifyStateEventObject(Target, ScaledTime, ScaledDuration, ClonedState, TrackName);
+				ClonedCount++;
+			}
+			else
+			{
+				SkippedCount++;
+			}
+		}
+		else
+		{
+			// Skeleton notify (name-based, no UObject) — skip these for now
+			SkippedCount++;
+		}
+	}
+
+	Target->RefreshCacheData();
+	GEditor->EndTransaction();
+	Target->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("source_path"), SourcePath);
+	Root->SetStringField(TEXT("target_path"), TargetPath);
+	Root->SetNumberField(TEXT("time_scale"), TimeScale);
+	Root->SetNumberField(TEXT("cloned_count"), ClonedCount);
+	Root->SetNumberField(TEXT("skipped_count"), SkippedCount);
+	Root->SetNumberField(TEXT("target_notify_count"), Target->Notifies.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleBulkAddNotify(const TSharedPtr<FJsonObject>& Params)
+{
+	// Parse asset_paths — handle both Array and String (Claude Code quirk)
+	TArray<TSharedPtr<FJsonValue>> PathValues;
+	TSharedPtr<FJsonValue> PathsField = Params->TryGetField(TEXT("asset_paths"));
+	if (!PathsField.IsValid())
+		return FMonolithActionResult::Error(TEXT("Missing required field: asset_paths"));
+
+	if (PathsField->Type == EJson::Array)
+	{
+		PathValues = PathsField->AsArray();
+	}
+	else if (PathsField->Type == EJson::String)
+	{
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PathsField->AsString());
+		if (!FJsonSerializer::Deserialize(Reader, PathValues))
+			return FMonolithActionResult::Error(TEXT("Failed to parse asset_paths string as JSON array"));
+	}
+	else
+	{
+		return FMonolithActionResult::Error(TEXT("'asset_paths' must be an array"));
+	}
+
+	if (PathValues.Num() == 0)
+		return FMonolithActionResult::Error(TEXT("asset_paths array is empty"));
+
+	FString NotifyClassName = Params->GetStringField(TEXT("notify_class"));
+	float Time = static_cast<float>(Params->GetNumberField(TEXT("time")));
+	FString TimeMode = TEXT("absolute");
+	Params->TryGetStringField(TEXT("time_mode"), TimeMode);
+	bool bIsNormalized = TimeMode.Equals(TEXT("normalized"), ESearchCase::IgnoreCase);
+
+	float Duration = 0.f;
+	bool bIsState = Params->HasField(TEXT("duration"));
+	if (bIsState)
+	{
+		Duration = static_cast<float>(Params->GetNumberField(TEXT("duration")));
+	}
+
+	FString TrackName = TEXT("1");
+	Params->TryGetStringField(TEXT("track_name"), TrackName);
+
+	// Resolve notify class
+	bool bIsNotifyState = false;
+	UClass* NotifyClass = FindFirstObject<UClass>(*NotifyClassName, EFindFirstObjectOptions::NativeFirst);
+	if (!NotifyClass)
+		NotifyClass = FindFirstObject<UClass>(*FString::Printf(TEXT("AnimNotify_%s"), *NotifyClassName), EFindFirstObjectOptions::NativeFirst);
+	if (!NotifyClass)
+		NotifyClass = FindFirstObject<UClass>(*FString::Printf(TEXT("AnimNotifyState_%s"), *NotifyClassName), EFindFirstObjectOptions::NativeFirst);
+
+	if (!NotifyClass)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Notify class not found: %s"), *NotifyClassName));
+
+	if (NotifyClass->IsChildOf(UAnimNotifyState::StaticClass()))
+	{
+		bIsNotifyState = true;
+		if (!bIsState)
+			return FMonolithActionResult::Error(TEXT("Notify class is a state notify — 'duration' parameter is required"));
+	}
+	else if (!NotifyClass->IsChildOf(UAnimNotify::StaticClass()))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Class '%s' is not a UAnimNotify or UAnimNotifyState subclass"), *NotifyClassName));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Bulk Add Notify")));
+
+	TArray<TSharedPtr<FJsonValue>> Results;
+	int32 Ok = 0, Fail = 0;
+
+	for (int32 i = 0; i < PathValues.Num(); ++i)
+	{
+		FString AssetPath = PathValues[i]->AsString();
+		TSharedRef<FJsonObject> RO = MakeShared<FJsonObject>();
+		RO->SetNumberField(TEXT("index"), i);
+		RO->SetStringField(TEXT("asset_path"), AssetPath);
+
+		UAnimSequenceBase* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequenceBase>(AssetPath);
+		if (!Seq)
+		{
+			RO->SetBoolField(TEXT("success"), false);
+			RO->SetStringField(TEXT("error"), FString::Printf(TEXT("Animation asset not found: %s"), *AssetPath));
+			Results.Add(MakeShared<FJsonValueObject>(RO));
+			Fail++;
+			continue;
+		}
+
+		float ActualTime = bIsNormalized ? Time * Seq->GetPlayLength() : Time;
+
+		if (ActualTime < 0.f || ActualTime > Seq->GetPlayLength())
+		{
+			RO->SetBoolField(TEXT("success"), false);
+			RO->SetStringField(TEXT("error"), FString::Printf(TEXT("Time %.3f out of range [0, %.3f]"), ActualTime, Seq->GetPlayLength()));
+			Results.Add(MakeShared<FJsonValueObject>(RO));
+			Fail++;
+			continue;
+		}
+
+		Seq->Modify();
+
+		if (bIsNotifyState)
+		{
+			float ActualDuration = bIsNormalized ? Duration * Seq->GetPlayLength() : Duration;
+			if (ActualTime + ActualDuration > Seq->GetPlayLength())
+				ActualDuration = Seq->GetPlayLength() - ActualTime;
+
+			UAnimNotifyState* NewState = NewObject<UAnimNotifyState>(Seq, NotifyClass);
+			UAnimationBlueprintLibrary::AddAnimationNotifyStateEventObject(Seq, ActualTime, ActualDuration, NewState, FName(*TrackName));
+			Seq->RefreshCacheData();
+			Seq->MarkPackageDirty();
+
+			RO->SetBoolField(TEXT("success"), true);
+			RO->SetNumberField(TEXT("time"), ActualTime);
+			RO->SetNumberField(TEXT("duration"), ActualDuration);
+		}
+		else
+		{
+			UAnimNotify* NewNotify = NewObject<UAnimNotify>(Seq, NotifyClass);
+			UAnimationBlueprintLibrary::AddAnimationNotifyEventObject(Seq, ActualTime, NewNotify, FName(*TrackName));
+			Seq->RefreshCacheData();
+			Seq->MarkPackageDirty();
+
+			RO->SetBoolField(TEXT("success"), true);
+			RO->SetNumberField(TEXT("time"), ActualTime);
+		}
+
+		Results.Add(MakeShared<FJsonValueObject>(RO));
+		Ok++;
+	}
+
+	GEditor->EndTransaction();
+
+	TSharedRef<FJsonObject> Final = MakeShared<FJsonObject>();
+	Final->SetBoolField(TEXT("success"), Fail == 0);
+	Final->SetNumberField(TEXT("total"), PathValues.Num());
+	Final->SetNumberField(TEXT("succeeded"), Ok);
+	Final->SetNumberField(TEXT("failed"), Fail);
+	Final->SetStringField(TEXT("notify_class"), NotifyClass->GetName());
+	Final->SetArrayField(TEXT("results"), Results);
+	return FMonolithActionResult::Success(Final);
+}
+
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleCreateMontageFromSections(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SkeletonPath = Params->GetStringField(TEXT("skeleton_path"));
+	FString SlotName = TEXT("DefaultSlot");
+	Params->TryGetStringField(TEXT("slot_name"), SlotName);
+
+	// Step 1: Create the montage
+	TSharedRef<FJsonObject> CreateParams = MakeShared<FJsonObject>();
+	CreateParams->SetStringField(TEXT("asset_path"), AssetPath);
+	CreateParams->SetStringField(TEXT("skeleton_path"), SkeletonPath);
+
+	FMonolithActionResult CreateResult = HandleCreateMontage(CreateParams);
+	if (!CreateResult.bSuccess)
+		return CreateResult;
+
+	UAnimMontage* Montage = FMonolithAssetUtils::LoadAssetByPath<UAnimMontage>(AssetPath);
+	if (!Montage)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Created montage but failed to load: %s"), *AssetPath));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Create Montage From Sections")));
+	Montage->Modify();
+
+	TArray<FString> Errors;
+
+	// Step 2: Rename default slot if needed
+	if (SlotName != TEXT("DefaultSlot") && Montage->SlotAnimTracks.Num() > 0)
+	{
+		Montage->SlotAnimTracks[0].SlotName = FName(*SlotName);
+	}
+
+	// Step 3: Process sections
+	const TArray<TSharedPtr<FJsonValue>>* SectionsArr = nullptr;
+	if (Params->TryGetArrayField(TEXT("sections"), SectionsArr) && SectionsArr)
+	{
+		// Remove the auto-created "Default" section if user is providing custom sections
+		if (SectionsArr->Num() > 0)
+		{
+			// Clear all existing composite sections
+			Montage->CompositeSections.Empty();
+		}
+
+		for (int32 i = 0; i < SectionsArr->Num(); ++i)
+		{
+			TSharedPtr<FJsonObject> SecObj = (*SectionsArr)[i]->AsObject();
+			if (!SecObj.IsValid()) continue;
+
+			FString SectionName = SecObj->GetStringField(TEXT("name"));
+			float StartTime = SecObj->HasField(TEXT("start_time")) ? static_cast<float>(SecObj->GetNumberField(TEXT("start_time"))) : 0.0f;
+
+			// Add section
+			Montage->AddAnimCompositeSection(FName(*SectionName), StartTime);
+
+			// Add anim segment if anim_path provided
+			FString SectionAnimPath;
+			if (SecObj->TryGetStringField(TEXT("anim_path"), SectionAnimPath) && !SectionAnimPath.IsEmpty())
+			{
+				UAnimSequenceBase* Anim = FMonolithAssetUtils::LoadAssetByPath<UAnimSequenceBase>(SectionAnimPath);
+				if (Anim)
+				{
+					FAnimSegment NewSeg;
+					NewSeg.SetAnimReference(Anim);
+					NewSeg.StartPos = StartTime;
+					NewSeg.AnimStartTime = 0.0f;
+					NewSeg.AnimEndTime = Anim->GetPlayLength();
+					NewSeg.AnimPlayRate = 1.0f;
+					NewSeg.LoopingCount = 1;
+
+					if (Montage->SlotAnimTracks.Num() > 0)
+					{
+						Montage->SlotAnimTracks[0].AnimTrack.AnimSegments.Add(NewSeg);
+					}
+				}
+				else
+				{
+					Errors.Add(FString::Printf(TEXT("Section '%s': animation not found: %s"), *SectionName, *SectionAnimPath));
+				}
+			}
+		}
+
+		// Set section flow (next_section links) in a second pass
+		for (int32 i = 0; i < SectionsArr->Num(); ++i)
+		{
+			TSharedPtr<FJsonObject> SecObj = (*SectionsArr)[i]->AsObject();
+			if (!SecObj.IsValid()) continue;
+
+			FString NextSection;
+			if (SecObj->TryGetStringField(TEXT("next_section"), NextSection) && !NextSection.IsEmpty())
+			{
+				FString SectionName = SecObj->GetStringField(TEXT("name"));
+				int32 SecIdx = Montage->GetSectionIndex(FName(*SectionName));
+				if (SecIdx != INDEX_NONE)
+				{
+					FCompositeSection& Sec = Montage->GetAnimCompositeSection(SecIdx);
+					Sec.NextSectionName = FName(*NextSection);
+				}
+			}
+		}
+	}
+
+	// Step 4: Apply blend settings
+	const TSharedPtr<FJsonObject>* BlendObj = nullptr;
+	if (Params->TryGetObjectField(TEXT("blend"), BlendObj) && BlendObj && BlendObj->IsValid())
+	{
+		if ((*BlendObj)->HasField(TEXT("blend_in_time")))
+			Montage->BlendIn.SetBlendTime(static_cast<float>((*BlendObj)->GetNumberField(TEXT("blend_in_time"))));
+		if ((*BlendObj)->HasField(TEXT("blend_out_time")))
+			Montage->BlendOut.SetBlendTime(static_cast<float>((*BlendObj)->GetNumberField(TEXT("blend_out_time"))));
+		if ((*BlendObj)->HasField(TEXT("blend_out_trigger_time")))
+			Montage->BlendOutTriggerTime = static_cast<float>((*BlendObj)->GetNumberField(TEXT("blend_out_trigger_time")));
+		bool bAutoBlendOut = true;
+		if ((*BlendObj)->TryGetBoolField(TEXT("enable_auto_blend_out"), bAutoBlendOut))
+			Montage->bEnableAutoBlendOut = bAutoBlendOut;
+	}
+
+	// Step 5: Add notifies
+	const TArray<TSharedPtr<FJsonValue>>* NotifiesArr = nullptr;
+	if (Params->TryGetArrayField(TEXT("notifies"), NotifiesArr) && NotifiesArr)
+	{
+		for (const auto& NVal : *NotifiesArr)
+		{
+			TSharedPtr<FJsonObject> NObj = NVal->AsObject();
+			if (!NObj.IsValid()) continue;
+
+			FString NClassName = NObj->GetStringField(TEXT("notify_class"));
+			float NTime = static_cast<float>(NObj->GetNumberField(TEXT("time")));
+			FString NTrackName = TEXT("1");
+			NObj->TryGetStringField(TEXT("track_name"), NTrackName);
+
+			UClass* NClass = FindFirstObject<UClass>(*NClassName, EFindFirstObjectOptions::NativeFirst);
+			if (!NClass)
+				NClass = FindFirstObject<UClass>(*FString::Printf(TEXT("AnimNotify_%s"), *NClassName), EFindFirstObjectOptions::NativeFirst);
+			if (!NClass)
+				NClass = FindFirstObject<UClass>(*FString::Printf(TEXT("AnimNotifyState_%s"), *NClassName), EFindFirstObjectOptions::NativeFirst);
+
+			if (!NClass)
+			{
+				Errors.Add(FString::Printf(TEXT("Notify class not found: %s"), *NClassName));
+				continue;
+			}
+
+			if (NClass->IsChildOf(UAnimNotifyState::StaticClass()))
+			{
+				float NDuration = NObj->HasField(TEXT("duration")) ? static_cast<float>(NObj->GetNumberField(TEXT("duration"))) : 0.1f;
+				UAnimNotifyState* NS = NewObject<UAnimNotifyState>(Montage, NClass);
+				UAnimationBlueprintLibrary::AddAnimationNotifyStateEventObject(Montage, NTime, NDuration, NS, FName(*NTrackName));
+			}
+			else if (NClass->IsChildOf(UAnimNotify::StaticClass()))
+			{
+				UAnimNotify* N = NewObject<UAnimNotify>(Montage, NClass);
+				UAnimationBlueprintLibrary::AddAnimationNotifyEventObject(Montage, NTime, N, FName(*NTrackName));
+			}
+		}
+		Montage->RefreshCacheData();
+	}
+
+	GEditor->EndTransaction();
+	Montage->MarkPackageDirty();
+
+	// Build response (reuse get_montage_info-style output)
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), Montage->GetPathName());
+	Root->SetStringField(TEXT("skeleton"), Montage->GetSkeleton() ? Montage->GetSkeleton()->GetPathName() : TEXT("None"));
+	Root->SetStringField(TEXT("slot_name"), SlotName);
+	Root->SetNumberField(TEXT("section_count"), Montage->CompositeSections.Num());
+	Root->SetNumberField(TEXT("slot_count"), Montage->SlotAnimTracks.Num());
+	Root->SetNumberField(TEXT("notify_count"), Montage->Notifies.Num());
+
+	if (Errors.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> ErrArr;
+		for (const FString& Err : Errors)
+			ErrArr.Add(MakeShared<FJsonValueString>(Err));
+		Root->SetArrayField(TEXT("warnings"), ErrArr);
+	}
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleBuildSequenceFromPoses(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SkeletonPath = Params->GetStringField(TEXT("skeleton_path"));
+	int32 FrameRate = Params->HasField(TEXT("frame_rate")) ? static_cast<int32>(Params->GetNumberField(TEXT("frame_rate"))) : 30;
+
+	if (FrameRate <= 0) FrameRate = 30;
+
+	// Parse frames array — handle both Array and String (Claude Code quirk)
+	TArray<TSharedPtr<FJsonValue>> FramesArr;
+	TSharedPtr<FJsonValue> FramesField = Params->TryGetField(TEXT("frames"));
+	if (!FramesField.IsValid())
+		return FMonolithActionResult::Error(TEXT("Missing required field: frames"));
+
+	if (FramesField->Type == EJson::Array)
+	{
+		FramesArr = FramesField->AsArray();
+	}
+	else if (FramesField->Type == EJson::String)
+	{
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FramesField->AsString());
+		if (!FJsonSerializer::Deserialize(Reader, FramesArr))
+			return FMonolithActionResult::Error(TEXT("Failed to parse frames string as JSON array"));
+	}
+	else
+	{
+		return FMonolithActionResult::Error(TEXT("'frames' must be an array"));
+	}
+
+	if (FramesArr.Num() == 0)
+		return FMonolithActionResult::Error(TEXT("frames array is empty"));
+
+	int32 FrameCount = FramesArr.Num();
+
+	// Load skeleton
+	USkeleton* Skeleton = FMonolithAssetUtils::LoadAssetByPath<USkeleton>(SkeletonPath);
+	if (!Skeleton) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeleton not found: %s"), *SkeletonPath));
+
+	// Create or load sequence
+	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
+	if (!Seq)
+	{
+		// Create new sequence
+		FString AssetName;
+		int32 LastSlash;
+		if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+		AssetName = AssetPath.Mid(LastSlash + 1);
+
+		UPackage* Pkg = CreatePackage(*AssetPath);
+		if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+		Seq = NewObject<UAnimSequence>(Pkg, FName(*AssetName), RF_Public | RF_Standalone);
+		if (!Seq) return FMonolithActionResult::Error(TEXT("Failed to create UAnimSequence object"));
+
+		Seq->SetSkeleton(Skeleton);
+		FAssetRegistryModule::AssetCreated(Seq);
+	}
+
+	// Collect unique bone names across all frames
+	TSet<FName> BoneNameSet;
+	for (const auto& FrameVal : FramesArr)
+	{
+		TSharedPtr<FJsonObject> FrameObj = FrameVal->AsObject();
+		if (!FrameObj.IsValid()) continue;
+
+		const TArray<TSharedPtr<FJsonValue>>* BonesArr = nullptr;
+		if (FrameObj->TryGetArrayField(TEXT("bones"), BonesArr) && BonesArr)
+		{
+			for (const auto& BoneVal : *BonesArr)
+			{
+				TSharedPtr<FJsonObject> BoneObj = BoneVal->AsObject();
+				if (BoneObj.IsValid() && BoneObj->HasField(TEXT("name")))
+				{
+					BoneNameSet.Add(FName(*BoneObj->GetStringField(TEXT("name"))));
+				}
+			}
+		}
+	}
+
+	if (BoneNameSet.Num() == 0)
+		return FMonolithActionResult::Error(TEXT("No bone data found in frames"));
+
+	// Build per-bone arrays: BoneName -> { Positions[], Rotations[], Scales[] }
+	struct FBoneTrackData
+	{
+		TArray<FVector> Positions;
+		TArray<FQuat> Rotations;
+		TArray<FVector> Scales;
+	};
+
+	TMap<FName, FBoneTrackData> BoneDataMap;
+	for (const FName& BN : BoneNameSet)
+	{
+		FBoneTrackData& Data = BoneDataMap.Add(BN);
+		Data.Positions.SetNum(FrameCount);
+		Data.Rotations.SetNum(FrameCount);
+		Data.Scales.SetNum(FrameCount);
+		// Initialize with identity
+		for (int32 f = 0; f < FrameCount; ++f)
+		{
+			Data.Positions[f] = FVector::ZeroVector;
+			Data.Rotations[f] = FQuat::Identity;
+			Data.Scales[f] = FVector::OneVector;
+		}
+	}
+
+	// Parse per-frame data
+	for (int32 f = 0; f < FrameCount; ++f)
+	{
+		TSharedPtr<FJsonObject> FrameObj = FramesArr[f]->AsObject();
+		if (!FrameObj.IsValid()) continue;
+
+		const TArray<TSharedPtr<FJsonValue>>* BonesArr = nullptr;
+		if (!FrameObj->TryGetArrayField(TEXT("bones"), BonesArr) || !BonesArr) continue;
+
+		for (const auto& BoneVal : *BonesArr)
+		{
+			TSharedPtr<FJsonObject> BoneObj = BoneVal->AsObject();
+			if (!BoneObj.IsValid()) continue;
+
+			FName BoneName(*BoneObj->GetStringField(TEXT("name")));
+			FBoneTrackData* Data = BoneDataMap.Find(BoneName);
+			if (!Data) continue;
+
+			const TArray<TSharedPtr<FJsonValue>>* LocArr = nullptr;
+			if (BoneObj->TryGetArrayField(TEXT("location"), LocArr) && LocArr && LocArr->Num() >= 3)
+			{
+				Data->Positions[f] = FVector((*LocArr)[0]->AsNumber(), (*LocArr)[1]->AsNumber(), (*LocArr)[2]->AsNumber());
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* RotArr = nullptr;
+			if (BoneObj->TryGetArrayField(TEXT("rotation"), RotArr) && RotArr && RotArr->Num() >= 4)
+			{
+				Data->Rotations[f] = FQuat((*RotArr)[0]->AsNumber(), (*RotArr)[1]->AsNumber(), (*RotArr)[2]->AsNumber(), (*RotArr)[3]->AsNumber());
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* ScaleArr = nullptr;
+			if (BoneObj->TryGetArrayField(TEXT("scale"), ScaleArr) && ScaleArr && ScaleArr->Num() >= 3)
+			{
+				Data->Scales[f] = FVector((*ScaleArr)[0]->AsNumber(), (*ScaleArr)[1]->AsNumber(), (*ScaleArr)[2]->AsNumber());
+			}
+		}
+	}
+
+	// Apply data via IAnimationDataController
+	IAnimationDataController& Controller = Seq->GetController();
+
+	Controller.OpenBracket(FText::FromString(TEXT("Build Sequence From Poses")), false);
+
+	Controller.SetFrameRate(FFrameRate(FrameRate, 1), false);
+	Controller.SetNumberOfFrames(FFrameNumber(FrameCount - 1), false);
+
+	for (auto& Pair : BoneDataMap)
+	{
+		Controller.AddBoneCurve(Pair.Key, false);
+		Controller.SetBoneTrackKeys(Pair.Key, Pair.Value.Positions, Pair.Value.Rotations, Pair.Value.Scales, false);
+	}
+
+	Controller.CloseBracket(false);
+
+	Seq->MarkPackageDirty();
+
+	float Duration = (FrameCount > 1) ? static_cast<float>(FrameCount - 1) / static_cast<float>(FrameRate) : 0.f;
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), Seq->GetPathName());
+	Root->SetNumberField(TEXT("frame_count"), FrameCount);
+	Root->SetNumberField(TEXT("frame_rate"), FrameRate);
+	Root->SetNumberField(TEXT("duration"), Duration);
+	Root->SetNumberField(TEXT("bone_count"), BoneNameSet.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// set_notify_properties — Wave 14
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetNotifyProperties(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	int32 NotifyIndex = static_cast<int32>(Params->GetNumberField(TEXT("notify_index")));
+
+	UAnimSequenceBase* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequenceBase>(AssetPath);
+	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("Animation asset not found: %s"), *AssetPath));
+
+	if (NotifyIndex < 0 || NotifyIndex >= Seq->Notifies.Num())
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid notify_index %d (asset has %d notifies)"), NotifyIndex, Seq->Notifies.Num()));
+
+	// Get the UObject target — instant notify or state notify
+	FAnimNotifyEvent& NotifyEvent = Seq->Notifies[NotifyIndex];
+	UObject* Target = nullptr;
+	FString NotifyType;
+	if (NotifyEvent.Notify)
+	{
+		Target = NotifyEvent.Notify;
+		NotifyType = TEXT("AnimNotify");
+	}
+	else if (NotifyEvent.NotifyStateClass)
+	{
+		Target = NotifyEvent.NotifyStateClass;
+		NotifyType = TEXT("AnimNotifyState");
+	}
+	else
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Notify at index %d has no Notify or NotifyStateClass object"), NotifyIndex));
+	}
+
+	// Parse properties object
+	const TSharedPtr<FJsonObject>* PropsPtr = nullptr;
+	if (!Params->TryGetObjectField(TEXT("properties"), PropsPtr) || !PropsPtr || !PropsPtr->IsValid())
+	{
+		// Handle Claude Code string serialization quirk
+		FString PropsString;
+		if (Params->TryGetStringField(TEXT("properties"), PropsString))
+		{
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PropsString);
+			TSharedPtr<FJsonObject> ParsedProps;
+			if (FJsonSerializer::Deserialize(Reader, ParsedProps) && ParsedProps.IsValid())
+			{
+				// Store parsed object back — use a local for the pointer
+				const_cast<FJsonObject*>(Params.Get())->SetObjectField(TEXT("properties"), ParsedProps);
+				Params->TryGetObjectField(TEXT("properties"), PropsPtr);
+			}
+			else
+			{
+				return FMonolithActionResult::Error(TEXT("Failed to parse 'properties' as JSON object"));
+			}
+		}
+		else
+		{
+			return FMonolithActionResult::Error(TEXT("'properties' parameter is required and must be a JSON object"));
+		}
+	}
+
+	if (!PropsPtr || !PropsPtr->IsValid() || (*PropsPtr)->Values.Num() == 0)
+		return FMonolithActionResult::Error(TEXT("'properties' object is empty"));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Notify Properties")));
+	Seq->Modify();
+
+	TArray<TSharedPtr<FJsonValue>> ResultArray;
+	bool bAnyFailed = false;
+
+	for (auto& Pair : (*PropsPtr)->Values)
+	{
+		const FString& PropName = Pair.Key;
+		FString ValueStr = Pair.Value->AsString();
+
+		TSharedPtr<FJsonObject> PropResult = MakeShared<FJsonObject>();
+		PropResult->SetStringField(TEXT("property"), PropName);
+		PropResult->SetStringField(TEXT("requested_value"), ValueStr);
+
+		// Find property — exact match first, case-insensitive fallback
+		FProperty* Prop = Target->GetClass()->FindPropertyByName(FName(*PropName));
+		if (!Prop)
+		{
+			for (TFieldIterator<FProperty> It(Target->GetClass()); It; ++It)
+			{
+				if (It->GetName().Equals(PropName, ESearchCase::IgnoreCase))
+				{
+					Prop = *It;
+					break;
+				}
+			}
+		}
+
+		if (!Prop)
+		{
+			PropResult->SetBoolField(TEXT("success"), false);
+			PropResult->SetStringField(TEXT("error"), FString::Printf(TEXT("Property '%s' not found on %s"), *PropName, *Target->GetClass()->GetName()));
+			ResultArray.Add(MakeShared<FJsonValueObject>(PropResult));
+			bAnyFailed = true;
+			continue;
+		}
+
+		void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Target);
+
+		// Read old value for reporting
+		FString OldValue;
+		Prop->ExportText_Direct(OldValue, ValuePtr, ValuePtr, Target, PPF_None);
+
+		// Set new value
+		const TCHAR* ImportResult = Prop->ImportText_Direct(*ValueStr, ValuePtr, Target, PPF_None);
+		if (!ImportResult)
+		{
+			PropResult->SetBoolField(TEXT("success"), false);
+			PropResult->SetStringField(TEXT("error"), FString::Printf(TEXT("ImportText_Direct failed for '%s' with value '%s'"), *PropName, *ValueStr));
+			PropResult->SetStringField(TEXT("old_value"), OldValue);
+			ResultArray.Add(MakeShared<FJsonValueObject>(PropResult));
+			bAnyFailed = true;
+			continue;
+		}
+
+		PropResult->SetBoolField(TEXT("success"), true);
+		PropResult->SetStringField(TEXT("old_value"), OldValue);
+
+		// Read back new value to confirm
+		FString NewValue;
+		Prop->ExportText_Direct(NewValue, ValuePtr, ValuePtr, Target, PPF_None);
+		PropResult->SetStringField(TEXT("new_value"), NewValue);
+
+		ResultArray.Add(MakeShared<FJsonValueObject>(PropResult));
+	}
+
+	GEditor->EndTransaction();
+
+	// Refresh notify cache
+	Seq->RefreshCacheData();
+	Seq->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("notify_index"), NotifyIndex);
+	Root->SetStringField(TEXT("notify_class"), Target->GetClass()->GetName());
+	Root->SetStringField(TEXT("notify_type"), NotifyType);
+	Root->SetArrayField(TEXT("results"), ResultArray);
+	Root->SetBoolField(TEXT("all_succeeded"), !bAnyFailed);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 15 — Physics Assets
+// ---------------------------------------------------------------------------
+
+static FString PhysicsTypeToString(EPhysicsType Type)
+{
+	switch (Type)
+	{
+		case PhysType_Default:    return TEXT("Default");
+		case PhysType_Kinematic:  return TEXT("Kinematic");
+		case PhysType_Simulated:  return TEXT("Simulated");
+		default:                  return TEXT("Unknown");
+	}
+}
+
+static EPhysicsType StringToPhysicsType(const FString& Str)
+{
+	if (Str.Equals(TEXT("Kinematic"), ESearchCase::IgnoreCase)) return PhysType_Kinematic;
+	if (Str.Equals(TEXT("Simulated"), ESearchCase::IgnoreCase)) return PhysType_Simulated;
+	return PhysType_Default;
+}
+
+static FString ConstraintMotionToString(EAngularConstraintMotion Motion)
+{
+	switch (Motion)
+	{
+		case ACM_Free:    return TEXT("Free");
+		case ACM_Limited: return TEXT("Limited");
+		case ACM_Locked:  return TEXT("Locked");
+		default:          return TEXT("Unknown");
+	}
+}
+
+static EAngularConstraintMotion StringToConstraintMotion(const FString& Str)
+{
+	if (Str.Equals(TEXT("Free"), ESearchCase::IgnoreCase))    return ACM_Free;
+	if (Str.Equals(TEXT("Limited"), ESearchCase::IgnoreCase)) return ACM_Limited;
+	return ACM_Locked;
+}
+
+static FString GetShapeTypeString(const UBodySetup* BodySetup)
+{
+	if (!BodySetup) return TEXT("None");
+	const FKAggregateGeom& Geom = BodySetup->AggGeom;
+	if (Geom.SphylElems.Num() > 0) return TEXT("Capsule");
+	if (Geom.SphereElems.Num() > 0) return TEXT("Sphere");
+	if (Geom.BoxElems.Num() > 0) return TEXT("Box");
+	if (Geom.ConvexElems.Num() > 0) return TEXT("ConvexHull");
+	if (Geom.TaperedCapsuleElems.Num() > 0) return TEXT("TaperedCapsule");
+	return TEXT("None");
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetPhysicsAssetInfo(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UPhysicsAsset* PhysAsset = FMonolithAssetUtils::LoadAssetByPath<UPhysicsAsset>(AssetPath);
+	if (!PhysAsset) return FMonolithActionResult::Error(FString::Printf(TEXT("Physics asset not found: %s"), *AssetPath));
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), PhysAsset->GetPathName());
+
+	// Bodies
+	TArray<TSharedPtr<FJsonValue>> BodiesArr;
+	for (int32 i = 0; i < PhysAsset->SkeletalBodySetups.Num(); ++i)
+	{
+		USkeletalBodySetup* BodySetup = PhysAsset->SkeletalBodySetups[i];
+		if (!BodySetup) continue;
+
+		TSharedPtr<FJsonObject> BodyObj = MakeShared<FJsonObject>();
+		BodyObj->SetNumberField(TEXT("index"), i);
+		BodyObj->SetStringField(TEXT("bone_name"), BodySetup->BoneName.ToString());
+		BodyObj->SetStringField(TEXT("physics_type"), PhysicsTypeToString(BodySetup->PhysicsType));
+		BodyObj->SetStringField(TEXT("shape_type"), GetShapeTypeString(BodySetup));
+
+		const FBodyInstance& BI = BodySetup->DefaultInstance;
+		BodyObj->SetNumberField(TEXT("mass"), BI.GetMassOverride());
+		BodyObj->SetBoolField(TEXT("override_mass"), BI.bOverrideMass);
+		BodyObj->SetNumberField(TEXT("linear_damping"), BI.LinearDamping);
+		BodyObj->SetNumberField(TEXT("angular_damping"), BI.AngularDamping);
+		BodyObj->SetStringField(TEXT("collision_profile"), BI.GetCollisionProfileName().ToString());
+		BodyObj->SetBoolField(TEXT("simulate_physics"), BI.bSimulatePhysics);
+		BodyObj->SetBoolField(TEXT("enable_gravity"), BI.bEnableGravity);
+
+		// Geometry counts
+		TSharedPtr<FJsonObject> GeomObj = MakeShared<FJsonObject>();
+		const FKAggregateGeom& Geom = BodySetup->AggGeom;
+		GeomObj->SetNumberField(TEXT("spheres"), Geom.SphereElems.Num());
+		GeomObj->SetNumberField(TEXT("boxes"), Geom.BoxElems.Num());
+		GeomObj->SetNumberField(TEXT("capsules"), Geom.SphylElems.Num());
+		GeomObj->SetNumberField(TEXT("convex_hulls"), Geom.ConvexElems.Num());
+		GeomObj->SetNumberField(TEXT("tapered_capsules"), Geom.TaperedCapsuleElems.Num());
+		BodyObj->SetObjectField(TEXT("geometry"), GeomObj);
+
+		BodiesArr.Add(MakeShared<FJsonValueObject>(BodyObj));
+	}
+	Root->SetArrayField(TEXT("bodies"), BodiesArr);
+	Root->SetNumberField(TEXT("body_count"), BodiesArr.Num());
+
+	// Constraints
+	TArray<TSharedPtr<FJsonValue>> ConstraintsArr;
+	for (int32 i = 0; i < PhysAsset->ConstraintSetup.Num(); ++i)
+	{
+		UPhysicsConstraintTemplate* CT = PhysAsset->ConstraintSetup[i];
+		if (!CT) continue;
+
+		const FConstraintInstance& CI = CT->DefaultInstance;
+		const FConstraintProfileProperties& Profile = CI.ProfileInstance;
+
+		TSharedPtr<FJsonObject> ConstraintObj = MakeShared<FJsonObject>();
+		ConstraintObj->SetNumberField(TEXT("index"), i);
+		ConstraintObj->SetStringField(TEXT("joint_name"), CI.JointName.ToString());
+		ConstraintObj->SetStringField(TEXT("bone_1"), CI.ConstraintBone1.ToString());
+		ConstraintObj->SetStringField(TEXT("bone_2"), CI.ConstraintBone2.ToString());
+
+		// Angular limits
+		TSharedPtr<FJsonObject> AngularObj = MakeShared<FJsonObject>();
+		AngularObj->SetStringField(TEXT("swing1_motion"), ConstraintMotionToString(static_cast<EAngularConstraintMotion>(Profile.ConeLimit.Swing1Motion.GetValue())));
+		AngularObj->SetNumberField(TEXT("swing1_limit"), Profile.ConeLimit.Swing1LimitDegrees);
+		AngularObj->SetStringField(TEXT("swing2_motion"), ConstraintMotionToString(static_cast<EAngularConstraintMotion>(Profile.ConeLimit.Swing2Motion.GetValue())));
+		AngularObj->SetNumberField(TEXT("swing2_limit"), Profile.ConeLimit.Swing2LimitDegrees);
+		AngularObj->SetStringField(TEXT("twist_motion"), ConstraintMotionToString(static_cast<EAngularConstraintMotion>(Profile.TwistLimit.TwistMotion.GetValue())));
+		AngularObj->SetNumberField(TEXT("twist_limit"), Profile.TwistLimit.TwistLimitDegrees);
+		ConstraintObj->SetObjectField(TEXT("angular"), AngularObj);
+
+		// Linear limits
+		TSharedPtr<FJsonObject> LinearObj = MakeShared<FJsonObject>();
+		LinearObj->SetNumberField(TEXT("limit"), Profile.LinearLimit.Limit);
+		ConstraintObj->SetObjectField(TEXT("linear"), LinearObj);
+
+		ConstraintObj->SetBoolField(TEXT("disable_collision"), Profile.bDisableCollision);
+
+		ConstraintsArr.Add(MakeShared<FJsonValueObject>(ConstraintObj));
+	}
+	Root->SetArrayField(TEXT("constraints"), ConstraintsArr);
+	Root->SetNumberField(TEXT("constraint_count"), ConstraintsArr.Num());
+
+	// Physical animation profiles
+#if WITH_EDITORONLY_DATA
+	TArray<TSharedPtr<FJsonValue>> ProfilesArr;
+	for (const FName& ProfileName : PhysAsset->GetPhysicalAnimationProfileNames())
+	{
+		ProfilesArr.Add(MakeShared<FJsonValueString>(ProfileName.ToString()));
+	}
+	Root->SetArrayField(TEXT("physical_animation_profiles"), ProfilesArr);
+
+	TArray<TSharedPtr<FJsonValue>> ConstraintProfilesArr;
+	for (const FName& ProfileName : PhysAsset->GetConstraintProfileNames())
+	{
+		ConstraintProfilesArr.Add(MakeShared<FJsonValueString>(ProfileName.ToString()));
+	}
+	Root->SetArrayField(TEXT("constraint_profiles"), ConstraintProfilesArr);
+#endif
+
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetBodyProperties(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString BoneName = Params->GetStringField(TEXT("bone_name"));
+
+	UPhysicsAsset* PhysAsset = FMonolithAssetUtils::LoadAssetByPath<UPhysicsAsset>(AssetPath);
+	if (!PhysAsset) return FMonolithActionResult::Error(FString::Printf(TEXT("Physics asset not found: %s"), *AssetPath));
+
+	int32 BodyIdx = PhysAsset->FindBodyIndex(FName(*BoneName));
+	if (BodyIdx == INDEX_NONE)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Body not found for bone: %s"), *BoneName));
+
+	USkeletalBodySetup* BodySetup = PhysAsset->SkeletalBodySetups[BodyIdx];
+	if (!BodySetup) return FMonolithActionResult::Error(TEXT("BodySetup is null"));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Body Properties")));
+	BodySetup->Modify();
+
+	FBodyInstance& BI = BodySetup->DefaultInstance;
+	TArray<FString> ModifiedProps;
+
+	// Mass
+	double MassVal;
+	if (Params->TryGetNumberField(TEXT("mass"), MassVal))
+	{
+		BI.SetMassOverride(static_cast<float>(MassVal), true);
+		ModifiedProps.Add(TEXT("mass"));
+	}
+
+	// Physics type
+	FString PhysTypeStr;
+	if (Params->TryGetStringField(TEXT("physics_type"), PhysTypeStr) && !PhysTypeStr.IsEmpty())
+	{
+		BodySetup->PhysicsType = StringToPhysicsType(PhysTypeStr);
+		ModifiedProps.Add(TEXT("physics_type"));
+	}
+
+	// Collision enabled
+	bool bCollisionEnabled;
+	if (Params->TryGetBoolField(TEXT("collision_enabled"), bCollisionEnabled))
+	{
+		BI.SetCollisionEnabled(bCollisionEnabled ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
+		ModifiedProps.Add(TEXT("collision_enabled"));
+	}
+
+	// Collision profile
+	FString ProfileName;
+	if (Params->TryGetStringField(TEXT("collision_profile"), ProfileName) && !ProfileName.IsEmpty())
+	{
+		BI.SetCollisionProfileName(FName(*ProfileName));
+		ModifiedProps.Add(TEXT("collision_profile"));
+	}
+
+	// Linear damping
+	double LinDamp;
+	if (Params->TryGetNumberField(TEXT("linear_damping"), LinDamp))
+	{
+		BI.LinearDamping = static_cast<float>(LinDamp);
+		ModifiedProps.Add(TEXT("linear_damping"));
+	}
+
+	// Angular damping
+	double AngDamp;
+	if (Params->TryGetNumberField(TEXT("angular_damping"), AngDamp))
+	{
+		BI.AngularDamping = static_cast<float>(AngDamp);
+		ModifiedProps.Add(TEXT("angular_damping"));
+	}
+
+	// Enable gravity
+	bool bGravity;
+	if (Params->TryGetBoolField(TEXT("enable_gravity"), bGravity))
+	{
+		BI.bEnableGravity = bGravity;
+		ModifiedProps.Add(TEXT("enable_gravity"));
+	}
+
+	GEditor->EndTransaction();
+	PhysAsset->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("bone_name"), BoneName);
+
+	TArray<TSharedPtr<FJsonValue>> ModArr;
+	for (const FString& P : ModifiedProps)
+	{
+		ModArr.Add(MakeShared<FJsonValueString>(P));
+	}
+	Root->SetArrayField(TEXT("modified"), ModArr);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetConstraintProperties(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UPhysicsAsset* PhysAsset = FMonolithAssetUtils::LoadAssetByPath<UPhysicsAsset>(AssetPath);
+	if (!PhysAsset) return FMonolithActionResult::Error(FString::Printf(TEXT("Physics asset not found: %s"), *AssetPath));
+
+	// Find constraint by index or bone pair
+	int32 ConstraintIdx = INDEX_NONE;
+	double IdxVal;
+	if (Params->TryGetNumberField(TEXT("constraint_index"), IdxVal))
+	{
+		ConstraintIdx = static_cast<int32>(IdxVal);
+	}
+	else
+	{
+		FString Bone1, Bone2;
+		if (Params->TryGetStringField(TEXT("bone_1"), Bone1) && Params->TryGetStringField(TEXT("bone_2"), Bone2)
+			&& !Bone1.IsEmpty() && !Bone2.IsEmpty())
+		{
+			// Search through constraints for matching bone pair
+			for (int32 i = 0; i < PhysAsset->ConstraintSetup.Num(); ++i)
+			{
+				if (!PhysAsset->ConstraintSetup[i]) continue;
+				const FConstraintInstance& CI = PhysAsset->ConstraintSetup[i]->DefaultInstance;
+				if ((CI.ConstraintBone1 == FName(*Bone1) && CI.ConstraintBone2 == FName(*Bone2)) ||
+					(CI.ConstraintBone1 == FName(*Bone2) && CI.ConstraintBone2 == FName(*Bone1)))
+				{
+					ConstraintIdx = i;
+					break;
+				}
+			}
+		}
+	}
+
+	if (ConstraintIdx == INDEX_NONE || !PhysAsset->ConstraintSetup.IsValidIndex(ConstraintIdx))
+		return FMonolithActionResult::Error(TEXT("Constraint not found. Provide constraint_index or bone_1+bone_2 pair."));
+
+	UPhysicsConstraintTemplate* CT = PhysAsset->ConstraintSetup[ConstraintIdx];
+	if (!CT) return FMonolithActionResult::Error(TEXT("Constraint template is null"));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Constraint Properties")));
+	CT->Modify();
+
+	FConstraintProfileProperties& Profile = CT->DefaultInstance.ProfileInstance;
+	TArray<FString> ModifiedProps;
+
+	// Swing1
+	FString Swing1MotionStr;
+	if (Params->TryGetStringField(TEXT("swing1_motion"), Swing1MotionStr) && !Swing1MotionStr.IsEmpty())
+	{
+		Profile.ConeLimit.Swing1Motion = StringToConstraintMotion(Swing1MotionStr);
+		ModifiedProps.Add(TEXT("swing1_motion"));
+	}
+	double Swing1Limit;
+	if (Params->TryGetNumberField(TEXT("swing1_limit"), Swing1Limit))
+	{
+		Profile.ConeLimit.Swing1LimitDegrees = static_cast<float>(Swing1Limit);
+		ModifiedProps.Add(TEXT("swing1_limit"));
+	}
+
+	// Swing2
+	FString Swing2MotionStr;
+	if (Params->TryGetStringField(TEXT("swing2_motion"), Swing2MotionStr) && !Swing2MotionStr.IsEmpty())
+	{
+		Profile.ConeLimit.Swing2Motion = StringToConstraintMotion(Swing2MotionStr);
+		ModifiedProps.Add(TEXT("swing2_motion"));
+	}
+	double Swing2Limit;
+	if (Params->TryGetNumberField(TEXT("swing2_limit"), Swing2Limit))
+	{
+		Profile.ConeLimit.Swing2LimitDegrees = static_cast<float>(Swing2Limit);
+		ModifiedProps.Add(TEXT("swing2_limit"));
+	}
+
+	// Twist
+	FString TwistMotionStr;
+	if (Params->TryGetStringField(TEXT("twist_motion"), TwistMotionStr) && !TwistMotionStr.IsEmpty())
+	{
+		Profile.TwistLimit.TwistMotion = StringToConstraintMotion(TwistMotionStr);
+		ModifiedProps.Add(TEXT("twist_motion"));
+	}
+	double TwistLimit;
+	if (Params->TryGetNumberField(TEXT("twist_limit"), TwistLimit))
+	{
+		Profile.TwistLimit.TwistLimitDegrees = static_cast<float>(TwistLimit);
+		ModifiedProps.Add(TEXT("twist_limit"));
+	}
+
+	// Disable collision
+	bool bDisableCollision;
+	if (Params->TryGetBoolField(TEXT("disable_collision"), bDisableCollision))
+	{
+		Profile.bDisableCollision = bDisableCollision;
+		ModifiedProps.Add(TEXT("disable_collision"));
+	}
+
+	CT->UpdateProfileInstance();
+	GEditor->EndTransaction();
+	PhysAsset->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("constraint_index"), ConstraintIdx);
+	Root->SetStringField(TEXT("bone_1"), CT->DefaultInstance.ConstraintBone1.ToString());
+	Root->SetStringField(TEXT("bone_2"), CT->DefaultInstance.ConstraintBone2.ToString());
+
+	TArray<TSharedPtr<FJsonValue>> ModArr;
+	for (const FString& P : ModifiedProps)
+	{
+		ModArr.Add(MakeShared<FJsonValueString>(P));
+	}
+	Root->SetArrayField(TEXT("modified"), ModArr);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 15 — IK Rig Retarget Chains
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleAddRetargetChain(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString ChainName = Params->GetStringField(TEXT("chain_name"));
+	FString StartBone = Params->GetStringField(TEXT("start_bone"));
+	FString EndBone = Params->GetStringField(TEXT("end_bone"));
+
+	UIKRigDefinition* Asset = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(AssetPath);
+	if (!Asset) return FMonolithActionResult::Error(FString::Printf(TEXT("IKRigDefinition not found: %s"), *AssetPath));
+
+	UIKRigController* C = UIKRigController::GetController(Asset);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get IKRigController"));
+
+	FString GoalStr;
+	FName GoalName = NAME_None;
+	if (Params->TryGetStringField(TEXT("goal_name"), GoalStr) && !GoalStr.IsEmpty())
+	{
+		GoalName = FName(*GoalStr);
+	}
+
+	FName ResultName = C->AddRetargetChain(FName(*ChainName), FName(*StartBone), FName(*EndBone), GoalName);
+	if (ResultName.IsNone())
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to add retarget chain '%s'"), *ChainName));
+
+	C->SortRetargetChains();
+	Asset->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("chain_name"), ResultName.ToString());
+	Root->SetStringField(TEXT("start_bone"), StartBone);
+	Root->SetStringField(TEXT("end_bone"), EndBone);
+	Root->SetStringField(TEXT("goal"), GoalName.ToString());
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleRemoveRetargetChain(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString ChainName = Params->GetStringField(TEXT("chain_name"));
+
+	UIKRigDefinition* Asset = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(AssetPath);
+	if (!Asset) return FMonolithActionResult::Error(FString::Printf(TEXT("IKRigDefinition not found: %s"), *AssetPath));
+
+	UIKRigController* C = UIKRigController::GetController(Asset);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get IKRigController"));
+
+	bool bSuccess = C->RemoveRetargetChain(FName(*ChainName));
+	if (!bSuccess)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to remove retarget chain '%s' — chain may not exist"), *ChainName));
+
+	Asset->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("removed_chain"), ChainName);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetRetargetChainBones(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString ChainName = Params->GetStringField(TEXT("chain_name"));
+
+	UIKRigDefinition* Asset = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(AssetPath);
+	if (!Asset) return FMonolithActionResult::Error(FString::Printf(TEXT("IKRigDefinition not found: %s"), *AssetPath));
+
+	UIKRigController* C = UIKRigController::GetController(Asset);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get IKRigController"));
+
+	// Verify chain exists
+	const FBoneChain* Chain = C->GetRetargetChainByName(FName(*ChainName));
+	if (!Chain)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Retarget chain not found: %s"), *ChainName));
+
+	TArray<FString> ModifiedProps;
+	FName CurrentChainName = FName(*ChainName);
+
+	// Start bone
+	FString StartBone;
+	if (Params->TryGetStringField(TEXT("start_bone"), StartBone) && !StartBone.IsEmpty())
+	{
+		bool bOk = C->SetRetargetChainStartBone(CurrentChainName, FName(*StartBone));
+		if (!bOk) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to set start bone '%s' on chain '%s'"), *StartBone, *ChainName));
+		ModifiedProps.Add(TEXT("start_bone"));
+	}
+
+	// End bone
+	FString EndBone;
+	if (Params->TryGetStringField(TEXT("end_bone"), EndBone) && !EndBone.IsEmpty())
+	{
+		bool bOk = C->SetRetargetChainEndBone(CurrentChainName, FName(*EndBone));
+		if (!bOk) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to set end bone '%s' on chain '%s'"), *EndBone, *ChainName));
+		ModifiedProps.Add(TEXT("end_bone"));
+	}
+
+	// Goal
+	FString GoalStr;
+	if (Params->TryGetStringField(TEXT("goal_name"), GoalStr) && !GoalStr.IsEmpty())
+	{
+		bool bOk = C->SetRetargetChainGoal(CurrentChainName, FName(*GoalStr));
+		if (!bOk) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to set goal '%s' on chain '%s'"), *GoalStr, *ChainName));
+		ModifiedProps.Add(TEXT("goal_name"));
+	}
+
+	// Rename (do last since it changes the name we use to reference it)
+	FString NewName;
+	if (Params->TryGetStringField(TEXT("new_name"), NewName) && !NewName.IsEmpty())
+	{
+		FName RenamedName = C->RenameRetargetChain(CurrentChainName, FName(*NewName));
+		if (RenamedName.IsNone())
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to rename chain '%s' to '%s'"), *ChainName, *NewName));
+		CurrentChainName = RenamedName;
+		ModifiedProps.Add(TEXT("new_name"));
+	}
+
+	Asset->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("chain_name"), CurrentChainName.ToString());
+
+	TArray<TSharedPtr<FJsonValue>> ModArr;
+	for (const FString& P : ModifiedProps)
+	{
+		ModArr.Add(MakeShared<FJsonValueString>(P));
+	}
+	Root->SetArrayField(TEXT("modified"), ModArr);
 	return FMonolithActionResult::Success(Root);
 }

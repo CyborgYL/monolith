@@ -1,6 +1,7 @@
 #include "MonolithEditorActions.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
+#include "EditorAssetLibrary.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Misc/OutputDeviceRedirector.h"
@@ -27,6 +28,7 @@
 #include "AutomatedAssetImportData.h"
 #include "Engine/Texture2D.h"
 #include "RenderingThread.h"
+#include "ShaderCompiler.h"
 #include "TextureResource.h"
 #include "Engine/StaticMesh.h"
 #include "Components/StaticMeshComponent.h"
@@ -406,10 +408,11 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("delete_assets"),
-		TEXT("Delete UE assets by path. Safety: only allows paths under /Game/AgentTraining/"),
+		TEXT("Delete UE assets by path. Optional safety: restrict to allowed path prefixes"),
 		FMonolithActionHandler::CreateStatic(&HandleDeleteAssets),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_paths"), TEXT("array"), TEXT("Array of UE asset paths to delete (must be under /Game/AgentTraining/)"))
+			.Required(TEXT("asset_paths"), TEXT("array"), TEXT("Array of UE asset paths to delete"))
+			.Optional(TEXT("allowed_prefixes"), TEXT("array"), TEXT("If set, only paths starting with one of these prefixes can be deleted (e.g. [\"/Game/AgentTraining/\"])"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("get_viewport_info"),
@@ -999,14 +1002,14 @@ bool FMonolithEditorActions::CaptureNiagaraFrame(
 	PreviewScene->AddComponent(NiagaraComp, NiagaraComp->GetRelativeTransform());
 
 	// Seek to desired time
+	const float SeekDelta = 1.0f / 30.0f;
+	UWorld* World = NiagaraComp->GetWorld();
+
 	if (SeekTime > 0.0f)
 	{
-		const float SeekDelta = 1.0f / 30.0f; // 30fps seek steps
 		NiagaraComp->SetSeekDelta(SeekDelta);
 		NiagaraComp->SeekToDesiredAge(SeekTime);
 
-		// Tick the world to process the seek
-		UWorld* World = NiagaraComp->GetWorld();
 		if (World)
 		{
 			World->TimeSeconds = SeekTime;
@@ -1024,10 +1027,35 @@ bool FMonolithEditorActions::CaptureNiagaraFrame(
 			World->SendAllEndOfFrameUpdates();
 			if (FNiagaraWorldManager* WorldManager = FNiagaraWorldManager::Get(World))
 			{
-				WorldManager->FlushComputeAndDeferredQueues(false);
+				WorldManager->FlushComputeAndDeferredQueues(true);  // Wait for GPU
 			}
 		}
 	}
+
+	// Warm-up ticks: pump the world + component so GPU particle buffers are populated.
+	// Runs even at SeekTime==0 — particles need frames to spawn and fill GPU buffers.
+	if (World)
+	{
+		constexpr int32 WarmUpFrames = 3;
+		for (int32 i = 0; i < WarmUpFrames; i++)
+		{
+			World->Tick(ELevelTick::LEVELTICK_PauseTick, SeekDelta);
+			NiagaraComp->TickComponent(SeekDelta, ELevelTick::LEVELTICK_All, nullptr);
+			World->SendAllEndOfFrameUpdates();
+			if (FNiagaraWorldManager* WorldManager = FNiagaraWorldManager::Get(World))
+			{
+				WorldManager->FlushComputeAndDeferredQueues(true);
+			}
+			FlushRenderingCommands();
+		}
+	}
+
+	// Wait for any in-flight shader compilation before capture
+	if (GShaderCompilingManager)
+	{
+		GShaderCompilingManager->FinishAllCompilation();
+	}
+	FlushRenderingCommands();
 
 	// Create render target
 	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
@@ -1050,8 +1078,7 @@ bool FMonolithEditorActions::CaptureNiagaraFrame(
 	CaptureComp->FOVAngle = FOV;
 	CaptureComp->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
 
-	// Register with the preview scene's world
-	UWorld* World = PreviewScene->GetWorld();
+	// Register with the preview scene's world (World already declared above)
 	CaptureComp->RegisterComponentWithWorld(World);
 	CaptureComp->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
 
@@ -1436,6 +1463,9 @@ FMonolithActionResult FMonolithEditorActions::HandleCaptureSequenceFrames(
 	double StartTime = FPlatformTime::Seconds();
 	TArray<TSharedPtr<FJsonValue>> FrameResults;
 
+	// Use CaptureNiagaraFrame per frame — the proven working path
+	// (DesiredAge + warm-up ticks + GPU flush). Persistent TickDeltaTime
+	// approach produced black frames — reverting to what works.
 	for (int32 i = 0; i < Timestamps.Num(); i++)
 	{
 		float T = Timestamps[i];
@@ -1941,29 +1971,53 @@ FMonolithActionResult FMonolithEditorActions::HandleDeleteAssets(
 		return FMonolithActionResult::Error(TEXT("No valid paths in asset_paths"));
 	}
 
-	// Safety: only allow deletion under /Game/AgentTraining/
-	for (const FString& Path : AssetPaths)
+	// Optional safety: restrict deletion to allowed prefixes
+	TArray<FString> AllowedPrefixes;
+	const TArray<TSharedPtr<FJsonValue>>* PrefixArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("allowed_prefixes"), PrefixArray) && PrefixArray)
 	{
-		if (!Path.StartsWith(TEXT("/Game/AgentTraining/")))
+		for (const auto& PVal : *PrefixArray)
 		{
-			return FMonolithActionResult::Error(FString::Printf(
-				TEXT("Refusing to delete %s — only assets under /Game/AgentTraining/ can be deleted"),
-				*Path));
+			FString Prefix;
+			if (PVal->TryGetString(Prefix) && !Prefix.IsEmpty())
+			{
+				AllowedPrefixes.Add(Prefix);
+			}
+		}
+	}
+
+	if (AllowedPrefixes.Num() > 0)
+	{
+		for (const FString& Path : AssetPaths)
+		{
+			bool bAllowed = false;
+			for (const FString& Prefix : AllowedPrefixes)
+			{
+				if (Path.StartsWith(Prefix))
+				{
+					bAllowed = true;
+					break;
+				}
+			}
+			if (!bAllowed)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Refusing to delete '%s' — not under any allowed prefix. Allowed: %s"),
+					*Path, *FString::Join(AllowedPrefixes, TEXT(", "))));
+			}
 		}
 	}
 
 	// Load and delete each asset
 	TArray<UObject*> ObjectsToDelete;
 	TArray<FString> NotFound;
-	TArray<FString> Deleted;
 
 	for (const FString& Path : AssetPaths)
 	{
-		UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *Path);
+		UObject* Asset = UEditorAssetLibrary::LoadAsset(Path);
 		if (Asset)
 		{
 			ObjectsToDelete.Add(Asset);
-			Deleted.Add(Path);
 		}
 		else
 		{
@@ -1978,9 +2032,10 @@ FMonolithActionResult FMonolithEditorActions::HandleDeleteAssets(
 	}
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetBoolField(TEXT("success"), true);
+	Result->SetBoolField(TEXT("success"), NumDeleted == ObjectsToDelete.Num() && NotFound.Num() == 0);
 	Result->SetNumberField(TEXT("deleted"), NumDeleted);
 	Result->SetNumberField(TEXT("requested"), AssetPaths.Num());
+	Result->SetNumberField(TEXT("found"), ObjectsToDelete.Num());
 
 	if (NotFound.Num() > 0)
 	{

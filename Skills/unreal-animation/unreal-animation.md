@@ -20,7 +20,7 @@ All asset paths follow UE content browser format (no .uasset extension):
 | Location | Path Format | Example |
 |----------|------------|---------|
 | Project Content/ | `/Game/Path/To/Asset` | `/Game/Animations/ABP_Player` |
-| Project Plugins/ | `/PluginName/Path/To/Asset` | `/CarnageFX/Animations/AM_Hit` |
+| Project Plugins/ | `/PluginName/Path/To/Asset` | `/MassProjectile/Animations/AM_Example` |
 | Engine Plugins | `/PluginName/Path/To/Asset` | `/Niagara/DefaultAssets/SystemAssets/NS_Default` |
 
 ## Key Parameter Names

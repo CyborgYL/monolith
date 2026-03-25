@@ -6,12 +6,14 @@
 #include "Actions/ProjectFindByTypeAction.h"
 #include "Actions/ProjectGetStatsAction.h"
 #include "Actions/ProjectGetAssetDetailsAction.h"
+#include "Actions/ProjectListGameplayTagsAction.h"
+#include "Actions/ProjectSearchGameplayTagsAction.h"
 
 #define LOCTEXT_NAMESPACE "FMonolithIndexModule"
 
 void FMonolithIndexModule::StartupModule()
 {
-	UE_LOG(LogMonolithIndex, Verbose, TEXT("Monolith -- Index module loaded (5 actions, SQLite+FTS5)"));
+	UE_LOG(LogMonolithIndex, Verbose, TEXT("Monolith -- Index module loaded (7 actions, SQLite+FTS5)"));
 
 	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
 
@@ -39,6 +41,16 @@ void FMonolithIndexModule::StartupModule()
 		FProjectGetAssetDetailsAction::GetDescription(),
 		FMonolithActionHandler::CreateStatic(&FProjectGetAssetDetailsAction::Execute),
 		FProjectGetAssetDetailsAction::GetSchema());
+
+	Registry.RegisterAction(TEXT("project"), FProjectListGameplayTagsAction::GetName(),
+		FProjectListGameplayTagsAction::GetDescription(),
+		FMonolithActionHandler::CreateStatic(&FProjectListGameplayTagsAction::Execute),
+		FProjectListGameplayTagsAction::GetSchema());
+
+	Registry.RegisterAction(TEXT("project"), FProjectSearchGameplayTagsAction::GetName(),
+		FProjectSearchGameplayTagsAction::GetDescription(),
+		FMonolithActionHandler::CreateStatic(&FProjectSearchGameplayTagsAction::Execute),
+		FProjectSearchGameplayTagsAction::GetSchema());
 }
 
 void FMonolithIndexModule::ShutdownModule()

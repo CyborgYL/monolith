@@ -6,6 +6,85 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-03-25
+
+Massive expansion across all modules: +153 actions (290 to 443). Niagara nearly doubles with 31 new actions and 10 bug fixes. Blueprint and Animation get major expansions. Material function suite rounds out the material pipeline.
+
+### Added
+
+**Niagara (+31, 65 -> 96)**
+
+- `add_dynamic_input` / `remove_dynamic_input` / `set_dynamic_input_value` / `get_dynamic_input_info` / `search_dynamic_inputs` -- full dynamic input CRUD
+- `add_event_handler` / `remove_event_handler` / `list_event_handlers` -- event handler management
+- `add_simulation_stage` / `remove_simulation_stage` / `list_simulation_stages` -- simulation stage CRUD
+- `create_npc_system` / `add_npc_behavior` / `get_npc_info` / `set_npc_property` / `list_npc_templates` -- NPC particle system support
+- `create_effect_type` / `get_effect_type_info` / `set_effect_type_property` -- effect type CRUD
+- `list_available_renderers` / `set_renderer_mesh` / `configure_ribbon` / `configure_subuv` -- renderer helpers
+- `diff_systems` -- diff two Niagara systems side-by-side
+- `save_emitter_as_template` -- save an emitter as a reusable template
+- `clone_module_overrides` -- clone module overrides between emitters
+- `preview_system` -- trigger a system preview in the editor
+- `get_available_parameters` / `get_module_output_parameters` -- parameter introspection
+- `rename_emitter` -- rename an emitter within a system
+- `get_emitter_property` -- read a single emitter property
+- `export_system_spec` expanded -- now includes event handlers, sim stages, static switches, and dynamic inputs
+
+**Blueprint (+20, 66 -> 86)**
+
+- `auto_layout` -- Modified Sugiyama graph layout algorithm for automatic node arrangement
+- 22 new actions including expanded node types, resolve improvements, DataTable field resolution
+- `batch_execute` improvements for bulk operations
+
+**Animation (+41, 74 -> 115)**
+
+- 41 new actions covering expanded montage editing, blend space manipulation, skeletal mesh queries, and animation asset management
+
+**Material (+9, 48 -> 57)**
+
+- `create_material_function` / `build_function_graph` / `get_function_info` -- material function full suite
+- `batch_set_material_property` / `batch_recompile` -- batch operations
+- `import_texture` -- image file import as UTexture2D
+- `list_material_instances` / `replace_expression` / `rename_expression` -- additional utilities
+
+**Project (+2, 5 -> 7)**
+
+- 2 new project index actions for deeper asset discovery
+
+### Fixed
+
+**Niagara (10 fixes)**
+
+- `batch_execute` reads now return data correctly instead of silently succeeding
+- Type validation on module inputs catches mismatched types before crash
+- GUID collision fix when duplicating emitters with shared module references
+- ShapeLocation race condition on freshly-created emitters with shape DIs
+- Color curve fan-out when multiple emitters share the same curve keys
+- NPC namespace routing fixed for NPC-specific actions
+- `move_module` now preserves parameter overrides during reorder
+- 3 test-driven fixes from Phase 1-6 testing
+
+**Material (6 fixes)**
+
+- `AssetTagsFinalized` renamed to match UE 5.7 API change
+- 5 missing includes that caused compile failures on clean builds
+
+**Blueprint (5 fixes)**
+
+- DataTable UDS field resolution -- match by display name
+- `resolve_node` expanded -- Self, MacroInstance, Return, generic fallback
+- K2Node generic fallback -- strip U prefix for UObject name lookup
+- Simplified templates -- removed broken function refs
+- Code review cleanup -- dead code, magic numbers, perf, correctness
+
+### Changed
+
+- **Niagara** -- Action count 65 -> 96
+- **Blueprint** -- Action count 66 -> 86
+- **Animation** -- Action count 74 -> 115
+- **Material** -- Action count 48 -> 57
+- **Project** -- Action count 5 -> 7
+- **Total** -- Action count 290 -> 443 (across 10 modules)
+
 ## [0.9.0] - 2026-03-19
 
 Major feature expansion: +69 actions across Blueprint, Material, Niagara, and Animation. IKRig, IK Retargeter, Control Rig, and AnimBP structural write support. Full Material instance CRUD. Niagara dynamic inputs, event handlers, and simulation stages. 60 bug fixes. 220 → 290 actions total.

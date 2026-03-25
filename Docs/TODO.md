@@ -1,6 +1,38 @@
 # Monolith — TODO
 
-Last updated: 2026-03-22
+Last updated: 2026-03-25
+
+---
+
+### Niagara Expansion — 31 New Actions (2026-03-25)
+
+- [x] **Dynamic Inputs (5):** `list_dynamic_inputs`, `get_dynamic_input_tree`, `remove_dynamic_input`, `get_dynamic_input_value`, `get_dynamic_input_inputs`
+- [x] **Emitter Management (3):** `rename_emitter`, `get_emitter_property`, `list_available_renderers`
+- [x] **Renderer Configuration (3):** `set_renderer_mesh`, `configure_ribbon`, `configure_subuv`
+- [x] **Event Handlers (3):** `get_event_handlers`, `set_event_handler_property`, `remove_event_handler`
+- [x] **Simulation Stages (3):** `get_simulation_stages`, `set_simulation_stage_property`, `remove_simulation_stage`
+- [x] **Module Outputs (1):** `get_module_output_parameters`
+- [x] **Niagara Parameter Collections (5):** `create_npc`, `get_npc`, `add_npc_parameter`, `remove_npc_parameter`, `set_npc_default`
+- [x] **Effect Types (3):** `create_effect_type`, `get_effect_type`, `set_effect_type_property`
+- [x] **Utilities (5):** `get_available_parameters`, `preview_system`, `diff_systems`, `save_emitter_as_template`, `clone_module_overrides`
+- [x] **`move_module` rewrite** — Complete rewrite of move_module to preserve input overrides
+- [x] **7 bug fixes** — type fallback warning, spawn shape duplicate, NPC namespace mismatch, + 4 others found during testing
+- [x] **Full test pass** — 40/40 PASS, 0 FAIL, 3 SKIPPED. Total Niagara actions: 65 → 96.
+
+---
+
+### Material Function Full Suite (2026-03-25)
+
+- [x] **export_function_graph** — Full graph export with connections, properties, switch details (#7)
+- [x] **set_function_metadata** — Update description, categories, library exposure
+- [x] **delete_function_expression** — Remove expression(s) from function
+- [x] **update_material_function** — Recompile cascade to referencing materials
+- [x] **create_function_instance** — Create MFI with parent + optional overrides
+- [x] **set_function_instance_parameter** — Set param overrides on MFI
+- [x] **get_function_instance_info** — Read MFI parent chain + overrides (11 param types)
+- [x] **layout_function_expressions** — Auto-arrange function graph
+- [x] **rename_function_parameter_group** — Rename param group
+- [x] **create_material_function type param** — Support MaterialLayer/MaterialLayerBlend creation
 
 ---
 

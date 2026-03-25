@@ -75,6 +75,10 @@ public:
 	static FMonolithActionResult CreateMaterialFunction(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult BuildFunctionGraph(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult GetFunctionInfo(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult ExportFunctionGraph(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult SetFunctionMetadata(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult UpdateMaterialFunction(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult DeleteFunctionExpression(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Wave 7: Batch & Advanced ---
 	static FMonolithActionResult BatchSetMaterialProperty(const TSharedPtr<FJsonObject>& Params);
@@ -83,6 +87,15 @@ public:
 
 	// --- Wave 8: Compound workflows ---
 	static FMonolithActionResult CreatePbrMaterialFromDisk(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 9: Function instances ---
+	static FMonolithActionResult CreateFunctionInstance(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult SetFunctionInstanceParameter(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult GetFunctionInstanceInfo(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 10: Function utilities ---
+	static FMonolithActionResult LayoutFunctionExpressions(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult RenameFunctionParameterGroup(const TSharedPtr<FJsonObject>& Params);
 
 private:
 	/** Load a UMaterial from an asset path. Returns nullptr on failure. */

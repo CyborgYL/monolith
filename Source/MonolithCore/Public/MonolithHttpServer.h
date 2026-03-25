@@ -34,6 +34,7 @@ private:
 	bool HandleGetMcp(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
 	bool HandleDeleteMcp(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
 	bool HandleOptions(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
+	bool HandleHealthCheck(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
 
 	// --- JSON-RPC Processing ---
 	TSharedPtr<FJsonObject> ProcessJsonRpcRequest(const TSharedPtr<FJsonObject>& Request);
@@ -52,4 +53,5 @@ private:
 	TArray<FHttpRouteHandle> RouteHandles;
 	int32 BoundPort = 0;
 	bool bIsRunning = false;
+	FDateTime StartTime;
 };

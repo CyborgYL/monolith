@@ -2,7 +2,7 @@
 
 #include "Modules/ModuleManager.h"
 
-#define MONOLITH_VERSION TEXT("0.9.0")
+#define MONOLITH_VERSION TEXT("0.10.0")
 
 class FMonolithHttpServer;
 
@@ -29,4 +29,7 @@ private:
 	TUniquePtr<FMonolithHttpServer> HttpServer;
 
 	void RegisterCoreTools();
+	void WriteSentinelFile(int32 Port);
+	void RemoveSentinelFile();
+	FString GetSentinelFilePath() const;
 };

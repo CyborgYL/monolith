@@ -5,9 +5,21 @@
 #include "PoseSearch/PoseSearchDatabase.h"
 #include "PoseSearch/PoseSearchSchema.h"
 #include "PoseSearch/PoseSearchFeatureChannel.h"
+#include "PoseSearch/PoseSearchFeatureChannel_Position.h"
+#include "PoseSearch/PoseSearchFeatureChannel_Velocity.h"
+#include "PoseSearch/PoseSearchFeatureChannel_Heading.h"
+#include "PoseSearch/PoseSearchFeatureChannel_Pose.h"
+#include "PoseSearch/PoseSearchFeatureChannel_Trajectory.h"
+#include "PoseSearch/PoseSearchFeatureChannel_Phase.h"
+#include "PoseSearch/PoseSearchFeatureChannel_Distance.h"
+#include "PoseSearch/PoseSearchFeatureChannel_Curve.h"
+#include "PoseSearch/PoseSearchFeatureChannel_Group.h"
 #include "PoseSearch/PoseSearchIndex.h"
+#include "PoseSearch/PoseSearchDerivedData.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/Skeleton.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "UObject/UnrealType.h"
 #include "Editor.h"
 
 // ---------------------------------------------------------------------------
@@ -52,6 +64,88 @@ void FMonolithPoseSearchActions::RegisterActions(FMonolithToolRegistry& Registry
 		FMonolithActionHandler::CreateStatic(&HandleGetDatabaseStats),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("PoseSearchDatabase asset path"))
+			.Build());
+
+	// Wave 11 — PoseSearch Creation
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_pose_search_schema"),
+		TEXT("Create a new PoseSearch schema with skeleton and default channels"),
+		FMonolithActionHandler::CreateStatic(&HandleCreatePoseSearchSchema),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path for the new schema (e.g. /Game/PoseSearch/PS_Schema)"))
+			.Required(TEXT("skeleton_path"), TEXT("string"), TEXT("Skeleton asset path"))
+			.Optional(TEXT("sample_rate"), TEXT("integer"), TEXT("Sample rate in Hz (default: 30)"))
+			.Optional(TEXT("add_default_channels"), TEXT("boolean"), TEXT("Add default Pose+Trajectory channels (default: true)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("create_pose_search_database"),
+		TEXT("Create a new PoseSearch database and assign a schema"),
+		FMonolithActionHandler::CreateStatic(&HandleCreatePoseSearchDatabase),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Asset path for the new database"))
+			.Required(TEXT("schema_path"), TEXT("string"), TEXT("PoseSearchSchema asset path to assign"))
+			.Build());
+
+	// Wave 14 — PoseSearch Writes
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_database_sequence_properties"),
+		TEXT("Set per-entry properties on a PoseSearch database animation asset (enabled, mirror, sampling range)"),
+		FMonolithActionHandler::CreateStatic(&HandleSetDatabaseSequenceProperties),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("PoseSearchDatabase asset path"))
+			.Required(TEXT("sequence_index"), TEXT("integer"), TEXT("Index of the animation entry"))
+			.Optional(TEXT("enabled"), TEXT("boolean"), TEXT("Enable/disable for search"))
+			.Optional(TEXT("mirror_option"), TEXT("string"), TEXT("UnmirroredOnly, MirroredOnly, or UnmirroredAndMirrored"))
+			.Optional(TEXT("sampling_range_start"), TEXT("number"), TEXT("Start of sampling range in seconds (0=full)"))
+			.Optional(TEXT("sampling_range_end"), TEXT("number"), TEXT("End of sampling range in seconds (0=full)"))
+			.Optional(TEXT("disable_reselection"), TEXT("boolean"), TEXT("Prevent reselection of poses from same asset"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_schema_channel"),
+		TEXT("Add a feature channel to a PoseSearch schema (Position, Velocity, Heading, Pose, Trajectory, Phase, Distance, Curve, Group)"),
+		FMonolithActionHandler::CreateStatic(&HandleAddSchemaChannel),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("PoseSearchSchema asset path"))
+			.Required(TEXT("channel_type"), TEXT("string"), TEXT("Channel type: Position, Velocity, Heading, Pose, Trajectory, Phase, Distance, Curve, Group"))
+			.Optional(TEXT("weight"), TEXT("number"), TEXT("Channel weight (default 1.0)"))
+			.Optional(TEXT("bone"), TEXT("string"), TEXT("Bone name for Position/Velocity/Heading channels"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("remove_schema_channel"),
+		TEXT("Remove a feature channel from a PoseSearch schema by index (from authored channels)"),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveSchemaChannel),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("PoseSearchSchema asset path"))
+			.Required(TEXT("channel_index"), TEXT("integer"), TEXT("Index into the authored Channels array"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_channel_weight"),
+		TEXT("Set the weight on a PoseSearch schema channel by index"),
+		FMonolithActionHandler::CreateStatic(&HandleSetChannelWeight),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("PoseSearchSchema asset path"))
+			.Required(TEXT("channel_index"), TEXT("integer"), TEXT("Index into the authored Channels array"))
+			.Required(TEXT("weight"), TEXT("number"), TEXT("New weight value"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("rebuild_pose_search_index"),
+		TEXT("Trigger async rebuild of a PoseSearch database search index"),
+		FMonolithActionHandler::CreateStatic(&HandleRebuildPoseSearchIndex),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("PoseSearchDatabase asset path"))
+			.Optional(TEXT("wait"), TEXT("boolean"), TEXT("Block until rebuild completes (default false)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_database_search_mode"),
+		TEXT("Configure search algorithm and cost bias settings on a PoseSearch database"),
+		FMonolithActionHandler::CreateStatic(&HandleSetDatabaseSearchMode),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("PoseSearchDatabase asset path"))
+			.Optional(TEXT("pose_search_mode"), TEXT("string"), TEXT("BruteForce, PCAKDTree, VPTree, or EventOnly"))
+			.Optional(TEXT("kd_tree_query_num_neighbors"), TEXT("integer"), TEXT("Number of KNN neighbors (1-600, default 200)"))
+			.Optional(TEXT("number_of_principal_components"), TEXT("integer"), TEXT("PCA dimensions (1-64, default 4)"))
+			.Optional(TEXT("kd_tree_max_leaf_size"), TEXT("integer"), TEXT("KDTree max leaf size (1-256, default 16)"))
+			.Optional(TEXT("continuing_pose_cost_bias"), TEXT("number"), TEXT("Cost bias for continuing current pose"))
+			.Optional(TEXT("base_cost_bias"), TEXT("number"), TEXT("Base cost bias applied to all poses"))
+			.Optional(TEXT("looping_cost_bias"), TEXT("number"), TEXT("Cost bias for looping animations"))
+			.Optional(TEXT("continuing_interaction_cost_bias"), TEXT("number"), TEXT("Cost bias for continuing interaction poses"))
 			.Build());
 }
 
@@ -325,6 +419,605 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleGetDatabaseStats(const T
 		}
 		Root->SetArrayField(TEXT("tags"), TagArray);
 	}
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// create_pose_search_schema
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleCreatePoseSearchSchema(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SkeletonPath = Params->GetStringField(TEXT("skeleton_path"));
+
+	USkeleton* Skeleton = FMonolithAssetUtils::LoadAssetByPath<USkeleton>(SkeletonPath);
+	if (!Skeleton) return FMonolithActionResult::Error(FString::Printf(TEXT("Skeleton not found: %s"), *SkeletonPath));
+
+	FString AssetName;
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UPoseSearchSchema* Schema = NewObject<UPoseSearchSchema>(Pkg, FName(*AssetName), RF_Public | RF_Standalone);
+	if (!Schema) return FMonolithActionResult::Error(TEXT("Failed to create UPoseSearchSchema object"));
+
+	// Add skeleton (public API)
+	Schema->AddSkeleton(Skeleton);
+
+	// Set sample rate if provided
+	if (Params->HasField(TEXT("sample_rate")))
+	{
+		Schema->SampleRate = static_cast<int32>(Params->GetNumberField(TEXT("sample_rate")));
+	}
+
+	// Add default channels (Pose + Trajectory) unless explicitly disabled
+	bool bAddDefaults = true;
+	if (Params->HasField(TEXT("add_default_channels")))
+	{
+		bAddDefaults = Params->GetBoolField(TEXT("add_default_channels"));
+	}
+	if (bAddDefaults)
+	{
+		Schema->AddDefaultChannels();
+	}
+
+	FAssetRegistryModule::AssetCreated(Schema);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), Schema->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	Root->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+	Root->SetNumberField(TEXT("sample_rate"), Schema->SampleRate);
+	Root->SetBoolField(TEXT("default_channels_added"), bAddDefaults);
+
+	// Report channel count
+	TConstArrayView<TObjectPtr<UPoseSearchFeatureChannel>> Channels = Schema->GetChannels();
+	Root->SetNumberField(TEXT("channel_count"), Channels.Num());
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// create_pose_search_database
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleCreatePoseSearchDatabase(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SchemaPath = Params->GetStringField(TEXT("schema_path"));
+
+	UPoseSearchSchema* Schema = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchSchema>(SchemaPath);
+	if (!Schema) return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchSchema not found: %s"), *SchemaPath));
+
+	FString AssetName;
+	int32 LastSlash;
+	if (!AssetPath.FindLastChar('/', LastSlash) || LastSlash == AssetPath.Len() - 1)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid asset path: %s"), *AssetPath));
+	AssetName = AssetPath.Mid(LastSlash + 1);
+
+	if (FMonolithAssetUtils::LoadAssetByPath<UObject>(AssetPath))
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'"), *AssetPath));
+
+	UPackage* Pkg = CreatePackage(*AssetPath);
+	if (!Pkg) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at '%s'"), *AssetPath));
+
+	UPoseSearchDatabase* Database = NewObject<UPoseSearchDatabase>(Pkg, FName(*AssetName), RF_Public | RF_Standalone);
+	if (!Database) return FMonolithActionResult::Error(TEXT("Failed to create UPoseSearchDatabase object"));
+
+	Database->Schema = Schema;
+
+	FAssetRegistryModule::AssetCreated(Database);
+	Pkg->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), Database->GetPathName());
+	Root->SetStringField(TEXT("asset_name"), AssetName);
+	Root->SetStringField(TEXT("schema"), Schema->GetPathName());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — Schema channel reflection access
+// ---------------------------------------------------------------------------
+
+/** Access the private 'Channels' UPROPERTY on UPoseSearchSchema via reflection.
+  * Returns nullptr if the property is not found (should never happen). */
+static FArrayProperty* GetSchemaChannelsProperty()
+{
+	static FArrayProperty* CachedProp = nullptr;
+	if (!CachedProp)
+	{
+		for (TFieldIterator<FArrayProperty> It(UPoseSearchSchema::StaticClass()); It; ++It)
+		{
+			if (It->GetName() == TEXT("Channels"))
+			{
+				CachedProp = *It;
+				break;
+			}
+		}
+	}
+	return CachedProp;
+}
+
+/** Get a mutable pointer to the authored Channels TArray on a schema instance. */
+static TArray<TObjectPtr<UPoseSearchFeatureChannel>>* GetSchemaChannelsMutable(UPoseSearchSchema* Schema)
+{
+	FArrayProperty* ArrayProp = GetSchemaChannelsProperty();
+	if (!ArrayProp) return nullptr;
+	return ArrayProp->ContainerPtrToValuePtr<TArray<TObjectPtr<UPoseSearchFeatureChannel>>>(Schema);
+}
+
+/** Trigger PostEditChangeProperty on the schema to call Finalize() internally. */
+static void TriggerSchemaFinalize(UPoseSearchSchema* Schema)
+{
+#if WITH_EDITOR
+	FPropertyChangedEvent Evt(GetSchemaChannelsProperty(), EPropertyChangeType::ValueSet);
+	Schema->PostEditChangeProperty(Evt);
+#endif
+}
+
+/** Map a channel type string to a UClass. Returns nullptr if unrecognized. */
+static UClass* ResolveChannelClass(const FString& TypeStr)
+{
+	if (TypeStr.Equals(TEXT("Position"), ESearchCase::IgnoreCase)) return UPoseSearchFeatureChannel_Position::StaticClass();
+	if (TypeStr.Equals(TEXT("Velocity"), ESearchCase::IgnoreCase)) return UPoseSearchFeatureChannel_Velocity::StaticClass();
+	if (TypeStr.Equals(TEXT("Heading"), ESearchCase::IgnoreCase))  return UPoseSearchFeatureChannel_Heading::StaticClass();
+	if (TypeStr.Equals(TEXT("Pose"), ESearchCase::IgnoreCase))     return UPoseSearchFeatureChannel_Pose::StaticClass();
+	if (TypeStr.Equals(TEXT("Trajectory"), ESearchCase::IgnoreCase)) return UPoseSearchFeatureChannel_Trajectory::StaticClass();
+	if (TypeStr.Equals(TEXT("Phase"), ESearchCase::IgnoreCase))    return UPoseSearchFeatureChannel_Phase::StaticClass();
+	if (TypeStr.Equals(TEXT("Distance"), ESearchCase::IgnoreCase)) return UPoseSearchFeatureChannel_Distance::StaticClass();
+	if (TypeStr.Equals(TEXT("Curve"), ESearchCase::IgnoreCase))    return UPoseSearchFeatureChannel_Curve::StaticClass();
+	if (TypeStr.Equals(TEXT("Group"), ESearchCase::IgnoreCase))    return UPoseSearchFeatureChannel_Group::StaticClass();
+	return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// set_database_sequence_properties — Wave 14
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseSequenceProperties(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	int32 SeqIndex = static_cast<int32>(Params->GetNumberField(TEXT("sequence_index")));
+
+	UPoseSearchDatabase* Database = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchDatabase>(AssetPath);
+	if (!Database)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchDatabase not found: %s"), *AssetPath));
+
+	const int32 NumAssets = Database->GetNumAnimationAssets();
+	if (SeqIndex < 0 || SeqIndex >= NumAssets)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid sequence_index %d (database has %d entries)"), SeqIndex, NumAssets));
+
+	FPoseSearchDatabaseAnimationAsset* Entry = Database->GetMutableDatabaseAnimationAsset(SeqIndex);
+	if (!Entry)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to get mutable entry at index %d"), SeqIndex));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set PoseSearch Database Sequence Properties")));
+	Database->Modify();
+
+#if WITH_EDITORONLY_DATA
+	if (Params->HasField(TEXT("enabled")))
+	{
+		Entry->SetIsEnabled(Params->GetBoolField(TEXT("enabled")));
+	}
+
+	if (Params->HasField(TEXT("disable_reselection")))
+	{
+		Entry->SetDisableReselection(Params->GetBoolField(TEXT("disable_reselection")));
+	}
+
+	if (Params->HasField(TEXT("mirror_option")))
+	{
+		FString MirrorStr = Params->GetStringField(TEXT("mirror_option"));
+		if (MirrorStr.Equals(TEXT("UnmirroredOnly"), ESearchCase::IgnoreCase))
+			Entry->MirrorOption = EPoseSearchMirrorOption::UnmirroredOnly;
+		else if (MirrorStr.Equals(TEXT("MirroredOnly"), ESearchCase::IgnoreCase))
+			Entry->MirrorOption = EPoseSearchMirrorOption::MirroredOnly;
+		else if (MirrorStr.Equals(TEXT("UnmirroredAndMirrored"), ESearchCase::IgnoreCase))
+			Entry->MirrorOption = EPoseSearchMirrorOption::UnmirroredAndMirrored;
+		else
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid mirror_option: '%s'. Use UnmirroredOnly, MirroredOnly, or UnmirroredAndMirrored"), *MirrorStr));
+		}
+	}
+
+	if (Params->HasField(TEXT("sampling_range_start")) || Params->HasField(TEXT("sampling_range_end")))
+	{
+		FFloatInterval CurrentRange = Entry->GetSamplingRange();
+		float Start = Params->HasField(TEXT("sampling_range_start"))
+			? static_cast<float>(Params->GetNumberField(TEXT("sampling_range_start")))
+			: CurrentRange.Min;
+		float End = Params->HasField(TEXT("sampling_range_end"))
+			? static_cast<float>(Params->GetNumberField(TEXT("sampling_range_end")))
+			: CurrentRange.Max;
+		Entry->SetSamplingRange(FFloatInterval(Start, End));
+	}
+#endif // WITH_EDITORONLY_DATA
+
+	GEditor->EndTransaction();
+	Database->MarkPackageDirty();
+
+	// Build response — read back current state
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("sequence_index"), SeqIndex);
+
+	if (UObject* AnimAsset = Entry->GetAnimationAsset())
+	{
+		Root->SetStringField(TEXT("animation"), AnimAsset->GetPathName());
+	}
+
+#if WITH_EDITORONLY_DATA
+	Root->SetBoolField(TEXT("enabled"), Entry->IsEnabled());
+	Root->SetBoolField(TEXT("disable_reselection"), Entry->IsDisableReselection());
+
+	FString MirrorStr;
+	switch (Entry->GetMirrorOption())
+	{
+	case EPoseSearchMirrorOption::UnmirroredOnly:      MirrorStr = TEXT("UnmirroredOnly"); break;
+	case EPoseSearchMirrorOption::MirroredOnly:        MirrorStr = TEXT("MirroredOnly"); break;
+	case EPoseSearchMirrorOption::UnmirroredAndMirrored: MirrorStr = TEXT("UnmirroredAndMirrored"); break;
+	default:                                           MirrorStr = TEXT("Unknown"); break;
+	}
+	Root->SetStringField(TEXT("mirror_option"), MirrorStr);
+
+	FFloatInterval Range = Entry->GetSamplingRange();
+	Root->SetNumberField(TEXT("sampling_range_start"), Range.Min);
+	Root->SetNumberField(TEXT("sampling_range_end"), Range.Max);
+#endif
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// add_schema_channel — Wave 14
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleAddSchemaChannel(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString ChannelType = Params->GetStringField(TEXT("channel_type"));
+
+	UPoseSearchSchema* Schema = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchSchema>(AssetPath);
+	if (!Schema)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchSchema not found: %s"), *AssetPath));
+
+	UClass* ChannelClass = ResolveChannelClass(ChannelType);
+	if (!ChannelClass)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Unknown channel type: '%s'. Supported: Position, Velocity, Heading, Pose, Trajectory, Phase, Distance, Curve, Group"), *ChannelType));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Add PoseSearch Schema Channel")));
+	Schema->Modify();
+
+	// Create the channel outered to the schema
+	UPoseSearchFeatureChannel* Channel = NewObject<UPoseSearchFeatureChannel>(Schema, ChannelClass, NAME_None, RF_Transactional);
+	if (!Channel)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create channel of type %s"), *ChannelType));
+	}
+
+	// Set weight if provided (Weight is WITH_EDITORONLY_DATA, exists on all channel types as a float UPROPERTY)
+#if WITH_EDITORONLY_DATA
+	if (Params->HasField(TEXT("weight")))
+	{
+		float Weight = static_cast<float>(Params->GetNumberField(TEXT("weight")));
+		FProperty* WeightProp = Channel->GetClass()->FindPropertyByName(TEXT("Weight"));
+		if (WeightProp)
+		{
+			void* WeightPtr = WeightProp->ContainerPtrToValuePtr<void>(Channel);
+			FString WeightStr = FString::SanitizeFloat(Weight);
+			WeightProp->ImportText_Direct(*WeightStr, WeightPtr, Channel, PPF_None);
+		}
+	}
+
+	// Set bone reference if provided (for Position, Velocity, Heading channels)
+	if (Params->HasField(TEXT("bone")))
+	{
+		FString BoneName = Params->GetStringField(TEXT("bone"));
+		FProperty* BoneProp = Channel->GetClass()->FindPropertyByName(TEXT("Bone"));
+		if (BoneProp)
+		{
+			// FBoneReference is a struct with BoneName field — import using UE text format
+			void* BonePtr = BoneProp->ContainerPtrToValuePtr<void>(Channel);
+			FString BoneImportStr = FString::Printf(TEXT("(BoneName=\"%s\")"), *BoneName);
+			BoneProp->ImportText_Direct(*BoneImportStr, BonePtr, Channel, PPF_None);
+		}
+	}
+#endif // WITH_EDITORONLY_DATA
+
+	// Use the public AddChannel API
+	Schema->AddChannel(Channel);
+
+	// Trigger Finalize() via PostEditChangeProperty
+	TriggerSchemaFinalize(Schema);
+
+	GEditor->EndTransaction();
+	Schema->MarkPackageDirty();
+
+	// Count authored channels for response
+	TArray<TObjectPtr<UPoseSearchFeatureChannel>>* AuthoredChannels = GetSchemaChannelsMutable(Schema);
+	int32 AuthoredCount = AuthoredChannels ? AuthoredChannels->Num() : -1;
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("channel_type"), ChannelType);
+	Root->SetStringField(TEXT("channel_class"), Channel->GetClass()->GetName());
+	Root->SetNumberField(TEXT("authored_channel_count"), AuthoredCount);
+	Root->SetNumberField(TEXT("schema_cardinality"), Schema->SchemaCardinality);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// remove_schema_channel — Wave 14
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleRemoveSchemaChannel(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	int32 ChannelIndex = static_cast<int32>(Params->GetNumberField(TEXT("channel_index")));
+
+	UPoseSearchSchema* Schema = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchSchema>(AssetPath);
+	if (!Schema)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchSchema not found: %s"), *AssetPath));
+
+	// Access the private Channels array via reflection
+	TArray<TObjectPtr<UPoseSearchFeatureChannel>>* Channels = GetSchemaChannelsMutable(Schema);
+	if (!Channels)
+		return FMonolithActionResult::Error(TEXT("Failed to access Channels property on schema via reflection"));
+
+	if (ChannelIndex < 0 || ChannelIndex >= Channels->Num())
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid channel_index %d (schema has %d authored channels)"), ChannelIndex, Channels->Num()));
+
+	// Capture info before removal
+	FString RemovedClass = (*Channels)[ChannelIndex] ? (*Channels)[ChannelIndex]->GetClass()->GetName() : TEXT("null");
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Remove PoseSearch Schema Channel")));
+	Schema->Modify();
+
+	Channels->RemoveAt(ChannelIndex);
+
+	// Trigger Finalize() via PostEditChangeProperty
+	TriggerSchemaFinalize(Schema);
+
+	GEditor->EndTransaction();
+	Schema->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("removed_index"), ChannelIndex);
+	Root->SetStringField(TEXT("removed_class"), RemovedClass);
+	Root->SetNumberField(TEXT("remaining_channel_count"), Channels->Num());
+	Root->SetNumberField(TEXT("schema_cardinality"), Schema->SchemaCardinality);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// set_channel_weight — Wave 14
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleSetChannelWeight(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	int32 ChannelIndex = static_cast<int32>(Params->GetNumberField(TEXT("channel_index")));
+	float NewWeight = static_cast<float>(Params->GetNumberField(TEXT("weight")));
+
+	UPoseSearchSchema* Schema = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchSchema>(AssetPath);
+	if (!Schema)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchSchema not found: %s"), *AssetPath));
+
+	// Access authored channels via reflection
+	TArray<TObjectPtr<UPoseSearchFeatureChannel>>* Channels = GetSchemaChannelsMutable(Schema);
+	if (!Channels)
+		return FMonolithActionResult::Error(TEXT("Failed to access Channels property on schema via reflection"));
+
+	if (ChannelIndex < 0 || ChannelIndex >= Channels->Num())
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid channel_index %d (schema has %d authored channels)"), ChannelIndex, Channels->Num()));
+
+	UPoseSearchFeatureChannel* Channel = (*Channels)[ChannelIndex];
+	if (!Channel)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Channel at index %d is null"), ChannelIndex));
+
+	// Weight is WITH_EDITORONLY_DATA — use reflection to set it on any channel type
+#if WITH_EDITORONLY_DATA
+	FProperty* WeightProp = Channel->GetClass()->FindPropertyByName(TEXT("Weight"));
+	if (!WeightProp)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Channel class %s has no Weight property"), *Channel->GetClass()->GetName()));
+
+	void* WeightPtr = WeightProp->ContainerPtrToValuePtr<void>(Channel);
+
+	// Read old weight
+	FString OldWeightStr;
+	WeightProp->ExportText_Direct(OldWeightStr, WeightPtr, WeightPtr, Channel, PPF_None);
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set PoseSearch Channel Weight")));
+	Schema->Modify();
+
+	FString WeightStr = FString::SanitizeFloat(NewWeight);
+	WeightProp->ImportText_Direct(*WeightStr, WeightPtr, Channel, PPF_None);
+
+	// Trigger Finalize()
+	TriggerSchemaFinalize(Schema);
+
+	GEditor->EndTransaction();
+	Schema->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("channel_index"), ChannelIndex);
+	Root->SetStringField(TEXT("channel_class"), Channel->GetClass()->GetName());
+	Root->SetStringField(TEXT("old_weight"), OldWeightStr);
+	Root->SetNumberField(TEXT("new_weight"), NewWeight);
+	return FMonolithActionResult::Success(Root);
+#else
+	return FMonolithActionResult::Error(TEXT("Channel weights are only available in editor builds (WITH_EDITORONLY_DATA)"));
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// rebuild_pose_search_index — Wave 14
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleRebuildPoseSearchIndex(const TSharedPtr<FJsonObject>& Params)
+{
+#if WITH_EDITOR
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UPoseSearchDatabase* Database = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchDatabase>(AssetPath);
+	if (!Database)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchDatabase not found: %s"), *AssetPath));
+
+	bool bWait = false;
+	if (Params->HasField(TEXT("wait")))
+	{
+		bWait = Params->GetBoolField(TEXT("wait"));
+	}
+
+	using namespace UE::PoseSearch;
+	ERequestAsyncBuildFlag Flag = ERequestAsyncBuildFlag::NewRequest;
+	if (bWait)
+	{
+		Flag |= ERequestAsyncBuildFlag::WaitForCompletion;
+	}
+
+	EAsyncBuildIndexResult Result = FAsyncPoseSearchDatabasesManagement::RequestAsyncBuildIndex(Database, Flag);
+
+	FString ResultStr;
+	switch (Result)
+	{
+	case EAsyncBuildIndexResult::InProgress: ResultStr = TEXT("InProgress"); break;
+	case EAsyncBuildIndexResult::Success:    ResultStr = TEXT("Success"); break;
+	case EAsyncBuildIndexResult::Failed:     ResultStr = TEXT("Failed"); break;
+	default:                                 ResultStr = TEXT("Unknown"); break;
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("result"), ResultStr);
+	Root->SetBoolField(TEXT("waited"), bWait);
+
+	// Report current index stats
+	const FSearchIndex& SearchIndex = Database->GetSearchIndex();
+	Root->SetNumberField(TEXT("total_poses"), SearchIndex.GetNumPoses());
+
+	return FMonolithActionResult::Success(Root);
+#else
+	return FMonolithActionResult::Error(TEXT("rebuild_pose_search_index is only available in editor builds"));
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// set_database_search_mode — Wave 14
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseSearchMode(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UPoseSearchDatabase* Database = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchDatabase>(AssetPath);
+	if (!Database)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("PoseSearchDatabase not found: %s"), *AssetPath));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set PoseSearch Database Search Mode")));
+	Database->Modify();
+
+	// Search mode
+	if (Params->HasField(TEXT("pose_search_mode")))
+	{
+		FString ModeStr = Params->GetStringField(TEXT("pose_search_mode"));
+		if (ModeStr.Equals(TEXT("BruteForce"), ESearchCase::IgnoreCase))
+			Database->PoseSearchMode = EPoseSearchMode::BruteForce;
+		else if (ModeStr.Equals(TEXT("PCAKDTree"), ESearchCase::IgnoreCase))
+			Database->PoseSearchMode = EPoseSearchMode::PCAKDTree;
+		else if (ModeStr.Equals(TEXT("VPTree"), ESearchCase::IgnoreCase))
+			Database->PoseSearchMode = EPoseSearchMode::VPTree;
+		else if (ModeStr.Equals(TEXT("EventOnly"), ESearchCase::IgnoreCase))
+			Database->PoseSearchMode = EPoseSearchMode::EventOnly;
+		else
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid pose_search_mode: '%s'. Use BruteForce, PCAKDTree, VPTree, or EventOnly"), *ModeStr));
+		}
+	}
+
+	// KDTree neighbors (not editor-only)
+	if (Params->HasField(TEXT("kd_tree_query_num_neighbors")))
+	{
+		Database->KDTreeQueryNumNeighbors = FMath::Clamp(
+			static_cast<int32>(Params->GetNumberField(TEXT("kd_tree_query_num_neighbors"))), 1, 600);
+	}
+
+#if WITH_EDITORONLY_DATA
+	// PCA components (editor-only)
+	if (Params->HasField(TEXT("number_of_principal_components")))
+	{
+		Database->NumberOfPrincipalComponents = FMath::Clamp(
+			static_cast<int32>(Params->GetNumberField(TEXT("number_of_principal_components"))), 1, 64);
+	}
+
+	// KDTree max leaf size (editor-only)
+	if (Params->HasField(TEXT("kd_tree_max_leaf_size")))
+	{
+		Database->KDTreeMaxLeafSize = FMath::Clamp(
+			static_cast<int32>(Params->GetNumberField(TEXT("kd_tree_max_leaf_size"))), 1, 256);
+	}
+#endif // WITH_EDITORONLY_DATA
+
+	// Cost biases (runtime-accessible)
+	if (Params->HasField(TEXT("continuing_pose_cost_bias")))
+	{
+		Database->ContinuingPoseCostBias = static_cast<float>(Params->GetNumberField(TEXT("continuing_pose_cost_bias")));
+	}
+	if (Params->HasField(TEXT("base_cost_bias")))
+	{
+		Database->BaseCostBias = static_cast<float>(Params->GetNumberField(TEXT("base_cost_bias")));
+	}
+	if (Params->HasField(TEXT("looping_cost_bias")))
+	{
+		Database->LoopingCostBias = static_cast<float>(Params->GetNumberField(TEXT("looping_cost_bias")));
+	}
+	if (Params->HasField(TEXT("continuing_interaction_cost_bias")))
+	{
+		Database->ContinuingInteractionCostBias = static_cast<float>(Params->GetNumberField(TEXT("continuing_interaction_cost_bias")));
+	}
+
+	GEditor->EndTransaction();
+	Database->MarkPackageDirty();
+
+	// Build response — echo back current values
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+
+	FString ModeStr;
+	switch (Database->PoseSearchMode)
+	{
+	case EPoseSearchMode::BruteForce: ModeStr = TEXT("BruteForce"); break;
+	case EPoseSearchMode::PCAKDTree:  ModeStr = TEXT("PCAKDTree"); break;
+	case EPoseSearchMode::VPTree:     ModeStr = TEXT("VPTree"); break;
+	case EPoseSearchMode::EventOnly:  ModeStr = TEXT("EventOnly"); break;
+	default:                          ModeStr = TEXT("Unknown"); break;
+	}
+	Root->SetStringField(TEXT("pose_search_mode"), ModeStr);
+	Root->SetNumberField(TEXT("kd_tree_query_num_neighbors"), Database->KDTreeQueryNumNeighbors);
+#if WITH_EDITORONLY_DATA
+	Root->SetNumberField(TEXT("number_of_principal_components"), Database->NumberOfPrincipalComponents);
+	Root->SetNumberField(TEXT("kd_tree_max_leaf_size"), Database->KDTreeMaxLeafSize);
+#endif
+	Root->SetNumberField(TEXT("continuing_pose_cost_bias"), Database->ContinuingPoseCostBias);
+	Root->SetNumberField(TEXT("base_cost_bias"), Database->BaseCostBias);
+	Root->SetNumberField(TEXT("looping_cost_bias"), Database->LoopingCostBias);
+	Root->SetNumberField(TEXT("continuing_interaction_cost_bias"), Database->ContinuingInteractionCostBias);
 
 	return FMonolithActionResult::Success(Root);
 }

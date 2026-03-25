@@ -31,6 +31,8 @@ public class MonolithAnimation : ModuleRules
 			"ControlRig",
 			"ControlRigDeveloper",
 			"RigVM",
+			"RigVMDeveloper",
+			"PoseSearchEditor",    // UAnimGraphNode_MotionMatching (Wave 7 ABP graph wiring)
 		});
 	}
 }

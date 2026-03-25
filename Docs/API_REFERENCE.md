@@ -1,8 +1,10 @@
 # Monolith API Reference
 
-**Total Actions: 218** across 9 namespaces
+**Total Actions: 443** across 10 namespaces
 
 > Auto-generated from action registration code. Each action is called via HTTP POST to `http://localhost:<port>` with JSON body `{ "namespace": "<ns>", "action": "<action>", "params": { ... } }`.
+>
+> **Note:** This reference covers all action signatures as of v0.10.0. Some sections below still use the detailed per-action format from earlier versions. For the most current param schemas, call `monolith_discover("namespace")` at runtime -- it returns live schemas directly from the plugin.
 
 ---
 
@@ -11,14 +13,15 @@
 | Namespace | Actions | Description |
 |-----------|---------|-------------|
 | [monolith](#monolith) | 4 | Core server tools (discover, status, update, reindex) |
-| [blueprint](#blueprint) | 46 | Blueprint read/write, variable/component/graph CRUD, node operations, compile |
-| [material](#material) | 25 | Material graph editing, inspection, and CRUD |
-| [animation](#animation) | 62 | Animation curves, bone tracks, sync markers, root motion, compression, blend spaces, ABPs, montages, skeletons, PoseSearch |
-| [niagara](#niagara) | 47 | Niagara VFX system editing (emitters, modules, params, renderers, HLSL) |
-| [editor](#editor) | 13 | Live Coding builds, compile output capture, and editor log capture |
+| [blueprint](#blueprint) | 86 | Blueprint read/write, variable/component/graph CRUD, node operations, compile, auto-layout |
+| [material](#material) | 57 | Material graph editing, inspection, CRUD, material functions |
+| [animation](#animation) | 115 | Animation curves, bone tracks, sync markers, root motion, compression, blend spaces, ABPs, montages, skeletons, PoseSearch, IKRig, Control Rig |
+| [niagara](#niagara) | 96 | Niagara VFX system editing (emitters, modules, params, renderers, HLSL, dynamic inputs, event handlers, sim stages, NPC, effect types) |
+| [editor](#editor) | 19 | Live Coding builds, compile output capture, editor log capture, scene capture, texture import |
 | [config](#config) | 6 | INI config file inspection and search |
-| [project](#project) | 5 | Project-wide asset index (SQLite + FTS5) |
-| [source](#source) | 10 | Unreal Engine C++ source code navigation |
+| [project](#project) | 7 | Project-wide asset index (SQLite + FTS5) |
+| [source](#source) | 11 | Unreal Engine C++ source code navigation |
+| [ui](#ui) | 42 | UI widget Blueprint CRUD, templates, styling, animation, settings scaffolding, accessibility |
 
 ---
 
@@ -30,7 +33,7 @@ Core server management and introspection tools.
 
 List available tool namespaces and their actions. Pass namespace to filter.
 
-> `discover` returns per-action param schemas for all 218 actions. AI clients also receive these schemas in `tools/list` at session start, so full param documentation is available without calling `discover` first.
+> `discover` returns per-action param schemas for all 443 actions. AI clients also receive these schemas in `tools/list` at session start, so full param documentation is available without calling `discover` first.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -2334,6 +2337,221 @@ Get compiled GPU HLSL for an emitter.
 
 ---
 
+### Dynamic Input Actions (new in v0.10.0)
+
+#### `niagara.add_dynamic_input`
+
+Add a dynamic input to a module's input slot.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+| `module` | string | **required** | Module name |
+| `input` | string | **required** | Input name to attach the dynamic input to |
+| `dynamic_input` | string | **required** | Dynamic input script name or path |
+
+---
+
+#### `niagara.remove_dynamic_input`
+
+Remove a dynamic input from a module's input slot.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+| `module` | string | **required** | Module name |
+| `input` | string | **required** | Input name to remove the dynamic input from |
+
+---
+
+#### `niagara.set_dynamic_input_value`
+
+Set a value on a dynamic input module.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+| `module` | string | **required** | Module name |
+| `input` | string | **required** | Input name on the dynamic input |
+| `value` | any | **required** | Value to set |
+
+---
+
+#### `niagara.get_dynamic_input_info`
+
+Get info about dynamic inputs attached to a module.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+| `module` | string | **required** | Module name |
+
+---
+
+#### `niagara.search_dynamic_inputs`
+
+Search available dynamic input scripts by keyword.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | **required** | Search keyword (supports multi-word) |
+
+---
+
+### Event Handler Actions (new in v0.10.0)
+
+#### `niagara.add_event_handler`
+
+Add an event handler stage to an emitter.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+| `event_name` | string | **required** | Event name to handle |
+| `source_emitter` | string | optional | Source emitter for the event |
+
+---
+
+#### `niagara.remove_event_handler`
+
+Remove an event handler from an emitter.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+| `handler_index` | number | **required** | Index of the event handler to remove |
+
+---
+
+#### `niagara.list_event_handlers`
+
+List all event handlers on an emitter.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+
+---
+
+### Simulation Stage Actions (new in v0.10.0)
+
+#### `niagara.add_simulation_stage`
+
+Add a simulation stage to a GPU emitter.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+| `stage_name` | string | **required** | Name for the new simulation stage |
+
+---
+
+#### `niagara.remove_simulation_stage`
+
+Remove a simulation stage from an emitter.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+| `stage_index` | number | **required** | Index of the simulation stage to remove |
+
+---
+
+#### `niagara.list_simulation_stages`
+
+List all simulation stages on an emitter.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+
+---
+
+### NPC System Actions (new in v0.10.0)
+
+#### `niagara.create_npc_system`
+
+Create a Niagara system configured for NPC particle behaviors.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `save_path` | string | **required** | Package path to save the new system |
+| `template` | string | optional | NPC template name |
+
+---
+
+#### `niagara.add_npc_behavior` / `niagara.get_npc_info` / `niagara.set_npc_property` / `niagara.list_npc_templates`
+
+NPC particle system management actions. Use `monolith_discover("niagara")` for full param schemas.
+
+---
+
+### Effect Type Actions (new in v0.10.0)
+
+#### `niagara.create_effect_type` / `niagara.get_effect_type_info` / `niagara.set_effect_type_property`
+
+Effect type CRUD. Use `monolith_discover("niagara")` for full param schemas.
+
+---
+
+### Renderer Helper Actions (new in v0.10.0)
+
+#### `niagara.list_available_renderers`
+
+List all available renderer types.
+
+*No parameters.*
+
+---
+
+#### `niagara.set_renderer_mesh`
+
+Set the mesh on a mesh renderer.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `asset_path` | string | **required** | Package path of the Niagara system |
+| `emitter` | string | **required** | Emitter handle ID |
+| `renderer_index` | number | **required** | Renderer index |
+| `mesh` | string | **required** | Package path of the static mesh asset |
+
+---
+
+#### `niagara.configure_ribbon` / `niagara.configure_subuv`
+
+Configure ribbon renderer or SubUV settings. Use `monolith_discover("niagara")` for full param schemas.
+
+---
+
+### Advanced Niagara Actions (new in v0.10.0)
+
+#### `niagara.diff_systems`
+
+Diff two Niagara systems side-by-side.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `system_a` | string | **required** | Package path of the first system |
+| `system_b` | string | **required** | Package path of the second system |
+
+---
+
+#### `niagara.save_emitter_as_template` / `niagara.clone_module_overrides` / `niagara.preview_system` / `niagara.get_available_parameters` / `niagara.get_module_output_parameters` / `niagara.rename_emitter` / `niagara.get_emitter_property`
+
+Advanced system management actions. Use `monolith_discover("niagara")` for full param schemas.
+
+---
+
 ## editor
 
 Live Coding build management and editor log capture.
@@ -2704,3 +2922,15 @@ Read source lines from a file by path.
 Trigger Python indexer to rebuild the engine source DB.
 
 *No parameters.*
+
+---
+
+## ui
+
+UI widget Blueprint CRUD, templates, styling, animation, settings scaffolding, and accessibility. 42 actions covering the full UMG widget pipeline.
+
+> **New in v0.9.0.** For full param schemas, call `monolith_discover("ui")` at runtime.
+
+The UI module provides actions for creating and editing Widget Blueprints, managing widget hierarchies, configuring styling and animations, scaffolding settings menus, and implementing accessibility features. Actions include widget CRUD, slot configuration, brush/style management, widget animation keyframing, settings generation from config, and accessibility annotation.
+
+Use `monolith_discover("ui")` for the complete action list with parameter schemas.

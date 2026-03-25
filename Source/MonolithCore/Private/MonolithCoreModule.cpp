@@ -4,6 +4,8 @@
 #include "MonolithJsonUtils.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithCoreTools.h"
+#include "Misc/FileHelper.h"
+#include "GenericPlatform/GenericPlatformProcess.h"
 
 #define LOCTEXT_NAMESPACE "FMonolithCoreModule"
 
@@ -19,7 +21,11 @@ void FMonolithCoreModule::StartupModule()
 	int32 Port = Settings ? Settings->ServerPort : 9316;
 
 	HttpServer = MakeUnique<FMonolithHttpServer>();
-	if (!HttpServer->Start(Port))
+	if (HttpServer->Start(Port))
+	{
+		WriteSentinelFile(Port);
+	}
+	else
 	{
 		UE_LOG(LogMonolith, Error, TEXT("Failed to start MCP server on port %d"), Port);
 	}
@@ -27,6 +33,8 @@ void FMonolithCoreModule::StartupModule()
 
 void FMonolithCoreModule::ShutdownModule()
 {
+	RemoveSentinelFile();
+
 	if (HttpServer.IsValid())
 	{
 		HttpServer->Stop();
@@ -41,6 +49,45 @@ void FMonolithCoreModule::ShutdownModule()
 void FMonolithCoreModule::RegisterCoreTools()
 {
 	FMonolithCoreTools::RegisterAll();
+}
+
+FString FMonolithCoreModule::GetSentinelFilePath() const
+{
+	return FPaths::Combine(FPaths::ProjectPluginsDir(), TEXT("Monolith"), TEXT("Saved"), TEXT(".monolith_running"));
+}
+
+void FMonolithCoreModule::WriteSentinelFile(int32 Port)
+{
+	TSharedPtr<FJsonObject> Sentinel = MakeShared<FJsonObject>();
+	Sentinel->SetNumberField(TEXT("pid"), FPlatformProcess::GetCurrentProcessId());
+	Sentinel->SetNumberField(TEXT("port"), Port);
+	Sentinel->SetStringField(TEXT("version"), MONOLITH_VERSION);
+	Sentinel->SetStringField(TEXT("started"), FDateTime::UtcNow().ToIso8601());
+
+	FString Body;
+	TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+		TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Body);
+	FJsonSerializer::Serialize(Sentinel.ToSharedRef(), Writer);
+
+	const FString Path = GetSentinelFilePath();
+	if (FFileHelper::SaveStringToFile(Body, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		UE_LOG(LogMonolith, Log, TEXT("Sentinel file written: %s"), *Path);
+	}
+	else
+	{
+		UE_LOG(LogMonolith, Warning, TEXT("Failed to write sentinel file: %s"), *Path);
+	}
+}
+
+void FMonolithCoreModule::RemoveSentinelFile()
+{
+	const FString Path = GetSentinelFilePath();
+	if (FPaths::FileExists(Path))
+	{
+		IFileManager::Get().Delete(*Path);
+		UE_LOG(LogMonolith, Log, TEXT("Sentinel file removed: %s"), *Path);
+	}
 }
 
 #undef LOCTEXT_NAMESPACE

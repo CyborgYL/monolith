@@ -124,4 +124,41 @@ public:
 	static FMonolithActionResult HandleAddStateToMachine(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddTransition(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetTransitionRule(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 14: Notify Properties (1) ---
+	static FMonolithActionResult HandleSetNotifyProperties(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 15: Physics Assets + IK Chains (6) ---
+	static FMonolithActionResult HandleGetPhysicsAssetInfo(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetBodyProperties(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetConstraintProperties(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddRetargetChain(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveRetargetChain(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetRetargetChainBones(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 11: Asset Creation + Setup (7 in this file) ---
+	static FMonolithActionResult HandleCreateBlendSpace(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateBlendSpace1D(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateAimOffset(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateAimOffset1D(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateComposite(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateAnimBlueprint(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCompareSkeletons(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 12: Sequence Properties + Sync Markers (7) ---
+	static FMonolithActionResult HandleSetSequenceProperties(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetAdditiveSettings(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetCompressionSettings(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetSyncMarkers(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddSyncMarker(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveSyncMarker(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRenameSyncMarker(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 13: Batch Ops + Montage Completion (6) ---
+	static FMonolithActionResult HandleBatchExecute(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddMontageAnimSegment(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCloneNotifySetup(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleBulkAddNotify(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateMontageFromSections(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleBuildSequenceFromPoses(const TSharedPtr<FJsonObject>& Params);
 };

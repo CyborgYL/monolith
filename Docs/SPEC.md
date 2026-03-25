@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 13 MCP tools (340 total actions across 10 domains), cutting AI assistant context consumption by ~95%.
+Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 13 MCP tools (443 total actions across 10 domains), cutting AI assistant context consumption by ~95%.
 
 ### What It Replaces
 
@@ -35,13 +35,13 @@ Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate M
 ```
 Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, settings, auto-updater
-  MonolithBlueprint     — Blueprint inspection, variable/component/graph CRUD, node operations, compile (66 actions)
-  MonolithMaterial      — Material inspection + graph editing + CRUD (48 actions)
-  MonolithAnimation     — Animation sequences, montages, ABPs, curves, notifies, skeletons, PoseSearch (74 actions)
-  MonolithNiagara       — Niagara particle systems, HLSL module/function creation (65 actions)
+  MonolithBlueprint     — Blueprint inspection, variable/component/graph CRUD, node operations, compile (86 actions)
+  MonolithMaterial      — Material inspection + graph editing + CRUD + function suite (57 actions)
+  MonolithAnimation     — Animation sequences, montages, ABPs, curves, notifies, skeletons, PoseSearch (115 actions)
+  MonolithNiagara       — Niagara particle systems, HLSL module/function creation, DI config, event handlers, sim stages, NPC, effect types (96 actions)
   MonolithEditor        — Build triggers, live compile, log capture, compile output, crash context, scene capture, texture import (19 actions)
   MonolithConfig        — Config/INI resolution and search (6 actions)
-  MonolithIndex         — SQLite FTS5 deep project indexer, 14 internal indexers (5 MCP actions)
+  MonolithIndex         — SQLite FTS5 deep project indexer, 14 internal indexers (7 MCP actions)
   MonolithSource        — Engine source + API lookup (11 actions)
   MonolithUI            — Widget blueprint CRUD, templates, styling, animation, settings scaffolding, accessibility (42 actions)
 ```
@@ -117,11 +117,11 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithBlueprintModule` | Registers 66 blueprint actions |
+| `FMonolithBlueprintModule` | Registers 86 blueprint actions |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
-#### Actions (66 — namespace: "blueprint")
+#### Actions (86 — namespace: "blueprint")
 
 **Read Actions (13)**
 | Action | Params | Description |
@@ -203,10 +203,10 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithMaterialModule` | Registers 48 material actions |
+| `FMonolithMaterialModule` | Registers 57 material actions |
 | `FMonolithMaterialActions` | Static handlers + helpers for loading materials and serializing expressions |
 
-#### Actions (48 — namespace: "material")
+#### Actions (57 — namespace: "material")
 
 **Read Actions (10)**
 | Action | Description |
@@ -241,6 +241,24 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | `begin_transaction` | Begin named undo transaction for batching edits |
 | `end_transaction` | End current undo transaction |
 
+**Material Function Actions (9)**
+| Action | Description |
+|--------|-------------|
+| `export_function_graph` | Full graph export of a material function — nodes, connections, properties, inputs, outputs, static switch details |
+| `set_function_metadata` | Update material function description, categories, and library exposure settings |
+| `delete_function_expression` | Remove expression(s) from a material function graph |
+| `update_material_function` | Recompile a material function and cascade changes to all referencing materials/instances |
+| `create_function_instance` | Create a MaterialFunctionInstance with parent reference and optional parameter overrides |
+| `set_function_instance_parameter` | Set parameter overrides on a MaterialFunctionInstance (supports 11 parameter types) |
+| `get_function_instance_info` | Read MFI parent chain and all parameter overrides (11 types: scalar, vector, texture, font, static switch, static component mask, and more) |
+| `layout_function_expressions` | Auto-arrange material function graph layout |
+| `rename_function_parameter_group` | Rename a parameter group across all parameters in a material function |
+
+**Extended Actions (1)**
+| Action | Change |
+|--------|--------|
+| `create_material_function` | Added `type` parameter — supports `MaterialLayer` and `MaterialLayerBlend` in addition to standard material functions |
+
 ---
 
 ### 3.4 MonolithAnimation
@@ -251,10 +269,10 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithAnimationModule` | Registers 74 animation actions (69 animation + 5 PoseSearch) |
+| `FMonolithAnimationModule` | Registers 115 animation actions |
 | `FMonolithAnimationActions` | Static handlers organized in 15 groups |
 
-#### Actions (74 — namespace: "animation")
+#### Actions (115 — namespace: "animation")
 
 **Sequence Info (4) — read-only**
 | Action | Description |
@@ -380,7 +398,7 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithNiagaraModule` | Registers 65 Niagara actions |
+| `FMonolithNiagaraModule` | Registers 96 Niagara actions |
 | `FMonolithNiagaraActions` | Static handlers + extensive private helpers |
 | `MonolithNiagaraHelpers` | 6 reimplemented NiagaraEditor functions (non-exported APIs) |
 
@@ -395,7 +413,7 @@ These exist because Epic's `FNiagaraStackGraphUtilities` functions lack `NIAGARA
 5. `GetParametersForContext` — System user store params
 6. `GetStackFunctionInputs` — Full input enumeration via engine's `FNiagaraStackGraphUtilities::GetStackFunctionInputs` with `FCompileConstantResolver`. Returns all input types (floats, vectors, colors, data interfaces, enums, bools) — not just static switch pins
 
-#### Actions (65 — namespace: "niagara")
+#### Actions (96 — namespace: "niagara")
 
 > **Note:** All Niagara actions accept `asset_path` (preferred) or `system_path` (backward compatible) for the system asset path parameter.
 >
@@ -479,6 +497,73 @@ These exist because Epic's `FNiagaraStackGraphUtilities` functions lack `NIAGARA
 |--------|-------------|
 | `get_compiled_gpu_hlsl` | Get compiled GPU HLSL for an emitter |
 
+**Dynamic Inputs (5)**
+| Action | Description |
+|--------|-------------|
+| `list_dynamic_inputs` | List all dynamic inputs on a module |
+| `get_dynamic_input_tree` | Get the full tree structure of a dynamic input |
+| `remove_dynamic_input` | Remove a dynamic input from a module |
+| `get_dynamic_input_value` | Get the current value of a dynamic input |
+| `get_dynamic_input_inputs` | Get all sub-inputs of a dynamic input |
+
+**Emitter Management (3)**
+| Action | Description |
+|--------|-------------|
+| `rename_emitter` | Rename an emitter within a system |
+| `get_emitter_property` | Get a property value from an emitter via reflection |
+| `list_available_renderers` | List all available renderer classes that can be added |
+
+**Renderer Configuration (3)**
+| Action | Description |
+|--------|-------------|
+| `set_renderer_mesh` | Set the mesh asset on a mesh renderer |
+| `configure_ribbon` | Configure ribbon renderer settings (width, facing, tessellation, etc.) |
+| `configure_subuv` | Configure SubUV animation settings on a renderer |
+
+**Event Handlers (3)**
+| Action | Description |
+|--------|-------------|
+| `get_event_handlers` | Get all event handlers on an emitter |
+| `set_event_handler_property` | Set a property on an event handler |
+| `remove_event_handler` | Remove an event handler from an emitter |
+
+**Simulation Stages (3)**
+| Action | Description |
+|--------|-------------|
+| `get_simulation_stages` | Get all simulation stages on an emitter |
+| `set_simulation_stage_property` | Set a property on a simulation stage |
+| `remove_simulation_stage` | Remove a simulation stage from an emitter |
+
+**Module Outputs (1)**
+| Action | Description |
+|--------|-------------|
+| `get_module_output_parameters` | Get output parameters exposed by a module |
+
+**Niagara Parameter Collections (NPC) (5)**
+| Action | Description |
+|--------|-------------|
+| `create_npc` | Create a Niagara Parameter Collection asset |
+| `get_npc` | Get NPC contents (parameters, defaults, namespace) |
+| `add_npc_parameter` | Add a parameter to an NPC |
+| `remove_npc_parameter` | Remove a parameter from an NPC |
+| `set_npc_default` | Set the default value of an NPC parameter |
+
+**Effect Types (3)**
+| Action | Description |
+|--------|-------------|
+| `create_effect_type` | Create a Niagara Effect Type asset |
+| `get_effect_type` | Get effect type settings (scalability, significance, budget) |
+| `set_effect_type_property` | Set a property on an effect type |
+
+**Utilities (4)**
+| Action | Description |
+|--------|-------------|
+| `get_available_parameters` | List available parameters that can be bound to inputs |
+| `preview_system` | Capture a preview image of a Niagara system |
+| `diff_systems` | Compare two Niagara systems and return structural differences |
+| `save_emitter_as_template` | Save an emitter as a reusable template asset |
+| `clone_module_overrides` | Clone input overrides from one module to another |
+
 #### UE 5.7 Compatibility Fixes (6 sites)
 
 All marked with "UE 5.7 FIX" comments:
@@ -559,7 +644,7 @@ All marked with "UE 5.7 FIX" comments:
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithIndexModule` | Registers 5 project actions |
+| `FMonolithIndexModule` | Registers 7 project actions |
 | `FMonolithIndexDatabase` | RAII SQLite wrapper. 13 tables + 2 FTS5 + 6 triggers + 1 meta. DELETE journal mode, 64MB cache |
 | `UMonolithIndexSubsystem` | UEditorSubsystem. Incremental + full indexing via FRunnable. Asset Registry callbacks for add/remove/rename. Deep asset indexing with game-thread batching. Batches every 100 assets. Progress notifications |
 | `IMonolithIndexer` | Pure virtual interface: GetSupportedClasses(), IndexAsset(), GetName() |
@@ -576,7 +661,7 @@ All marked with "UE 5.7 FIX" comments:
 | `FDependencyIndexer` | Hard + Soft package dependencies (runs after all other indexers) |
 | `FMonolithIndexNotification` | Slate notification bar with throbber + percentage |
 
-#### Actions (5 — namespace: "project")
+#### Actions (7 — namespace: "project")
 
 | Action | Params | Description |
 |--------|--------|-------------|
@@ -850,15 +935,15 @@ python Saved/monolith_offline.py <namespace> <action> [args...]
 
 | Skill | Trigger Words | Entry Point | Actions |
 |-------|--------------|-------------|---------|
-| unreal-animation | animation, montage, ABP, blend space, notify, curves, compression, PoseSearch | `animation_query()` | 74 |
-| unreal-blueprints | Blueprint, BP, event graph, node, variable | `blueprint_query()` | 66 |
+| unreal-animation | animation, montage, ABP, blend space, notify, curves, compression, PoseSearch | `animation_query()` | 115 |
+| unreal-blueprints | Blueprint, BP, event graph, node, variable | `blueprint_query()` | 86 |
 | unreal-build | build, compile, Live Coding, hot reload, rebuild | `editor_query()` | 19 |
 | unreal-cpp | C++, header, include, UCLASS, Build.cs, linker error | `source_query()` + `config_query()` | 11+6 |
 | unreal-debugging | build error, crash, log, debug, stack trace | `editor_query()` | 19 |
-| unreal-materials | material, shader, PBR, texture, material graph | `material_query()` | 48 |
-| unreal-niagara | Niagara, particle, VFX, emitter | `niagara_query()` | 65 |
+| unreal-materials | material, shader, PBR, texture, material graph | `material_query()` | 57 |
+| unreal-niagara | Niagara, particle, VFX, emitter | `niagara_query()` | 96 |
 | unreal-performance | performance, optimization, FPS, frame time | Cross-domain | config + material + niagara |
-| unreal-project-search | find asset, search project, dependencies | `project_query()` | 5 |
+| unreal-project-search | find asset, search project, dependencies | `project_query()` | 7 |
 | unreal-ui | UI, HUD, widget, menu, settings, save game, accessibility, font, toast, dialog | `ui_query()` | 42 |
 
 All skills follow a common structure: YAML frontmatter, Discovery section, Asset Path Conventions table, action tables, workflow examples, and rules.
@@ -1019,7 +1104,7 @@ See `TODO.md` for the full list. Key architectural constraints:
 |--------|-----------|---------|
 | MonolithCore | monolith | 4 |
 | MonolithBlueprint | blueprint | 66 |
-| MonolithMaterial | material | 48 |
+| MonolithMaterial | material | 57 |
 | MonolithAnimation | animation | 74 |
 | MonolithNiagara | niagara | 65 |
 | MonolithEditor | editor | 19 |
@@ -1027,6 +1112,6 @@ See `TODO.md` for the full list. Key architectural constraints:
 | MonolithIndex | project | 5 |
 | MonolithSource | source | 11 |
 | MonolithUI | ui | 42 |
-| **Total** | | **340** |
+| **Total** | | **349** |
 
 **Note:** PoseSearch's 5 actions are included in Animation's 74 — they are not additive. The original Python server had higher counts (~231 tools) due to fragmented action design.

@@ -5,6 +5,7 @@
 #include "MonolithSettings.h"
 #include "HttpServerModule.h"
 #include "HttpServerResponse.h"
+#include "GenericPlatform/GenericPlatformProcess.h"
 
 FMonolithHttpServer::FMonolithHttpServer()
 {
@@ -58,10 +59,25 @@ bool FMonolithHttpServer::Start(int32 Port)
 		FHttpRequestHandler::CreateRaw(this, &FMonolithHttpServer::HandleOptions)
 	));
 
+	// Bind GET /health — lightweight health check (no JSON-RPC)
+	RouteHandles.Add(HttpRouter->BindRoute(
+		FHttpPath(TEXT("/health")),
+		EHttpServerRequestVerbs::VERB_GET,
+		FHttpRequestHandler::CreateRaw(this, &FMonolithHttpServer::HandleHealthCheck)
+	));
+
+	// Bind OPTIONS /health — CORS preflight
+	RouteHandles.Add(HttpRouter->BindRoute(
+		FHttpPath(TEXT("/health")),
+		EHttpServerRequestVerbs::VERB_OPTIONS,
+		FHttpRequestHandler::CreateRaw(this, &FMonolithHttpServer::HandleOptions)
+	));
+
 	FHttpServerModule::Get().StartAllListeners();
 
 	bIsRunning = true;
 	BoundPort = Port;
+	StartTime = FDateTime::UtcNow();
 
 	UE_LOG(LogMonolith, Log, TEXT("Monolith MCP server started on port %d"), Port);
 	return true;
@@ -104,7 +120,9 @@ bool FMonolithHttpServer::HandlePostMcp(const FHttpServerRequest& Request, const
 	{
 		TSharedPtr<FJsonObject> Err = FMonolithJsonUtils::ErrorResponse(
 			nullptr, FMonolithJsonUtils::ErrParseError, TEXT("Empty request body"));
-		OnComplete(MakeJsonResponse(FMonolithJsonUtils::Serialize(Err), EHttpServerResponseCodes::BadRequest));
+		auto Response = MakeJsonResponse(FMonolithJsonUtils::Serialize(Err), EHttpServerResponseCodes::BadRequest);
+		AddCorsHeaders(*Response);
+		OnComplete(MoveTemp(Response));
 		return true;
 	}
 
@@ -219,6 +237,30 @@ bool FMonolithHttpServer::HandleDeleteMcp(const FHttpServerRequest& Request, con
 bool FMonolithHttpServer::HandleOptions(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
 {
 	auto Response = FHttpServerResponse::Ok();
+	AddCorsHeaders(*Response);
+	OnComplete(MoveTemp(Response));
+	return true;
+}
+
+bool FMonolithHttpServer::HandleHealthCheck(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+{
+	TSharedPtr<FJsonObject> Health = MakeShared<FJsonObject>();
+	Health->SetStringField(TEXT("status"), TEXT("ok"));
+	Health->SetNumberField(TEXT("port"), BoundPort);
+	Health->SetNumberField(TEXT("pid"), FPlatformProcess::GetCurrentProcessId());
+	Health->SetStringField(TEXT("version"), MONOLITH_VERSION);
+
+	const FTimespan Uptime = FDateTime::UtcNow() - StartTime;
+	Health->SetNumberField(TEXT("uptime_seconds"), static_cast<double>(Uptime.GetTotalSeconds()));
+
+	Health->SetNumberField(TEXT("tools_registered"), FMonolithToolRegistry::Get().GetActionCount());
+
+	FString Body;
+	TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+		TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Body);
+	FJsonSerializer::Serialize(Health.ToSharedRef(), Writer);
+
+	auto Response = MakeJsonResponse(Body);
 	AddCorsHeaders(*Response);
 	OnComplete(MoveTemp(Response));
 	return true;

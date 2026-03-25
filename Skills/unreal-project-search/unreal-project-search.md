@@ -20,7 +20,7 @@ All asset paths follow UE content browser format (no .uasset extension):
 | Location | Path Format | Example |
 |----------|------------|--------|
 | Project Content/ | `/Game/Path/To/Asset` | `/Game/Materials/M_Rock` |
-| Project Plugins/ | `/PluginName/Path/To/Asset` | `/CarnageFX/Materials/M_Blood` |
+| Project Plugins/ | `/PluginName/Path/To/Asset` | `/MassProjectile/Materials/M_Example` |
 | Engine Plugins | `/PluginName/Path/To/Asset` | `/Niagara/DefaultAssets/SystemAssets/NS_Default` |
 
 **Note:** For project plugins, the path starts with the plugin name as configured in the .uplugin file's "MountPoint" — which defaults to `/<PluginName>/`. Most plugins mount their Content/ folder there directly.
@@ -67,7 +67,7 @@ project_query({ action: "find_references", params: { asset_path: "/Game/Material
 
 ### Find references to a plugin asset
 ```
-project_query({ action: "find_references", params: { asset_path: "/CarnageFX/Materials/M_Blood" } })
+project_query({ action: "find_references", params: { asset_path: "/MassProjectile/Materials/M_Example" } })
 ```
 
 ### Get detailed metadata for an asset

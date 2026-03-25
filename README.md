@@ -18,40 +18,43 @@ It works with **Claude Code**, **Cursor**, or any MCP-compatible client. If your
 
 ## Why Monolith?
 
-Most MCP integrations register every action as a separate tool, which floods the AI's context window and buries the actually useful stuff. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists everything available. Small tool list (12 tools), massive capability (291 actions across nine domains). The AI gets oriented fast and spends its context on your actual problem.
+Most MCP integrations register every action as a separate tool, which floods the AI's context window and buries the actually useful stuff. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists everything available. Small tool list (13 tools), massive capability (443 actions across ten domains). The AI gets oriented fast and spends its context on your actual problem.
 
 ## What Can It Actually Do?
 
-**Blueprint** — The AI has full read/write access to every part of a Blueprint. It can read graph topology, trace execution flow, inspect variables, components, functions, and interfaces. It can create new Blueprints from any parent class, add/remove/rename variables and components, build out functions and event dispatchers, wire up nodes, set pin defaults, implement interfaces, reparent, compile, and validate. Hand it a description and it'll build the whole Blueprint. Or give it an existing one and it'll surgically change what you need.
+**Blueprint (86 actions)** — Full programmatic control of every Blueprint in your project. Create from any parent class, build entire node graphs from a JSON spec, add/remove/connect/disconnect nodes in bulk, manage variables, components, functions, macros, and event dispatchers. Implement interfaces, reparent hierarchies, edit construction scripts, read/write CDO properties on any Blueprint or DataAsset. The auto-layout engine uses a modified Sugiyama algorithm so AI-generated graphs actually look clean. Compare two Blueprints side-by-side, scaffold from templates, manage data tables, user defined structs and enums. Hand the AI a description and it builds the whole thing — or point it at an existing Blueprint and it'll surgically rewire what you need.
 
-**Material** — Create materials and instances from scratch, add and connect expression nodes, set scalar/vector/texture parameters, build full PBR graphs programmatically, recompile, validate for errors, and read compiled shader stats. "Give me a worn leather material with edge wear and a normal map input" is a reasonable thing to ask.
+**Material (57 actions)** — Create materials, material instances, and material functions from scratch. Build entire PBR graphs programmatically — add expressions, connect pins, auto-layout, recompile. Drop in custom HLSL nodes. Import textures from disk and wire them directly into material slots. Batch-set properties across dozens of instances at once. Render material previews and thumbnails without leaving the AI session. Full material function support: create, build internal graphs, export/import between projects. Get compilation stats, validate for errors, inspect shader complexity. Covers the full material workflow from creation to validation.
 
-**Animation** — Inspect and modify animation sequences, montages, blend spaces, Animation Blueprints, state machines, skeletons, and PoseSearch databases. Add/remove notifies, edit montage sections, create blend space samples, trace ABP state transitions. The whole animation pipeline is in scope.
+**Animation (115 actions)** — The entire animation pipeline, end to end. Create and edit sequences with bone tracks, curves, notifies, and sync markers. Build montages with sections, slots, blending config, and anim segments. Set up 1D/2D Blend Spaces and Aim Offsets with sample points. **Animation Blueprint graph writing** — add states to state machines, create transitions, set transition rules, add and connect anim graph nodes, set state animations. AI can build ABP locomotion setups programmatically, not just read them. PoseSearch integration: create schemas and databases, configure channels, rebuild the search index. Control Rig graph manipulation with node wiring and variable management. Physics Asset editing for body and constraint properties. IK Rig and Retargeter support — chain mapping, solver configuration, the works. Skeleton management with sockets, virtual bones, and curves. 115 actions covering the full animation pipeline.
 
-**Niagara** — Create particle systems from specs, add/remove emitters and modules, set module inputs and bindings, configure data interfaces and renderers, edit parameters, read compiled GPU HLSL, and batch-execute multiple operations atomically. "Build me a blood splatter system that responds to hit direction" — genuinely doable.
+**Niagara (96 actions)** — Full system and emitter lifecycle — create, duplicate, configure, compile. Module CRUD with override-preserving reorder so you don't blow away artist tweaks. Complete dynamic input lifecycle: attach inputs, inspect the tree, read values, remove them. Event handler and simulation stage CRUD. Niagara Parameter Collections with full param management. Effect Type creation with scalability and culling configuration. Renderer helpers for every type — mesh assignment, ribbon presets (trail, beam, lightning, tube), SubUV and flipbook setup. Data interface configuration handles JSON arrays and structs natively. Diff two systems to see exactly what changed. Clone overrides between modules, discover parameter bindings, inspect module outputs. Batch execute with read-only optimization so queries don't trigger unnecessary recompiles. Full `export_system_spec` dumps everything — event handlers, sim stages, static switches, dynamic inputs. Covers the full Niagara workflow from system creation to final polish.
 
-**Editor** — Trigger full UBT builds or Live Coding compiles, read build errors and compiler output, search editor logs, get crash context after failures, query editor state. The AI can compile your code and diagnose the failure without you touching the editor.
+**UI (42 actions)** — Widget Blueprint CRUD with full widget tree manipulation. Pre-built templates for common game UI: HUD elements, menus, settings panels, confirmation dialogs, loading screens, inventory grids, save slot lists, notification toasts. Style everything — brushes, fonts, color schemes, batch style operations. Create keyframed widget animations. Full game scaffolding: settings systems, save/load, audio config, input remapping, accessibility features. Run accessibility audits, set up colorblind modes, configure text scaling. Covers the full UI workflow from widget creation to accessibility.
 
-**Config** — Read, search, and diff INI files with full resolution chain awareness (Base → Platform → Project → User). Ask what a setting does, where it's overridden, and what the effective value is. Good for performance tuning sessions where you want the AI to just sort out the INIs.
+**Editor (19 actions)** — Trigger full UBT builds or Live Coding compiles, read build errors and compiler output, search and tail editor logs, get crash context after failures. Capture preview screenshots of any asset — materials, Niagara systems, meshes. Import textures, stitch flipbooks, delete assets. The AI can compile your code, read the errors, fix the C++, recompile, and verify the fix — all without you touching the editor.
 
-**Project** — Full-text search across every indexed asset. Find assets by name, type, path, or content. Trace references between assets. The index updates automatically as assets change and covers marketplace/Fab plugin content too.
+**Config (6 actions)** — Full INI resolution chain awareness: Base, Platform, Project, User. Ask what any setting does, where it's overridden, what the effective value is, and how it differs from the engine default. Search across all config files at once. Perfect for performance tuning sessions where you want the AI to just sort out your INIs.
 
-**Source** — Look up any Unreal Engine C++ API: read function implementations, search engine source, get class hierarchies, trace call graphs, verify include paths. The native C++ indexer runs automatically — no Python, no setup. The AI never has to guess at a function signature.
+**Source (11 actions)** — Search over 1M+ Unreal Engine C++ symbols instantly. Read function implementations, get full class hierarchies, trace call graphs (callers and callees), verify include paths — all against a local index, fully offline. The native C++ indexer runs automatically on editor startup. No Python, no setup. Optionally index your project's own C++ source for the same coverage on your code. The AI never has to guess at a function signature again.
+
+**Project (7 actions)** — SQLite FTS5 full-text search across every indexed asset in your project. Find assets by name, type, path, or content. Trace references between assets. Search gameplay tags. Get detailed asset metadata. The index updates live as assets change and covers marketplace/Fab plugin content too — 15 deep indexers registered including DataAsset subclasses.
 
 ---
 
 ## Features
 
-- **Full Blueprint read/write/CRUD** — Create Blueprints, edit variables/components/functions/nodes, compile and validate. Read CDO properties from any Blueprint or DataAsset.
-- **Material graph editing** — Read, build, and validate material graphs with preview support
-- **Animation coverage** — Montages, blend spaces, ABP state machines, skeletons, bone tracks
-- **Niagara particle systems** — Create and edit systems, emitters, modules, parameters, renderers, and HLSL
-- **Editor integration** — Build triggers, log capture, compile output, crash context, Live Coding support
-- **Config management** — INI resolution, diff, search, and explain
-- **Deep project search** — SQLite FTS5 full-text search across all indexed assets, including marketplace and Fab plugin content. Configurable additional content paths.
-- **Engine source intelligence** — Native C++ indexer (no Python required) with call graphs, class hierarchy, and cross-references. Optional project C++ source indexing for richer results.
-- **Auto-updater** — Checks GitHub Releases on editor startup, one-click update
-- **Claude Code skills** — Domain-specific workflow guides bundled with the plugin
+- **Blueprint (86 actions)** — Full CRUD, node graph manipulation, JSON-to-Blueprint building, auto-layout (Sugiyama), CDO property access, data tables, structs, enums, template system, Blueprint comparison. Works as a complete Blueprint co-pilot with any MCP client
+- **Material authoring (57 actions)** — Programmatic PBR graph building, custom HLSL, material functions, texture import, batch operations, preview rendering, compilation stats
+- **Animation (115 actions)** — Sequences, montages, blend spaces, Animation Blueprint graph writing (add states, transitions, rules, wire nodes), PoseSearch, Control Rig, Physics Assets, IK Rigs, Retargeters, skeleton management
+- **Niagara VFX (96 actions)** — System/emitter lifecycle, dynamic inputs, event handlers, sim stages, Parameter Collections, Effect Types, renderer presets, data interfaces, system diffing, batch execute
+- **UI (42 actions)** *(new module)* — Widget Blueprint CRUD, pre-built templates (HUDs, menus, settings, inventory, save slots), styling, animation, game system scaffolding (save/load, audio, input remapping), accessibility audit, colorblind modes, text scaling
+- **Editor control (19 actions)** — UBT builds, Live Coding, error diagnosis, log search, scene capture, texture import, crash context
+- **Config intelligence (6 actions)** — Full INI resolution chain, explain, diff, search across all config files
+- **Project search (7 actions)** — SQLite FTS5 across all indexed assets including marketplace/Fab content, reference tracing, 15 deep indexers
+- **Engine source (11 actions)** — Native C++ indexer over 1M+ symbols, call graphs, class hierarchy, offline — no Python required
+- **Auto-updater** — Checks GitHub Releases on editor startup, downloads and stages updates, auto-swaps on exit
+- **Claude Code skills** — 9 domain-specific workflow guides bundled with the plugin
 - **Pure C++** — Direct UE API access, embedded Streamable HTTP server, zero external dependencies
 
 ---
@@ -201,17 +204,18 @@ cp -r Plugins/Monolith/Skills/* ~/.claude/skills/
 ```
 Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, auto-updater (4 actions)
-  MonolithBlueprint     — Blueprint read/write, variable/component/graph CRUD, node operations, compile, CDO reader (67 actions)
-  MonolithMaterial      — Material inspection + graph editing + CRUD (47 actions)
-  MonolithAnimation     — Animation sequences, montages, ABPs, PoseSearch (74 actions)
-  MonolithNiagara       — Niagara particle systems (64 actions)
-  MonolithEditor        — Build triggers, log capture, compile output, crash context (17 actions)
+  MonolithBlueprint     — Blueprint read/write, variable/component/graph CRUD, node operations, compile, CDO reader (86 actions)
+  MonolithMaterial      — Material inspection + graph editing + CRUD + material functions (57 actions)
+  MonolithAnimation     — Animation sequences, montages, ABPs, PoseSearch, IKRig, Control Rig (115 actions)
+  MonolithNiagara       — Niagara particle systems, dynamic inputs, event handlers, sim stages, NPC (96 actions)
+  MonolithEditor        — Build triggers, log capture, compile output, crash context (19 actions)
   MonolithConfig        — Config/INI resolution and search (6 actions)
-  MonolithIndex         — SQLite FTS5 deep project indexer, marketplace content, 15 asset indexers (5 actions)
-  MonolithSource        — Native C++ engine source indexer, call graphs, class hierarchy (10 actions)
+  MonolithIndex         — SQLite FTS5 deep project indexer, marketplace content, 15 asset indexers (7 actions)
+  MonolithSource        — Native C++ engine source indexer, call graphs, class hierarchy (11 actions)
+  MonolithUI            — UI widget Blueprint CRUD, templates, styling, animation (42 actions)
 ```
 
-**291 actions total across 9 modules, exposed through 12 MCP tools.**
+**443 actions total across 10 modules, exposed through 13 MCP tools.**
 
 ### Tool Reference
 
@@ -221,14 +225,15 @@ Monolith.uplugin
 | `monolith` | `monolith_status` | — | Server health, version, index status |
 | `monolith` | `monolith_reindex` | — | Trigger full project re-index |
 | `monolith` | `monolith_update` | — | Check or install updates |
-| `blueprint` | `blueprint_query` | 67 | Full Blueprint CRUD — read/write graphs, variables, components, functions, nodes, compile, CDO properties |
-| `material` | `material_query` | 47 | Inspection, editing, graph building, previews, validation, CRUD |
-| `animation` | `animation_query` | 74 | Montages, blend spaces, ABPs, skeletons, bone tracks, PoseSearch, IKRig, Control Rig |
-| `niagara` | `niagara_query` | 64 | Systems, emitters, modules, parameters, renderers, HLSL, dynamic inputs, simulation stages |
-| `editor` | `editor_query` | 17 | Build triggers, error logs, compile output, crash context, scene capture, texture import |
+| `blueprint` | `blueprint_query` | 86 | Full Blueprint CRUD — read/write graphs, variables, components, functions, nodes, compile, CDO properties, auto-layout |
+| `material` | `material_query` | 57 | Inspection, editing, graph building, material functions, previews, validation, CRUD |
+| `animation` | `animation_query` | 115 | Montages, blend spaces, ABPs, skeletons, bone tracks, PoseSearch, IKRig, Control Rig |
+| `niagara` | `niagara_query` | 96 | Systems, emitters, modules, parameters, renderers, HLSL, dynamic inputs, event handlers, sim stages, NPC, effect types |
+| `editor` | `editor_query` | 19 | Build triggers, error logs, compile output, crash context, scene capture, texture import |
 | `config` | `config_query` | 6 | INI resolution, explain, diff, search |
-| `project` | `project_query` | 5 | Deep project search — FTS5 across all indexed assets including marketplace plugins |
-| `source` | `source_query` | 10 | Native C++ engine source lookup, call graphs, class hierarchy, project reindex |
+| `project` | `project_query` | 7 | Deep project search — FTS5 across all indexed assets including marketplace plugins |
+| `source` | `source_query` | 11 | Native C++ engine source lookup, call graphs, class hierarchy, project reindex |
+| `ui` | `ui_query` | 42 | UI widget Blueprint CRUD, templates, styling, animation, settings scaffolding, accessibility |
 
 ---
 
