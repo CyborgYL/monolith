@@ -763,14 +763,21 @@ FMonolithActionResult FMonolithMaterialActions::GetAllExpressions(const TSharedP
 {
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
 
-	UMaterial* Mat = LoadBaseMaterial(AssetPath);
-	if (!Mat)
+	// Try UMaterial first, then fall back to UMaterialFunction
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UMaterial* Mat = Cast<UMaterial>(LoadedAsset);
+	UMaterialFunction* MatFunc = Mat ? nullptr : Cast<UMaterialFunction>(LoadedAsset);
+
+	if (!Mat && !MatFunc)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load base material at '%s'"), *AssetPath));
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to load material or material function at '%s'"), *AssetPath));
 	}
 
+	TConstArrayView<TObjectPtr<UMaterialExpression>> Expressions =
+		Mat ? Mat->GetExpressions() : MatFunc->GetExpressions();
+
 	TArray<TSharedPtr<FJsonValue>> ExpressionsArray;
-	TConstArrayView<TObjectPtr<UMaterialExpression>> Expressions = Mat->GetExpressions();
 	for (const TObjectPtr<UMaterialExpression>& Expr : Expressions)
 	{
 		if (Expr)
@@ -781,6 +788,7 @@ FMonolithActionResult FMonolithMaterialActions::GetAllExpressions(const TSharedP
 
 	auto ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetStringField(TEXT("asset_type"), Mat ? TEXT("Material") : TEXT("MaterialFunction"));
 	ResultJson->SetNumberField(TEXT("expression_count"), ExpressionsArray.Num());
 	ResultJson->SetArrayField(TEXT("expressions"), ExpressionsArray);
 
@@ -797,14 +805,21 @@ FMonolithActionResult FMonolithMaterialActions::GetExpressionDetails(const TShar
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
 	FString ExpressionName = Params->GetStringField(TEXT("expression_name"));
 
-	UMaterial* Mat = LoadBaseMaterial(AssetPath);
-	if (!Mat)
+	// Try UMaterial first, then fall back to UMaterialFunction
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UMaterial* Mat = Cast<UMaterial>(LoadedAsset);
+	UMaterialFunction* MatFunc = Mat ? nullptr : Cast<UMaterialFunction>(LoadedAsset);
+
+	if (!Mat && !MatFunc)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load base material at '%s'"), *AssetPath));
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to load material or material function at '%s'"), *AssetPath));
 	}
 
+	TConstArrayView<TObjectPtr<UMaterialExpression>> Expressions =
+		Mat ? Mat->GetExpressions() : MatFunc->GetExpressions();
+
 	UMaterialExpression* FoundExpr = nullptr;
-	TConstArrayView<TObjectPtr<UMaterialExpression>> Expressions = Mat->GetExpressions();
 	for (const TObjectPtr<UMaterialExpression>& Expr : Expressions)
 	{
 		if (Expr && Expr->GetName() == ExpressionName)
@@ -3166,15 +3181,23 @@ FMonolithActionResult FMonolithMaterialActions::SetExpressionProperty(const TSha
 		}
 	}
 
-	UMaterial* Mat = LoadBaseMaterial(AssetPath);
-	if (!Mat)
+	// Try UMaterial first, then fall back to UMaterialFunction
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UMaterial* Mat = Cast<UMaterial>(LoadedAsset);
+	UMaterialFunction* MatFunc = Mat ? nullptr : Cast<UMaterialFunction>(LoadedAsset);
+
+	if (!Mat && !MatFunc)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load base material at '%s'"), *AssetPath));
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to load material or material function at '%s'"), *AssetPath));
 	}
+
+	TConstArrayView<TObjectPtr<UMaterialExpression>> Expressions =
+		Mat ? Mat->GetExpressions() : MatFunc->GetExpressions();
 
 	// Find expression
 	UMaterialExpression* TargetExpr = nullptr;
-	for (const TObjectPtr<UMaterialExpression>& Expr : Mat->GetExpressions())
+	for (const TObjectPtr<UMaterialExpression>& Expr : Expressions)
 	{
 		if (Expr && Expr->GetName() == ExprName)
 		{
@@ -3186,7 +3209,7 @@ FMonolithActionResult FMonolithMaterialActions::SetExpressionProperty(const TSha
 	if (!TargetExpr)
 	{
 		TArray<FString> AvailableNames;
-		for (const TObjectPtr<UMaterialExpression>& E : Mat->GetExpressions())
+		for (const TObjectPtr<UMaterialExpression>& E : Expressions)
 		{
 			if (E) AvailableNames.Add(E->GetName());
 		}
@@ -3264,8 +3287,16 @@ FMonolithActionResult FMonolithMaterialActions::SetExpressionProperty(const TSha
 		// Pass the actual property so PostEditChangePropertyInternal calls
 		// MaterialGraph->RebuildGraph() and the editor display updates correctly.
 		FPropertyChangedEvent ChangeEvent(Prop);
-		Mat->PreEditChange(Prop);
-		Mat->PostEditChangeProperty(ChangeEvent);
+		if (Mat)
+		{
+			Mat->PreEditChange(Prop);
+			Mat->PostEditChangeProperty(ChangeEvent);
+		}
+		else if (MatFunc)
+		{
+			MatFunc->PreEditChange(Prop);
+			MatFunc->PostEditChangeProperty(ChangeEvent);
+		}
 	}
 
 	GEditor->EndTransaction();
