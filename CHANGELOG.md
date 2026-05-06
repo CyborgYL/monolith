@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **MCP proxy startup tool-list stability for clients that do not refresh after `tools/list_changed`.** The native proxy and Python fallback now return a cached tool list when the editor is down, or a seed list of the stable namespace/meta tools on first run. This preserves Claude Code's normal auto-reconnect behavior and also keeps Codex-style deferred tool catalogs from starting with an empty Monolith surface when the AI session launches before Unreal Editor.
+
 - **`animation.get_bone_track_keys` rewritten to use non-deprecated `IAnimationDataModel` API** — PR [#54](https://github.com/tumourlove/monolith/pull/54) by **@MaxenceEpitech**. Old code read raw `FRawAnimSequenceTrack` via the deprecated `IAnimationDataModel::GetBoneAnimationTracks()` accessor (wrapped in `PRAGMA_DISABLE_DEPRECATION_WARNINGS`). That path returns the **uncompressed source tracks** which are missing on AnimSequences that have already been baked / compressed — so callers got `Bone track not found: <bone>` even when the bone was clearly animated and visible in the asset. Switched to the public, non-deprecated pair: `IsValidBoneTrackName()` to validate the bone (no false-positive on missing source tracks) and `GetBoneTrackTransforms(FName, TArray<FTransform>&)` to evaluate per-key `FTransform`s (works regardless of underlying compressed storage). Adds an empty-track guard so `AllTransforms.Num() == 0` returns a clean error instead of producing `num_keys=0` and a misleading `start_frame > end_frame` message.
 
 ### Changed

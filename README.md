@@ -329,6 +329,7 @@ A stdio-to-HTTP proxy that keeps Claude Code MCP sessions alive across editor re
 
 - JSON-RPC message handling with editor query splitting
 - Background health poll with `notifications/tools/list_changed`
+- Stable cached/seed `tools/list` response when the editor is down at AI-client startup
 - Tool deduplication and action allowlist/denylist
 - Built with WinHTTP + nlohmann/json, zero UE dependency
 
@@ -347,7 +348,7 @@ A stdio-to-HTTP proxy that keeps Claude Code MCP sessions alive across editor re
 
 **Migrating from Python proxy:** Replace `{"command": "python", "args": ["Plugins/Monolith/Scripts/monolith_proxy.py"]}` with the config above. The Python scripts remain as deprecated fallbacks.
 
-**Source:** `Tools/MonolithProxy/monolith_proxy.cpp` (775 lines)
+**Source:** `Tools/MonolithProxy/monolith_proxy.cpp`
 
 ### monolith_query.exe — Offline Query Tool
 
