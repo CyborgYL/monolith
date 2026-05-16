@@ -17,6 +17,17 @@
 #include "Registry/UIPropertyPathCache.h"
 #include "Registry/UIReflectionHelper.h"
 
+// Bug #5 fix (2026-05-16 UI gap audit): compile_widget now surfaces
+// FCompilerResultsLog messages as errors[]/warnings[] arrays in the response
+// payload, matching the shape blueprint_query("compile_blueprint") returns.
+// FCompilerResultsLog is the canonical channel — IWidgetCompilerLog (which
+// UCommonBoundActionBar::ValidateCompiledDefaults writes through) routes back
+// into the same results log for widget BPs, so capturing here covers both
+// the compiler-graph errors AND the validator-emitted ones.
+#include "Kismet2/CompilerResultsLog.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "Logging/TokenizedMessage.h"
+
 void FMonolithUIActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
     Registry.RegisterAction(
@@ -73,13 +84,13 @@ void FMonolithUIActions::RegisterActions(FMonolithToolRegistry& Registry)
 
     Registry.RegisterAction(
         TEXT("ui"), TEXT("set_widget_property"),
-        TEXT("Set a property on a widget (text, color, opacity, visibility, etc.). Default mode gates writes through the per-type curated allowlist; pass raw_mode=true to bypass the gate (legacy compat)."),
+        TEXT("Set a property on a widget (text, color, opacity, visibility, etc.). Default mode gates writes through the per-type curated allowlist; pass raw_mode=true to bypass the gate (legacy compat). The new value can be supplied as `value` OR the alias `property_value` (Bug #6 fix)."),
         FMonolithActionHandler::CreateStatic(&HandleSetWidgetProperty),
         FParamSchemaBuilder()
             .Required(TEXT("asset_path"), TEXT("string"), TEXT("Widget Blueprint asset path"))
             .Required(TEXT("widget_name"), TEXT("string"), TEXT("Target widget name"))
             .Required(TEXT("property_name"), TEXT("string"), TEXT("Property path. Dotted segments allowed (e.g. 'Padding.Left'). Allowlist-gated unless raw_mode=true."))
-            .Required(TEXT("value"), TEXT("string"), TEXT("Property value. Strings, numbers, booleans, JSON arrays/objects all accepted; struct types (Vector2D/LinearColor/Margin/Vector4/SlateColor) accept multiple shapes."))
+            .Required(TEXT("value"), TEXT("string"), TEXT("Property value (alias: 'property_value'). Strings, numbers, booleans, JSON arrays/objects all accepted; struct types (Vector2D/LinearColor/Margin/Vector4/SlateColor) accept multiple shapes."))
             .Optional(TEXT("compile"), TEXT("boolean"), TEXT("Compile after setting"), TEXT("false"))
             .Optional(TEXT("raw_mode"), TEXT("boolean"), TEXT("Bypass the allowlist gate (legacy unconditional ImportText_Direct path). Default false."), TEXT("false"))
             .Build()
@@ -602,11 +613,28 @@ FMonolithActionResult FMonolithUIActions::HandleSetWidgetProperty(const TSharedP
     FString PropertyName = Params->GetStringField(TEXT("property_name"));
     const bool bRawMode = MonolithUIInternal::GetOptionalBool(Params, TEXT("raw_mode"), false);
 
-    // Pull `value` as the raw JSON value so non-string shapes survive.
+    // Bug #6 fix (2026-05-16 UI gap audit): accept BOTH `value` and
+    // `property_value` as aliases. Discovery output's schema description
+    // historically left the param name ambiguous; some callers (and the
+    // BlackMassUI Phase 4 subagent) probed with `property_value` and got
+    // "Missing required param" followed by a SECOND error about wbp_path
+    // when the param was renamed — the dual-failure mode wasted calls. We
+    // now accept either spelling and surface a single coherent error that
+    // names both forms AND preserves wbp_path in the message.
+    //
+    // Pull as the raw JSON value so non-string shapes (numbers, booleans,
+    // arrays, struct objects) survive — FUIReflectionHelper dispatches on
+    // FProperty kind, not on FString shape.
     TSharedPtr<FJsonValue> ValueJson = Params->TryGetField(TEXT("value"));
     if (!ValueJson.IsValid())
     {
-        return FMonolithActionResult::Error(TEXT("set_widget_property: missing 'value'"));
+        ValueJson = Params->TryGetField(TEXT("property_value"));
+    }
+    if (!ValueJson.IsValid())
+    {
+        return FMonolithActionResult::Error(FString::Printf(
+            TEXT("set_widget_property: missing required param 'value' (alias: 'property_value') on wbp_path='%s', widget_name='%s', property_name='%s'"),
+            *AssetPath, *WidgetName, *PropertyName));
     }
 
     FMonolithActionResult Err;
@@ -715,6 +743,11 @@ FMonolithActionResult FMonolithUIActions::HandleSetWidgetProperty(const TSharedP
 }
 
 // --- compile_widget ---
+// Bug #5 fix (2026-05-16 UI gap audit): the action now always returns
+// errors[] + warnings[] + notes[] arrays harvested from FCompilerResultsLog.
+// The shape mirrors blueprint_query("compile_blueprint") so callers can use
+// a single parser. Pattern mirrored from
+// MonolithBlueprintCompileActions.cpp:80 (HandleCompileBlueprint).
 FMonolithActionResult FMonolithUIActions::HandleCompileWidget(const TSharedPtr<FJsonObject>& Params)
 {
     FString AssetPath = Params->GetStringField(TEXT("asset_path"));
@@ -722,29 +755,116 @@ FMonolithActionResult FMonolithUIActions::HandleCompileWidget(const TSharedPtr<F
     UWidgetBlueprint* WBP = MonolithUIInternal::LoadWidgetBlueprint(AssetPath, Err);
     if (!WBP) return Err;
 
-    FKismetEditorUtilities::CompileBlueprint(WBP);
+    // Drive the compile through the FCompilerResultsLog-capturing overload so
+    // the Messages array carries every Tokenized diagnostic the validator and
+    // the K2 compiler emit. SkipGarbageCollection matches the blueprint_query
+    // flow's flags and keeps the action interactive-fast.
+    FCompilerResultsLog Results;
+    FKismetEditorUtilities::CompileBlueprint(WBP, EBlueprintCompileOptions::SkipGarbageCollection, &Results);
+
+    TArray<TSharedPtr<FJsonValue>> ErrorArr;
+    TArray<TSharedPtr<FJsonValue>> WarnArr;
+    TArray<TSharedPtr<FJsonValue>> NoteArr;
+    for (const TSharedRef<FTokenizedMessage>& Msg : Results.Messages)
+    {
+        TSharedPtr<FJsonObject> MsgObj = MakeShared<FJsonObject>();
+        MsgObj->SetStringField(TEXT("message"), Msg->ToText().ToString());
+
+        const EMessageSeverity::Type Sev = Msg->GetSeverity();
+        if (Sev == EMessageSeverity::Error)
+        {
+            ErrorArr.Add(MakeShared<FJsonValueObject>(MsgObj));
+        }
+        else if (Sev == EMessageSeverity::Warning)
+        {
+            WarnArr.Add(MakeShared<FJsonValueObject>(MsgObj));
+        }
+        else
+        {
+            // Info / PerformanceWarning / unknown all surface as notes so
+            // callers see them without conflating with hard errors.
+            NoteArr.Add(MakeShared<FJsonValueObject>(MsgObj));
+        }
+    }
+
+    // Status-string mapping shared across the two response paths (error vs
+    // success). Keep aligned with blueprint_query("compile_blueprint") so
+    // callers can switch on the same set of tokens.
+    FString StatusStr;
+    switch (WBP->Status)
+    {
+    case BS_Unknown:              StatusStr = TEXT("unknown"); break;
+    case BS_Dirty:                StatusStr = TEXT("dirty"); break;
+    case BS_Error:                StatusStr = TEXT("error"); break;
+    case BS_UpToDate:             StatusStr = TEXT("up_to_date"); break;
+    case BS_UpToDateWithWarnings: StatusStr = TEXT("up_to_date_with_warnings"); break;
+    case BS_BeingCreated:         StatusStr = TEXT("being_created"); break;
+    default:                      StatusStr = TEXT("other"); break;
+    }
 
     // Phase K — when the compiler reports BS_Error, surface that as an
     // FUISpecError-shaped failure rather than a success-with-status=error.
     // The LLM consumer can branch cleanly on bSuccess instead of having to
-    // parse a string status field from a "successful" call.
+    // parse a string status field from a "successful" call. Bug #5 evolution:
+    // append the FCompilerResultsLog ValidOptions list with the verbatim
+    // error/warning messages — the dispatcher (MonolithHttpServer:716)
+    // surfaces only the FMonolithActionResult::ErrorMessage text on a failed
+    // call, so we pack the diagnostic surface INTO that text via the
+    // FUISpecError ValidOptions field (which ToLLMReport() renders as a
+    // labelled `valid_options:` block in the error body).
     if (WBP->Status == BS_Error)
     {
+        // Compose the ValidOptions list as "[Error] <msg>" / "[Warn] <msg>"
+        // strings so the LLM sees both severity AND text without having to
+        // parse a nested JSON object inside an error string.
+        TArray<FString> Diagnostics;
+        Diagnostics.Reserve(ErrorArr.Num() + WarnArr.Num());
+        for (const TSharedPtr<FJsonValue>& V : ErrorArr)
+        {
+            const TSharedPtr<FJsonObject> Obj = V.IsValid() ? V->AsObject() : nullptr;
+            FString MsgText;
+            if (Obj.IsValid()) Obj->TryGetStringField(TEXT("message"), MsgText);
+            Diagnostics.Add(FString::Printf(TEXT("[Error] %s"), *MsgText));
+        }
+        for (const TSharedPtr<FJsonValue>& V : WarnArr)
+        {
+            const TSharedPtr<FJsonObject> Obj = V.IsValid() ? V->AsObject() : nullptr;
+            FString MsgText;
+            if (Obj.IsValid()) Obj->TryGetStringField(TEXT("message"), MsgText);
+            Diagnostics.Add(FString::Printf(TEXT("[Warn] %s"), *MsgText));
+        }
+
+        // Build a compact suggested_fix that names the first error message
+        // verbatim so callers don't have to dig into valid_options[] for
+        // the basic "what went wrong" answer.
+        FString FirstErrorPreview;
+        if (ErrorArr.Num() > 0)
+        {
+            const TSharedPtr<FJsonObject> Obj = ErrorArr[0]->AsObject();
+            if (Obj.IsValid()) Obj->TryGetStringField(TEXT("message"), FirstErrorPreview);
+        }
+        const FString FailDetail = FirstErrorPreview.IsEmpty()
+            ? FString::Printf(TEXT("Blueprint '%s' compiled with errors (BS_Error). See valid_options[] for diagnostics."), *AssetPath)
+            : FString::Printf(TEXT("Blueprint '%s' compiled with errors (BS_Error): %s"), *AssetPath, *FirstErrorPreview);
+
         FUISpecError E = MonolithUIInternal::MakeSpecError(
             TEXT("Compile"),
             TEXT("/asset_path"),
-            FString::Printf(TEXT("Blueprint '%s' compiled with errors (BS_Error)."), *AssetPath),
-            TEXT("Open the WBP in the editor to see compiler diagnostics, or call ui::get_widget_tree to inspect the structural state."));
+            FailDetail,
+            TEXT("Inspect valid_options[] in this error for the full FCompilerResultsLog surface, or call blueprint_query::compile_blueprint for the same diagnostics with per-node error linkage."),
+            MoveTemp(Diagnostics));
         return MonolithUIInternal::MakeErrorFromSpecError(E, -32603);
     }
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("asset_path"), AssetPath);
     Result->SetBoolField(TEXT("compiled"), true);
-    Result->SetStringField(TEXT("status"),
-        WBP->Status == BS_UpToDate ? TEXT("up_to_date") :
-        WBP->Status == BS_Dirty    ? TEXT("dirty") :
-        WBP->Status == BS_Unknown  ? TEXT("unknown") : TEXT("other"));
+    Result->SetStringField(TEXT("status"), StatusStr);
+    Result->SetArrayField(TEXT("errors"), ErrorArr);
+    Result->SetArrayField(TEXT("warnings"), WarnArr);
+    Result->SetArrayField(TEXT("notes"), NoteArr);
+    Result->SetNumberField(TEXT("error_count"), ErrorArr.Num());
+    Result->SetNumberField(TEXT("warning_count"), WarnArr.Num());
     return FMonolithActionResult::Success(Result);
 }
 

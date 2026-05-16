@@ -86,8 +86,8 @@ Counts re-verified against `RegisterAction(TEXT("ui"), ...)` call sites on 2026-
 | `get_widget_tree` | `asset_path` | Get the full widget hierarchy tree |
 | `add_widget` | `asset_path`, `widget_class`, `parent_slot` | Add a widget to the widget tree |
 | `remove_widget` | `asset_path`, `widget_name` | Remove a widget from the widget tree |
-| `set_widget_property` | `asset_path`, `widget_name`, `property_name`, `value` | Set a property on a widget via reflection |
-| `compile_widget` | `asset_path` | Compile the Widget Blueprint and return errors/warnings |
+| `set_widget_property` | `asset_path`, `widget_name`, `property_name`, `value` (alias: `property_value`) | Set a property on a widget via reflection. Allowlist-gated unless `raw_mode=true`. `value` and `property_value` are accepted as aliases since the 2026-05-16 Bug #6 fix. |
+| `compile_widget` | `asset_path` | Compile the Widget Blueprint. Returns `errors[]`, `warnings[]`, `notes[]`, `error_count`, `warning_count` on success — shape mirrors `blueprint_query::compile_blueprint`. On BS_Error, the diagnostic list is packed into `valid_options[]` of the structured error (Bug #5 fix, 2026-05-16). |
 | `list_widget_types` | none | List all available widget classes that can be instantiated |
 
 **Slot Operations (3)**
@@ -189,6 +189,8 @@ Class-as-data: style creators (`create_common_button_style`, `create_common_text
 
 ### Category B: Buttons + Styling (9 actions)
 
+> **Allowlist note (2026-05-16):** `CommonButtonBase` token now has `TriggeringInputAction` (FDataTableRowHandle) and `bDisplayInActionBar` (bool) on its curated allowlist. `set_widget_property` writes these without requiring `raw_mode=true` (Bug #2 fix).
+
 | Action | Params | Description |
 |--------|--------|-------------|
 | `convert_button_to_common` | `asset_path`, `widget_name` | Replace a UButton with UCommonButtonBase. Does NOT auto-transfer children; the old child subtree is retired and child variable GUIDs are pruned before compile. |
@@ -208,7 +210,7 @@ Class-as-data: style creators (`create_common_button_style`, `create_common_text
 | `create_input_action_data_table` | `save_path`, `table_name` | Create a DataTable for CommonUI input action definitions |
 | `add_input_action_row` | `table_path`, `row_name`, `action_spec` | Add a row to an input action DataTable |
 | `bind_common_action_widget` | `asset_path`, `widget_name`, `action_row` | Bind a `UCommonActionWidget` to display a specific input glyph |
-| `create_bound_action_bar` | `save_path` | Scaffold a WBP containing a `UCommonBoundActionBar` |
+| `create_bound_action_bar` | `wbp_path`, `widget_name`, `parent_widget?`, `action_button_class?` | Add a `UCommonBoundActionBar` to an existing WBP. Writes `ActionButtonClass` (default: `/Game/Monolith/CommonUI/MonolithDefaultCommonButton.MonolithDefaultCommonButton_C`) so the WBP compiles cleanly — bare bars previously failed `ValidateCompiledDefaults` (Bug #4 fix, 2026-05-16). |
 | `get_active_input_type` | none | [RUNTIME] Query the current active input type (gamepad, keyboard, touch) |
 | `set_input_type_override` | `input_type` | [RUNTIME] Force a specific input type for glyph display |
 | `list_platform_input_tables` | none | List all registered platform input DataTables |
@@ -294,6 +296,17 @@ The MonolithGAS module also registers four cross-namespace aliases under `ui::` 
 2. `set_initial_focus_target` requires the target WBP to expose a `DesiredFocusTargetName` or `InitialFocusTargetName` FName UPROPERTY and override `NativeGetDesiredFocusTarget`. Action errors out if neither property exists.
 3. `show_common_message` is fire-and-forward — async result-binding (Yes/No) requires the dialog WBP to handle internally. No MCP-side delegate routing yet.
 4. `dump_action_router_state` cannot read `UCommonUIActionRouterBase::CurrentInputLocks` (private-transient in engine). Engine PR candidate (M0.7).
+
+### Resolved (2026-05-16 UI Gap Audit — Phase 1 Tier 1)
+
+The following correctness bugs were fixed in the 2026-05-16 sprint (plan: [`Docs/plans/2026-05-16-monolith-ui-gap-audit.md`](../../../../Docs/plans/2026-05-16-monolith-ui-gap-audit.md)):
+
+- **Bug #1 — `create_common_*_style` hash-cache mis-keying.** `FMonolithUIStyleService::ComputeContentHash` now mixes `AssetName` into the canonical buffer. Two empty-property-bag requests under different names previously collided on the Step-3 hash cache and returned the wrong asset on the second call. New three-arg `ComputeContentHash(StyleClass, AssetName, Properties)` overload is the cache-lookup path; the two-arg overload is retained for legacy tests verifying property-bag equivalence.
+- **Bug #2 — CommonUI button allowlist coverage.** `TriggeringInputAction` (FDataTableRowHandle) and `bDisplayInActionBar` (bool) are now on the curated allowlist for the `CommonButtonBase` token. Callers wiring action-bar bindings no longer need `raw_mode=true`.
+- **Bug #3 — `wrap_with_reduce_motion_gate` silent skip.** Now returns a `skipped[]` array with `{wbp, reason, missing_property, suggested_parent_classes[]}` per entry. The legacy `missing_property[]` array is preserved one release for backwards compatibility.
+- **Bug #4 — `create_bound_action_bar` BS_Error.** Action now writes `ActionButtonClass` on the constructed `UCommonBoundActionBar` so the WBP compiles cleanly. New optional `action_button_class` param (string, defaults to `/Game/Monolith/CommonUI/MonolithDefaultCommonButton.MonolithDefaultCommonButton_C`).
+- **Bug #5 — `compile_widget` diagnostics.** Action now returns `errors[]`, `warnings[]`, `notes[]`, `error_count`, `warning_count` on success. On BS_Error, the diagnostic list is packed into `valid_options[]` of the FUISpecError so the LLM still receives every message text on a failed call. Shape mirrors `blueprint_query("compile_blueprint")`.
+- **Bug #6 — `set_widget_property` schema clarification.** The new value can now be supplied as `value` OR `property_value` (alias). Missing-value error preserves `wbp_path`, `widget_name`, `property_name` in the message body for caller-side context.
 
 ---
 
