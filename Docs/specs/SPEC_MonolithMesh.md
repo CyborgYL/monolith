@@ -122,6 +122,40 @@
 
 > **Procedural Geometry Overhaul (2026-03-28):** The proc gen actions (`create_parametric_mesh`, `create_structure`, `create_horror_prop`, etc.) now feature sweep-based thin walls (`wall_mode: "sweep"` default), auto snap-to-floor (`snap_to_floor` param), auto-collision on all saved meshes (`collision: auto/box/convex/complex_as_simple/none`), human-scale defaults (stairs 90/28/18cm, doors 90cm, floor 3cm), door/window/vent trim frames (`add_trim` param), and vent openings via `create_structure`. Collision-aware prop placement uses `collision_mode: none/warn/reject/adjust` on scatter actions with SweepSingle box traces for floor finding. All proc gen actions support `use_cache` and `auto_save` params for the caching system.
 
+### Mesh Import (`import_mesh` — automated FBX/glTF pipeline)
+
+Handler: `FMonolithMeshTechArtActions::ImportMesh` (`Source/MonolithMesh/Private/MonolithMeshTechArtActions.cpp`). Drives the engine's `IAssetTools::ImportAssetsAutomated` path via `UFbxImportUI` + `UFbxFactory` for FBX inputs (and the engine default factory for glTF / other formats). Backwards-compatible with the original static-mesh-only contract: omitting the new skeletal flags reproduces pre-PR behaviour exactly.
+
+**Schema:**
+
+| Param | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `files` | array<string> | required | — | Absolute file paths to import (FBX, glTF, etc.) |
+| `destination` | string | required | — | Content path (e.g. `/Game/Characters/Skeleton/MyCharacter`) |
+| `replace_existing` | boolean | optional | `false` | Overwrite assets that already exist at `destination` |
+| `combine_meshes` | boolean | optional | `true` | Combine all FBX sub-meshes into a single asset |
+| `generate_lightmap_uvs` | boolean | optional | `true` | Generate a lightmap UV channel on import |
+| `auto_generate_collision` | boolean | optional | `true` | Generate collision primitives on import |
+| `normal_import_method` | string | optional | `ImportNormalsAndTangents` | `ImportNormals` / `ImportNormalsAndTangents` / `ComputeNormals` |
+| `material_import` | string | optional | `create_new` | `create_new` (new MIs), `find_existing` (reuse by name), `skip` (no material/texture import) |
+| **`import_as_skeletal`** | boolean | optional | `false` | **NEW.** Selects `USkeletalMesh` import path: sets `UFbxImportUI::bImportAsSkeletal=true` + `MeshTypeToImport=FBXIT_SkeletalMesh`. Engine auto-creates a `USkeleton` companion asset under `destination` when no existing skeleton is supplied. |
+| **`import_animations`** | boolean | optional | `false` | **NEW.** Imports animation sequences alongside the skeletal mesh via `UFbxImportUI::bImportAnimations=true`. **Forces `import_as_skeletal=true`** if not already set — animation import is not paired with the static-mesh branch. |
+
+**FBX branch behaviour** (when at least one input file ends in `.fbx`):
+
+- **Skeletal path** (`import_as_skeletal=true` OR `import_animations=true`): skeletal mesh + auto-created skeleton; anim sequences imported only when `import_animations=true`.
+- **Static path** (default, no skeletal flags): identical to pre-PR behaviour — `bImportAsSkeletal=false`, `MeshTypeToImport=FBXIT_StaticMesh`, `bImportAnimations=false`.
+
+**Response shape:** for each imported `UObject`, returns `{ asset_path, type }`. When the imported object is a `UStaticMesh`, additional fields are populated: `vertex_count`, `triangle_count`, `material_slots[]`, `bounds`. The skeletal-result branch currently emits only `{ asset_path, type }` per imported asset — bone count, skeleton path, and morph-target metadata enrichment is **(WISHLIST)** for the skeletal-result JSON branch.
+
+**Wishlist / v2 follow-ups:**
+
+- **(WISHLIST)** `skeleton_asset` param — supply an existing `USkeleton` asset path to bind imported animations to, rather than auto-creating a new skeleton under `destination`. Enables retargeting onto an existing character rig.
+- **(WISHLIST)** Enriched skeletal-result JSON branch — bone count, skeleton asset path, socket count, morph target count, physics asset reference parity with the existing `UStaticMesh` stat block.
+- **(WISHLIST)** glTF skeletal/animation parity — confirm glTF factory honors the same boolean semantics, or document the divergence.
+
+**Credit:** integration-test contribution from @4698to (downstream UE 5.7 fork). See `Docs/FEEDBACK_import_mesh_skeletal_params.md` for the upstream contributor's full design rationale (bilingual EN/中文).
+
 ### Procedural Town Generator (45 gated + 1 always-registered actions — 11 sub-projects) — WORK-IN-PROGRESS
 
 > **Status:** Work-in-progress, disabled by default (`bEnableProceduralTownGen = false`). Fix Plans v2-v5 addressed 27+ issues but fundamental geometry problems remain (wall misalignment, room separation). Very much a WIP — unless you're willing to dig in and help improve it, it's best left alone.

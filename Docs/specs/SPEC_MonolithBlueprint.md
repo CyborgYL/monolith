@@ -111,4 +111,23 @@
 **Existing CDO actions also gain `dry_run` + `strict` optional params:**
 - `set_cdo_property` — Phase 1 adds `dry_run`?, `strict`? optional params. When `dry_run=true`, validates the proposed write via the reflection walker and returns the per-field report without entering the engine edit cradle. Same `strict` semantics as the plural action.
 
+### Bulk Fill & Describe Surface (2026-05-11)
+
+`MonolithBlueprintBulkFillAdapter` registers under `FMonolithBulkFillRegistry` for the `blueprint` namespace, exposed via the framework-level `bulk_fill_query("apply", ...)` and `describe_query("schema", ...)` dispatchers. Phase 1 of the MCP ergonomics rollout (design spec `Docs/plans/2026-05-11-monolith-mcp-ergonomics-design.md`, implementation plan `Docs/plans/2026-05-11-monolith-mcp-ergonomics.md`).
+
+**Surface summary.** `bulk_fill_query("apply", target_namespace="blueprint", target="<asset_path>", tree={...}, dry_run=<bool>, strict=<bool>)` walks the JSON tree against the target asset's CDO reflection schema and either commits atomically (under the standard Blueprint edit cradle preserved per Issue #29) or fails with a per-key error map. `describe_query("schema", target_namespace="blueprint", target="<asset_path>")` returns the settable CDO surface — UPROPERTY names, UE reflection types, ImportText forms, enum value lists, clamp ranges, nested struct/array/map/set children.
+
+**fill_kind catalogue (1 — enumerated against `MonolithBlueprintBulkFillAdapter.cpp`):**
+
+| `fill_kind` | Target shape | Walks |
+|---|---|---|
+| `CDOProperties` | Blueprint asset OR generic UObject (DataAsset, DataTable, GameplayEffect, AbilitySet, InputAction) | nested JSON object keyed by UPROPERTY names against the asset's CDO; dual-path asset load tries `LoadAssetByPath<UBlueprint>` then falls back to generic UObject `StaticLoadObject` |
+
+**Adapter convenience surface.** The two `blueprint::set_cdo_properties` / `blueprint::describe_cdo_schema` actions documented above are aliases routed through this same adapter — they exist for symmetry with the read-side `get_cdo_properties` and skip the `target_namespace="blueprint"` parameter. Authoring `blueprint::set_cdo_properties` and `bulk_fill_query("apply", target_namespace="blueprint", ...)` are semantically identical; the framework call is preferred when wiring multi-namespace tooling that already routes through the central dispatchers.
+
+**Limitations / v1.1 follow-ups.**
+
+- Soft refs (`PC_SoftObject` / `PC_SoftClass`) and `PC_Interface` defer to the existing primitives path — `(WISHLIST v1.1)` for first-class reflection-walker support.
+- Cross-package `TObjectPtr` field writes inherit the v0.14.8 PR #43 `RF_Transient` fix — adapters do not need to defend against package-flag corruption.
+
 ---
