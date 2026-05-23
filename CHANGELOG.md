@@ -40,6 +40,8 @@ Public in-tree action count: **~1344 actions across 19 in-tree namespaces.** Per
 
 - **NodeGuid correctness — every MCP node-creation path now assigns a valid `NodeGuid` ([gap #15](https://github.com/tumourlove/monolith/issues/15)).** `add_node`, `add_event_node`, `add_timeline`, `promote_pin_to_variable`, `add_comment_node`, and `add_property_access` now call `UEdGraphNode::CreateNewGuid()` so authored nodes carry valid GUIDs and no longer risk invalid-GUID warnings on compile/save.
 
+- **C2011 struct redefinition under unity builds in MonolithBABridge** ([PR #61](https://github.com/tumourlove/monolith/pull/61) by **@tc-imba**). `DECLARE_LOG_CATEGORY_EXTERN` for `LogMonolithBABridge` was duplicated at file scope across two `.cpp` files; the declaration is hoisted into `MonolithBAFormatterImpl.h` (outside the `WITH_BLUEPRINT_ASSIST` guard) so both the BA-enabled and empty-shell log paths share a single declaration.
+
 ### Changed
 
 - **`animation.add_anim_graph_node` now supports arbitrary concrete custom AnimGraph node classes** via an optional `node_class` parameter, while preserving the existing built-in `node_type` aliases. The action resolves loaded `UAnimGraphNode_Base` subclasses by full path or unique short/class name, rejects abstract/non-AnimGraph/ambiguous/schema-incompatible classes before mutation, and keeps stock node aliases available for release builds.
@@ -58,7 +60,7 @@ Public in-tree action count: **~1344 actions across 19 in-tree namespaces.** Per
 
 ### Contributors
 
-Big thanks to **@4698to** for [PR #58](https://github.com/tumourlove/monolith/pull/58) (`mesh.import_mesh` skeletal-mesh + animation import params) and to **@middle233** for [PR #60](https://github.com/tumourlove/monolith/pull/60) (event-aware Niagara summary semantics + `validate_system` event-chain reasoning). Author attribution preserved on every cherry-picked commit.
+Big thanks to **@4698to** for [PR #58](https://github.com/tumourlove/monolith/pull/58) (`mesh.import_mesh` skeletal-mesh + animation import params), to **@middle233** for [PR #60](https://github.com/tumourlove/monolith/pull/60) (event-aware Niagara summary semantics + `validate_system` event-chain reasoning), and to **@tc-imba** for [PR #61](https://github.com/tumourlove/monolith/pull/61) (MonolithBABridge unity-build C2011 fix + root-cause analysis). Author attribution preserved on every cherry-picked commit.
 
 ## [0.14.10] - 2026-05-09
 
