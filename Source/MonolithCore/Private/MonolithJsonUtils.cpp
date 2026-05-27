@@ -106,20 +106,47 @@ namespace MonolithResponseShapingDetail
 		{
 			return false;
 		}
+
+		// Canonical native-array path (covers automation tests + well-formed JSON callers).
 		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
-		if (!Params->TryGetArrayField(Key, Arr) || !Arr)
+		if (Params->TryGetArrayField(Key, Arr) && Arr)
 		{
-			return false;
-		}
-		for (const TSharedPtr<FJsonValue>& V : *Arr)
-		{
-			FString S;
-			if (V.IsValid() && V->TryGetString(S))
+			for (const TSharedPtr<FJsonValue>& V : *Arr)
 			{
-				Out.Add(S);
+				FString S;
+				if (V.IsValid() && V->TryGetString(S))
+				{
+					Out.Add(S);
+				}
+			}
+			return Out.Num() > 0;
+		}
+
+		// String-fallback path: Claude Code serializes top-level array args as JSON-encoded
+		// strings (e.g. `_fields:"[\"count\"]"`). Mirror the unwrap pattern used for "params"
+		// in MonolithHttpServer.cpp:691-701.
+		FString StrValue;
+		if (Params->TryGetStringField(Key, StrValue) && !StrValue.IsEmpty())
+		{
+			TSharedPtr<FJsonValue> ParsedValue;
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(StrValue);
+			if (FJsonSerializer::Deserialize(Reader, ParsedValue) && ParsedValue.IsValid() && ParsedValue->Type == EJson::Array)
+			{
+				const TArray<TSharedPtr<FJsonValue>>& ParsedArr = ParsedValue->AsArray();
+				for (const TSharedPtr<FJsonValue>& V : ParsedArr)
+				{
+					FString S;
+					if (V.IsValid() && V->TryGetString(S))
+					{
+						Out.Add(S);
+					}
+				}
+				UE_LOG(LogMonolith, Verbose, TEXT("ReadStringArrayParam: recovered stringified JSON array for key '%s' (%d entries)"), Key, Out.Num());
+				return Out.Num() > 0;
 			}
 		}
-		return Out.Num() > 0;
+
+		return false;
 	}
 
 	/** A value counts as "empty" for _compact_json if it is null, "", {}, or []. Numbers/bools/nonempty pass. */
@@ -177,7 +204,19 @@ void ApplyResponseShaping(
 	const bool bHasOmit   = MonolithResponseShapingDetail::ReadStringArrayParam(Params, TEXT("_omit"),   OmitSet);
 
 	bool bCompact = false;
-	Params->TryGetBoolField(TEXT("_compact_json"), bCompact);
+	if (!Params->TryGetBoolField(TEXT("_compact_json"), bCompact))
+	{
+		// String-fallback: Claude Code may serialize the bool as the string "true"/"false".
+		FString CompactStr;
+		if (Params->TryGetStringField(TEXT("_compact_json"), CompactStr) && !CompactStr.IsEmpty())
+		{
+			bCompact = CompactStr.Equals(TEXT("true"), ESearchCase::IgnoreCase) || FCString::ToBool(*CompactStr);
+			if (bCompact)
+			{
+				UE_LOG(LogMonolith, Verbose, TEXT("ApplyResponseShaping: recovered stringified bool for '_compact_json' ('%s')"), *CompactStr);
+			}
+		}
+	}
 
 	// Mutually exclusive: _fields wins, _omit ignored, warn the caller.
 	bool bApplyOmit = bHasOmit;
