@@ -98,6 +98,8 @@ Standard codes mirror the JSON-RPC 2.0 spec. Monolith server-defined codes live 
 
 All three sources emit free-text strings into the same array. No schema or envelope change — `FMonolithActionResult` shape is unchanged.
 
+**`error.data.suggestions` channel (Phase 2, 2026-05-27).** On `ErrMethodNotFound` / `ErrInvalidParams` dispatch failures where the action name or namespace is unknown, the error envelope carries an optional `data: { kind: "action"|"namespace", suggestions: [{namespace, action, score}, ...] }` payload. Top-3 fuzzy matches over the registry keyspace via UE's `Algo::LevenshteinDistance`; normalised score = `1.0 - dist/max(len)`. The dispatcher snapshots the keyspace under `FScopeLock`, drops the lock, then scores and sorts — no read-path latency spike on the hot dispatch loop. Asset-path and property-name fuzzy matching are explicitly OUT-OF-SCOPE (O(N·L²) over 10K+ registry entries kills it; property-name overlap with the K3 unknown-key warning produces noise). See §14.4. (WISHLIST) K3 unknown-key counter as telemetry feedback for evaluating future retry-thrash interventions.
+
 ### Module Loading
 
 | Module | Loading Phase | Type |
@@ -698,6 +700,110 @@ All four bind `Type = "string"` and `Default = ""`. Use the non-sugar overloads 
 **Dispatch ordering.** The `AssetPath` rewrite block in `FMonolithToolRegistry::ExecuteAction` runs AFTER K2 alias rewrite (so the rewrite sees the canonical key) and BEFORE the K3 unknown-key check. Only `Kind == AssetPath` params are rewritten; `DiskPath` / `GameplayTag` / `Other` all pass through untouched. Warnings funnel into the same `warnings[]` channel as §14.1's response-shaping warnings and the K3 unknown-param soft-warns.
 
 **Per-namespace param tagging (WISHLIST, Phase 1.1+).** Of ~929 `.Required(...)` / `.Optional(...)` occurrences across 30 `*Actions.cpp` files, none have been migrated to `RequiredAssetPath` / `OptionalAssetPath` yet — back-compat is preserved (untagged params default to `Kind == Other` and opt OUT of any path normalisation). The per-namespace audit pass to retrofit `asset_path` / `wbp_path` / `material_path` / etc. to `AssetPath`-kind is deferred to a Phase 1.1+ workstream and tracked in `Docs/plans/2026-05-27-mcp-llm-ergonomics.md` §3.D.
+
+### 14.3 MCP Tool Annotations on `tools/list` (Phase 2, 2026-05-27)
+
+`tools/list` now serialises four MCP-spec hint fields per tool so LLM clients can pre-filter destructive vs read-only calls without dispatching them first. Source: `FMonolithActionInfo` (per-action) and `FMonolithDispatcherAnnotations` (per-dispatcher), declared in `MonolithCore/Public/MonolithToolRegistry.h`.
+
+| Field | Wire key | Meaning |
+|-------|----------|---------|
+| `bReadOnlyHint` | `readOnlyHint` | Tool performs no state mutation. |
+| `bDestructiveHint` | `destructiveHint` | Tool may destroy / overwrite project state. |
+| `bIdempotentHint` | `idempotentHint` | Repeat calls with identical params yield identical effect. |
+| `Title` | `title` | Short human-readable display label. |
+
+**Wire encoding.** Annotations are only emitted on `tools/list` when at least one field is non-default — avoids ~1567 × 4 bytes of boilerplate per session init. Serialisation lives in `FMonolithHttpServer::HandleToolsList`.
+
+**Per-action vs per-dispatcher.** Single-action top-level tools (e.g. `monolith_discover`, `monolith_status`, `monolith_guide`, `monolith_reindex`) carry annotations on the underlying `FMonolithActionInfo`. Namespace dispatcher tools (`source_query`, etc.) carry annotations on a separate `FMonolithDispatcherAnnotations` struct via `FMonolithToolRegistry::SetDispatcherAnnotations` / `GetDispatcherAnnotations`, because per-action annotation is semantically wrong when sibling actions inside the same dispatcher disagree on `destructive` / `read-only`.
+
+**Annotated in v0.16.0+.** Five tools audited and tagged: `monolith_discover` (read-only + idempotent + title), `monolith_status` (read-only + idempotent + title), `monolith_guide` (read-only + idempotent + title), `monolith_reindex` (idempotent only — modifies cache state), `source_query` (read-only + idempotent — dispatcher-level, all child actions are pure index reads). Set sites: `MonolithCoreTools.cpp`, `MonolithGuideTool.cpp`, `MonolithSourceActions.cpp`.
+
+**Per-action annotation across the full 1567-action surface (WISHLIST).** Architecturally blocked by the 15-dispatcher collapse pattern — each `*_query` tool exposes many child actions with heterogeneous destructiveness. Dispatcher-level annotation is the only honest place for these. Per-action annotation would only be meaningful for the 5 standalone top-level tools, which is already done. Do not propose extending it.
+
+### 14.4 `did_you_mean` Fuzzy Match on Dispatch Errors (Phase 2, 2026-05-27)
+
+Unknown action / unknown namespace dispatch errors now carry a `data.suggestions` payload listing the top-3 closest registry keys. Implementation: `MonolithCore/Public/MonolithFuzzyMatch.h` + `MonolithFuzzyMatch.cpp`, called from `FMonolithToolRegistry::ExecuteAction` around lines 199–251.
+
+**Algorithm.** UE's `Algo::LevenshteinDistance` over the registry keyspace. Normalised score `1.0 - dist/max(len)` so closer matches score higher. Top-3 sorted descending.
+
+**Concurrency pattern.** Snapshot the registry keyspace under `FScopeLock`, drop the lock, then score and sort. The hot dispatch loop's lock is held only for the snapshot — scoring runs lock-free off a local copy. No read-path latency spike on dispatch.
+
+**Engage conditions.** Two paths only:
+
+1. Unknown action name within a known namespace — `error.data.kind = "action"`, suggestions are sibling actions in the same namespace ranked by distance to the supplied action name.
+2. Unknown namespace (top-level tool name unrecognised) — `error.data.kind = "namespace"`, suggestions are registered namespace names ranked by distance.
+
+**Error payload shape.**
+
+```json
+{
+  "error": {
+    "code": -32601,
+    "message": "...",
+    "data": {
+      "kind": "action",
+      "suggestions": [
+        { "namespace": "blueprint", "action": "create_blueprint", "score": 0.88 },
+        ...
+      ]
+    }
+  }
+}
+```
+
+**Out of scope.** Asset-path and property-name fuzzy matching deliberately omitted: O(N·L²) over a 10K+ asset registry kills the hot path, and property-name suggestions overlap with the K3 unknown-key warning channel — adding noise without information. (WISHLIST) K3 unknown-key counter as telemetry feedback for evaluating future retry-thrash interventions.
+
+### 14.5 `source_query("search_source")` Cursor Pagination (Phase 3, 2026-05-27)
+
+`source_query("search_source")` now supports opaque cursor pagination for large result sets. Implementation: `MonolithSource/Public/MonolithCursorCodec.h` + `MonolithCursorCodec.cpp`, called from `FMonolithSourceActions::HandleSearchSource`. Count helpers added to `FMonolithSourceDatabase`.
+
+**In-params.**
+
+| Param | Type | Meaning |
+|-------|------|---------|
+| `cursor` | `string?` | Optional opaque base64+JSON envelope. Omit on page 0; pass the previous response's `next_cursor` for subsequent pages. |
+
+**Out-params.**
+
+| Param | Type | Meaning |
+|-------|------|---------|
+| `next_cursor` | `string?` | Cursor to fetch the next page. `null` / omitted on the last page. |
+| `total_estimate` | `int?` | Total row count across all pages. Page 0 only — server-side `MATCH COUNT(*)` against the symbol + source FTS tables. ~50–200 ms cold cache, then cached inside the cursor for subsequent pages. |
+
+**Cursor envelope.** Base64-encoded JSON of shape `{ query_hash, symbol_page, source_page, cached_total_estimate }`. The decoder is fallible — empty / garbage / malformed input returns a clean `INVALID_CURSOR` error, never a panic.
+
+**Hard cap.** 1000 rows total per query. A request with `limit=2000` is clamped to 1000.
+
+**Query-hash mismatch.** If the supplied cursor's `query_hash` does not match the current request's query parameters, the dispatcher returns a clean `INVALID_CURSOR` error rather than silently serving the wrong slice.
+
+**Rerun-slice scheme, not keyset.** FTS5 `bm25()` rank is unstable under inserts / deletes (the rank drifts on next index update). Keyset / row-id cursors would silently skip or duplicate rows. The honest option for a moving FTS index is to rerun the query and slice the result set — accepting the rerun cost in exchange for correctness. Documented in the Phase 3 design audit.
+
+**`project_query("search")` cursor pagination (WISHLIST).** Architecturally blocked by `FMonolithIndexDatabase::FullTextSearch` at `MonolithIndexDatabase.cpp:1017-1079`, which performs a UNION-and-resort across multiple FTS tables without a deterministic ordering. A CTE / `UNION ALL` refactor with stable ordering is the prerequisite; deferred to a future Phase 5+ workstream.
+
+### 14.6 Proxy Call Log (Phase 4, 2026-05-27)
+
+Both proxies now emit a one-line-per-call JSONL log to `Saved/Logs/MonolithCalls.jsonl` (project-root-relative). Local-only, no phone-home.
+
+**Schema.** Eight fields per line:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `ts` | string | ISO-8601 UTC timestamp. |
+| `namespace` | string | Top-level tool name. |
+| `action` | string | Action name within the namespace (or `""` for single-action tools). |
+| `params_hash` | string | SHA-1 hex digest over canonicalised params JSON (sorted keys, no whitespace). |
+| `duration_ms` | int | Round-trip wall time including server dispatch + JSON parse. |
+| `ok` | bool | `true` on JSON-RPC success, `false` on JSON-RPC error. |
+| `error_code` | int? | JSON-RPC error code on failure; omitted on success. |
+| `result_bytes` | int | Size of the result body. |
+
+**Canonicalisation.** Params are JSON-canonicalised (recursively sorted object keys, no whitespace) before hashing — `FCrc::StrCrc32` is NOT used; SHA-1 over the canonical bytes is the contract. Identical params shapes hash identically regardless of input key order.
+
+**Parity.** Native proxy (`Tools/MonolithProxy/monolith_proxy.cpp`) and Python fallback (`Scripts/monolith_proxy.py`) implement the same schema. Native requires `build_proxy.bat` rebuild + Claude Code MCP reconnect to engage; Python picks up on next Claude Code start.
+
+**Opt-out.** Set `MONOLITH_CALL_LOG=0` in the environment. Default is on.
+
+**Rotation.** User-managed — delete `Saved/Logs/MonolithCalls.jsonl` to reset. The proxy appends; it does not truncate, rotate, or cap file size.
 
 ---
 
