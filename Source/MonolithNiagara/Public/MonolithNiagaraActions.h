@@ -36,6 +36,7 @@ public:
 	static FMonolithActionResult HandleSetEmitterProperty(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleRequestCompile(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCreateSystem(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateStatelessEmitter(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Module (12) ---
 	static FMonolithActionResult HandleGetOrderedModules(const TSharedPtr<FJsonObject>& Params);

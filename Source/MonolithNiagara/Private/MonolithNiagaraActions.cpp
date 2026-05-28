@@ -1818,6 +1818,11 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("save_path"), TEXT("Path to save the new system"))
 			.Optional(TEXT("template"), TEXT("string"), TEXT("Template system to base on"))
 			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("create_stateless_emitter"), TEXT("**Phase 0 stub.** Create a standalone UNiagaraStatelessEmitter (Lightweight Emitter) asset. Not yet implemented."),
+		FMonolithActionHandler::CreateStatic(&HandleCreateStatelessEmitter),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Path where the new Lightweight Emitter asset will be saved"))
+			.Build());
 
 	// Module (12)
 	Registry.RegisterAction(TEXT("niagara"), TEXT("get_ordered_modules"), TEXT("Get ordered modules in a script stage"),
@@ -3016,6 +3021,12 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystem(const TSharedP
 	}
 
 	return SuccessStr(NS->GetPathName());
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleCreateStatelessEmitter(const TSharedPtr<FJsonObject>& Params)
+{
+	// Phase 0 stub — factory call lands in Phase 1.
+	return FMonolithActionResult::Error(TEXT("not implemented"));
 }
 
 // ============================================================================
