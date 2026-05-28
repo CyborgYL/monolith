@@ -220,6 +220,11 @@
 			"Name": "MonolithLevelSequence",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithReflectionIntel",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
 		}
 	]
 }

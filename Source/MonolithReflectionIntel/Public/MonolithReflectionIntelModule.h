@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: MIT
+// Plan: Plugins/Monolith/Docs/plans/2026-05-28-reflection-intelligence.md (Phase 1).
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Delegates/IDelegateInstance.h"
+#include "Modules/ModuleManager.h"
+#include "Templates/UniquePtr.h"
+
+DECLARE_LOG_CATEGORY_EXTERN(LogMonolithReflectionIntel, Log, All);
+
+// UE 5.7: enum class declared without underlying type at UObject/UObjectGlobals.h:3216;
+// forward-declare without an underlying type to match (see MonolithSourceSubsystem.h for precedent).
+enum class EReloadCompleteReason;
+
+// Forward-declare to keep SQLiteCore out of this header (the TUniquePtr member
+// below only requires a forward decl; full definition is needed in the .cpp).
+class FSQLiteDatabase;
+
+/**
+ * MonolithReflectionIntel — Phase 1 of Reflection Intelligence (v0.17.0).
+ *
+ * Hosts the deterministic markdown decision-record indexer (FDecisionRecordIndexer)
+ * and registers the `decision_query` namespace (5 actions) into FMonolithToolRegistry.
+ *
+ * The indexer writes to the EngineSource.db SQLite file (owned by
+ * UMonolithSourceSubsystem). New tables `decision_records` and
+ * `decision_supersedes` use the `decision_` prefix.
+ *
+ * Loading phase: Default. Module type: Editor.
+ *
+ * DEVIATION (vs plan §0 "shared DB handle"): UMonolithSourceSubsystem does not
+ * expose an accessor for its raw FSQLiteDatabase pointer, so this module owns
+ * its own ReadOnly handle for queries (cached as a TUniquePtr member, torn
+ * down explicitly in ShutdownModule) and opens a transient ReadWrite handle
+ * for the indexer pass. See MonolithReflectionIntelModule.cpp for the policy.
+ */
+class FMonolithReflectionIntelModule : public IModuleInterface
+{
+public:
+	virtual void StartupModule() override;
+	virtual void ShutdownModule() override;
+
+	/**
+	 * Run the decision-record indexer once on demand. Invoked lazily by the
+	 * `decision_query` action handlers when the table is empty, and bound to
+	 * FCoreUObjectDelegates::ReloadCompleteDelegate for hot-reload refresh.
+	 * Cheap to call repeatedly — the indexer wipes and rewrites in one pass.
+	 */
+	static bool RunDecisionIndexerOnce(FString& OutStatus);
+
+	/**
+	 * Lazily open (or return) the cached ReadOnly handle on EngineSource.db.
+	 * Owned by this module instance (TUniquePtr); torn down in ShutdownModule
+	 * so the SQLite handle + file lock release cleanly on editor exit / Live
+	 * Coding module reload.
+	 *
+	 * Returns nullptr if EngineSource.db does not exist (caller should surface
+	 * "run source.trigger_reindex"). Path-changes between calls (e.g. plugin
+	 * re-mount) close the prior handle and open a fresh one.
+	 */
+	FSQLiteDatabase* GetOrOpenCachedQueryDb();
+
+	/** Bootstrap-latch accessors — replaces the prior function-static `bAttemptedBootstrap`
+	 *  so that a module reload re-arms the lazy bootstrap path. */
+	bool HasAttemptedBootstrap() const { return bDecisionBootstrapAttempted; }
+	void MarkBootstrapAttempted()       { bDecisionBootstrapAttempted = true; }
+
+	/** Close + drop the cached query DB handle. Called from the lazy-bootstrap
+	 *  path in FDecisionQueryAdapter::GetRawDB before invoking the indexer
+	 *  (which opens its own RW handle on the same file). */
+	void ResetCachedQueryDb();
+
+private:
+	void RegisterDecisionActions();
+	void OnReloadComplete(EReloadCompleteReason Reason);
+
+	FDelegateHandle ReloadCompleteHandle;
+
+	/** Cached ReadOnly handle on EngineSource.db. Owned by this module instance;
+	 *  Reset() explicitly in ShutdownModule before module unload to release the
+	 *  SQLite handle + file lock (TUniquePtr destruction order is not guaranteed
+	 *  during module teardown). */
+	TUniquePtr<FSQLiteDatabase> CachedQueryDb;
+	FString CachedQueryDbPath;
+
+	/** Replaces the prior function-static `bAttemptedBootstrap` in the adapter.
+	 *  Re-arms automatically on module reload because the module instance is
+	 *  reconstructed on hot-reload. */
+	bool bDecisionBootstrapAttempted = false;
+};
