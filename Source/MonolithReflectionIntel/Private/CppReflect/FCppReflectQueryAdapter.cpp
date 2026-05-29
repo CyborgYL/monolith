@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Plan: Plugins/Monolith/Docs/plans/2026-05-28-reflection-intelligence.md (Phase 3a — v0.17.0).
 //
-// FCppReflectQueryAdapter — implementation. Five read-only handlers over the
+// FCppReflectQueryAdapter — implementation. Six read-only handlers over the
 // Phase 3a reflect_* + cpp_asset_edges tables. All run on the game thread.
 // Cursor codec mirrored from the Phase 1 / Phase 2 adapters — consolidation
 // into MonolithCore is a Phase 5+ item and out of scope.
@@ -80,6 +80,71 @@ namespace
 		for (const FString& P : Parts) { H = HashCombine(H, GetTypeHash(P)); }
 		return H;
 	}
+
+	// ---------------------------------------------------------------------
+	// Distinct token universe of the reflect_uclasses.flags column.
+	//
+	// `flags` stores colon-joined UHT metadata keys (e.g.
+	// "IsBlueprintBase:BlueprintType"). This walks every row, splits on ':',
+	// and tallies a per-token class count. Shared by HandleListClassSpecifiers
+	// (the full vocabulary action) and HandleFindClassSpecifier's empty-result
+	// `known_tokens` hint. Caller already holds a valid game-thread DB handle.
+	//
+	// Counts are per-row occurrences: a token tallies at most once per class row
+	// (colon-lists do not repeat a key within one row), so the count is the
+	// number of UCLASSes carrying that token.
+	// ---------------------------------------------------------------------
+	bool CollectClassSpecifierTokens(FSQLiteDatabase& DB, TMap<FString, int32>& OutCounts)
+	{
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(DB, TEXT(
+			"SELECT flags FROM reflect_uclasses WHERE flags IS NOT NULL AND flags <> '';")))
+		{
+			return false;
+		}
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			FString Flags;
+			Stmt.GetColumnValueByIndex(0, Flags);
+			if (Flags.IsEmpty()) { continue; }
+
+			TArray<FString> Tokens;
+			Flags.ParseIntoArray(Tokens, TEXT(":"), /*InCullEmpty=*/true);
+			for (const FString& Token : Tokens)
+			{
+				const FString Trimmed = Token.TrimStartAndEnd();
+				if (Trimmed.IsEmpty()) { continue; }
+				int32& Count = OutCounts.FindOrAdd(Trimmed);
+				++Count;
+			}
+		}
+		return true;
+	}
+
+	// Build a `[{ token, count }]` JSON array from a token->count map, sorted by
+	// descending count then ascending token for a stable, useful ordering.
+	TArray<TSharedPtr<FJsonValue>> TokenCountsToJsonArray(const TMap<FString, int32>& Counts)
+	{
+		TArray<TPair<FString, int32>> Sorted;
+		Sorted.Reserve(Counts.Num());
+		for (const TPair<FString, int32>& Pair : Counts) { Sorted.Add(Pair); }
+		Sorted.Sort([](const TPair<FString, int32>& A, const TPair<FString, int32>& B)
+		{
+			if (A.Value != B.Value) { return A.Value > B.Value; }
+			return A.Key < B.Key;
+		});
+
+		TArray<TSharedPtr<FJsonValue>> Out;
+		Out.Reserve(Sorted.Num());
+		for (const TPair<FString, int32>& Pair : Sorted)
+		{
+			TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+			O->SetStringField(TEXT("token"), Pair.Key);
+			O->SetNumberField(TEXT("count"), Pair.Value);
+			Out.Add(MakeShared<FJsonValueObject>(O));
+		}
+		return Out;
+	}
 }
 
 // ============================================================================
@@ -150,20 +215,36 @@ void FCppReflectQueryAdapter::RegisterActions(FMonolithToolRegistry& Registry)
 
 	// ---- find_class_specifier ----
 	Registry.RegisterAction(TEXT("cppreflect"), TEXT("find_class_specifier"),
-		TEXT("Find UCLASS rows whose `flags` colon-list contains the given "
-		     "specifier (e.g. \"BlueprintType\", \"Abstract\", \"MinimalAPI\"). "
-		     "Case-sensitive substring match on flags. Cursor pagination."),
+		TEXT("Find UCLASS rows whose `flags` column contains the given token. "
+		     "NOTE: `flags` stores UHT METADATA KEYS, not raw C++ specifiers — "
+		     "real stored tokens include \"IsBlueprintBase\", \"BlueprintType\", "
+		     "\"Abstract\". A small alias map translates well-known C++ specifiers "
+		     "(\"Blueprintable\" -> \"IsBlueprintBase\"). Specifiers UHT drops "
+		     "entirely (\"MinimalAPI\", \"NotBlueprintable\") are NOT stored and "
+		     "return an explicit not-captured note. Match is case-insensitive. "
+		     "Call list_class_specifiers to discover the exact token universe. "
+		     "Cursor pagination."),
 		FMonolithActionHandler::CreateStatic(&FCppReflectQueryAdapter::HandleFindClassSpecifier),
 		FParamSchemaBuilder()
 			.Required(TEXT("specifier_name"), TEXT("string"),
-				TEXT("UCLASS specifier token to search the flags column for"))
+				TEXT("UCLASS specifier or metadata-key token to search the flags column for"))
 			.Optional(TEXT("limit"), TEXT("integer"),
 				TEXT("Max rows per page (default 50, hard cap 200)"), TEXT("50"))
 			.Optional(TEXT("cursor"), TEXT("string"),
 				TEXT("Opaque pagination cursor"))
 			.Build());
 
-	// Dispatcher annotation — all five handlers are pure SELECT against the
+	// ---- list_class_specifiers ----
+	Registry.RegisterAction(TEXT("cppreflect"), TEXT("list_class_specifiers"),
+		TEXT("Return the DISTINCT universe of tokens stored in the `flags` column "
+		     "of reflect_uclasses, each with a per-token class count. The `flags` "
+		     "column stores UHT metadata keys (e.g. \"IsBlueprintBase\", "
+		     "\"BlueprintType\", \"Abstract\"), NOT raw C++ UCLASS specifiers. Use "
+		     "this to discover what find_class_specifier can actually match."),
+		FMonolithActionHandler::CreateStatic(&FCppReflectQueryAdapter::HandleListClassSpecifiers),
+		FParamSchemaBuilder().Build());
+
+	// Dispatcher annotation — all six handlers are pure SELECT against the
 	// Phase 3a reflect_* tables.
 	FMonolithDispatcherAnnotations Anno;
 	Anno.bReadOnlyHint    = true;
@@ -680,6 +761,49 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleFindClassSpecifier(const TS
 			FMonolithJsonUtils::ErrInvalidParams);
 	}
 
+	// --- C++-specifier -> stored metadata-key translation ----------------
+	// The `flags` column stores UHT metadata keys, not raw C++ UCLASS
+	// specifiers (see CppReflectSchema.cpp / FUHTArtefactReader writer). Two
+	// classes of well-known specifier need handling before we build the query:
+	//
+	//   1. ALIASED: UHT rewrites the specifier into a different stored key.
+	//      The only mainstream one is Blueprintable -> IsBlueprintBase.
+	//      ("BlueprintType" and "Abstract" pass through 1:1 and need no entry.)
+	//   2. DROPPED:  UHT never stores the token at all (MinimalAPI is purely an
+	//      export-macro hint; NotBlueprintable is encoded as ABSENCE of
+	//      IsBlueprintBase). Searching the flags column for these can only ever
+	//      return empty — so we answer honestly instead of a misleading [].
+	//
+	// Kept deliberately small and local: this is a find_class_specifier-only
+	// affordance, not a general alias system (Phase D).
+	const FString SpecLower = SpecifierName.ToLower();
+
+	// Specifiers UHT drops entirely — never present in the metadata-key vocab.
+	if (SpecLower == TEXT("minimalapi") || SpecLower == TEXT("notblueprintable"))
+	{
+		TMap<FString, int32> TokenCounts;
+		CollectClassSpecifierTokens(*DB, TokenCounts);
+
+		TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+		Out->SetStringField(TEXT("specifier_name"), SpecifierName);
+		Out->SetArrayField(TEXT("uclasses"), TArray<TSharedPtr<FJsonValue>>());
+		Out->SetBoolField(TEXT("token_stored"), false);
+		Out->SetStringField(TEXT("note"), FString::Printf(TEXT(
+			"\"%s\" is a C++ UCLASS specifier that UHT does not store in the "
+			"metadata-key vocabulary (the `flags` column), so it can never match. "
+			"Call list_class_specifiers to see the tokens that are queryable."),
+			*SpecifierName));
+		Out->SetArrayField(TEXT("known_tokens"), TokenCountsToJsonArray(TokenCounts));
+		return FMonolithActionResult::Success(Out);
+	}
+
+	// Aliased specifiers: translate to the stored metadata key before querying.
+	FString EffectiveToken = SpecifierName;
+	if (SpecLower == TEXT("blueprintable"))
+	{
+		EffectiveToken = TEXT("IsBlueprintBase");
+	}
+
 	const int32 ReqLimit = Params->HasField(TEXT("limit"))
 		? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 50;
 	const FString CursorIn = Params->HasField(TEXT("cursor"))
@@ -705,26 +829,29 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleFindClassSpecifier(const TS
 		Page = State.Page;
 	}
 
-	// Match against the colon-delimited `flags` column. SQLite LIKE pattern:
-	//   `flags = ?`                exact-only (whole specifier list = match)
-	//   `flags LIKE ?:%`           starts with this specifier
-	//   `flags LIKE %:?:%`         contains this specifier in the middle
-	//   `flags LIKE %:?`           ends with this specifier
+	// Match against the colon-delimited `flags` column using the translated
+	// EffectiveToken (see alias map above). SQLite LIKE pattern:
+	//   `flags = ?`                exact-only (whole metadata-key list = match)
+	//   `flags LIKE ?:%`           starts with this token
+	//   `flags LIKE %:?:%`         contains this token in the middle
+	//   `flags LIKE %:?`           ends with this token
 	// We OR all four shapes to catch any position. Simpler than a regex.
+	// The exact arm carries COLLATE NOCASE so single-token flags match
+	// case-insensitively (LIKE is already ASCII-case-insensitive in SQLite).
 	FSQLitePreparedStatement Stmt;
 	if (!Stmt.Create(*DB, TEXT(
 		"SELECT class_name, module_name, parent_class, source_path, flags "
 		"FROM reflect_uclasses "
-		"WHERE flags = ?1 OR flags LIKE ?2 OR flags LIKE ?3 OR flags LIKE ?4 "
+		"WHERE flags = ?1 COLLATE NOCASE OR flags LIKE ?2 OR flags LIKE ?3 OR flags LIKE ?4 "
 		"ORDER BY module_name, class_name "
 		"LIMIT ? OFFSET ?;")))
 	{
 		return FMonolithActionResult::Error(TEXT("SELECT prepare failed."));
 	}
-	const FString ExactMatch = SpecifierName;
-	const FString PrefixMatch = SpecifierName + TEXT(":%");
-	const FString MidMatch    = TEXT("%:") + SpecifierName + TEXT(":%");
-	const FString SuffixMatch = TEXT("%:") + SpecifierName;
+	const FString ExactMatch = EffectiveToken;
+	const FString PrefixMatch = EffectiveToken + TEXT(":%");
+	const FString MidMatch    = TEXT("%:") + EffectiveToken + TEXT(":%");
+	const FString SuffixMatch = TEXT("%:") + EffectiveToken;
 	Stmt.SetBindingValueByIndex(1, ExactMatch);
 	Stmt.SetBindingValueByIndex(2, PrefixMatch);
 	Stmt.SetBindingValueByIndex(3, MidMatch);
@@ -753,7 +880,26 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleFindClassSpecifier(const TS
 
 	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
 	Out->SetStringField(TEXT("specifier_name"), SpecifierName);
+	// Surface the alias translation so the caller understands what was actually
+	// queried (e.g. caller typed "Blueprintable", translated to "IsBlueprintBase").
+	// Set unconditionally of row count so the empty-result hint path below also
+	// carries it — an empty result must still tell the caller the queried token.
+	if (EffectiveToken != SpecifierName)
+	{
+		Out->SetStringField(TEXT("effective_token"), EffectiveToken);
+	}
 	Out->SetArrayField(TEXT("uclasses"), Rows);
+
+	// Informative empty response: when the first page matched zero rows, attach
+	// the full distinct token universe so the caller can self-correct without a
+	// second round-trip to list_class_specifiers. (effective_token, if an alias
+	// was applied, is already attached above.)
+	if (Rows.Num() == 0 && !bHasCursor)
+	{
+		TMap<FString, int32> TokenCounts;
+		CollectClassSpecifierTokens(*DB, TokenCounts);
+		Out->SetArrayField(TEXT("known_tokens"), TokenCountsToJsonArray(TokenCounts));
+	}
 
 	if (Rows.Num() == Limit)
 	{
@@ -763,5 +909,30 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleFindClassSpecifier(const TS
 		OutCursor.CachedTotalEstimate = -1;
 		Out->SetStringField(TEXT("next_cursor"), EncodeCursor(OutCursor));
 	}
+	return FMonolithActionResult::Success(Out);
+}
+
+FMonolithActionResult FCppReflectQueryAdapter::HandleListClassSpecifiers(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+	FSQLiteDatabase* DB = GetRawDB();
+	if (!DB)
+	{
+		return FMonolithActionResult::Error(
+			TEXT("EngineSource.db not available. Run source.trigger_reindex to bootstrap."));
+	}
+
+	// The token universe is small (a few dozen distinct metadata keys across the
+	// whole index), so no pagination is needed — return the full distinct set
+	// with per-token class counts. `flags` stores UHT metadata keys, not raw
+	// C++ specifiers (see HandleFindClassSpecifier's alias map).
+	TMap<FString, int32> TokenCounts;
+	if (!CollectClassSpecifierTokens(*DB, TokenCounts))
+	{
+		return FMonolithActionResult::Error(TEXT("SELECT prepare failed (reflect_uclasses absent?)."));
+	}
+
+	TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetArrayField(TEXT("specifiers"), TokenCountsToJsonArray(TokenCounts));
+	Out->SetNumberField(TEXT("distinct_count"), TokenCounts.Num());
 	return FMonolithActionResult::Success(Out);
 }

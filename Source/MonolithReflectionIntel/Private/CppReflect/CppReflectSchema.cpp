@@ -23,7 +23,13 @@ namespace MonolithCppReflectSchema
 		// (e.g. "Source/Leviathan/Public/Characters/LeviathanCharacterBase.h").
 		// `source_line` is 0 in Phase 3a — UHT artefacts do not carry the
 		// declaration line; the tree-sitter Phase 3b pass will fill this in.
-		// `flags` is a colon-delimited specifier list (e.g. "BlueprintType:Abstract").
+		// `flags` is a colon-joined metadata-key list (UHT Class_MetaDataParams
+		// keys, e.g. "IsBlueprintBase:BlueprintType") — NOT C++ specifiers. UHT
+		// rewrites some specifiers into metadata keys (UCLASS(Blueprintable) is
+		// stored as "IsBlueprintBase"), passes a few through 1:1 ("BlueprintType",
+		// "Abstract"), and drops others entirely ("MinimalAPI", "NotBlueprintable").
+		// Query via cppreflect_query("list_class_specifiers") to discover the
+		// real stored token universe.
 		// PK pair (class_name, module_name) tolerates same-named classes in
 		// different modules without uniqueness conflicts.
 		return TEXT(

@@ -373,12 +373,14 @@ bool FCppReflectFindSpecifierTest::RunTest(const FString& /*Parameters*/)
 	FString Status;
 	Reader.Run(Db, { WorkRoot }, false, Status);
 
-	// Run the same OR'd LIKE pattern the adapter uses.
+	// Run the same OR'd LIKE pattern the adapter uses. The exact arm carries
+	// COLLATE NOCASE to mirror the adapter's production SQL (FindClassSpecifier),
+	// so a lowercase specifier still matches the canonically-cased stored token.
 	FSQLitePreparedStatement Stmt;
 	TestTrue(TEXT("Prepare specifier-search query"),
 		Stmt.Create(Db, TEXT(
 			"SELECT class_name FROM reflect_uclasses "
-			"WHERE flags = ?1 OR flags LIKE ?2 OR flags LIKE ?3 OR flags LIKE ?4;")));
+			"WHERE flags = ?1 COLLATE NOCASE OR flags LIKE ?2 OR flags LIKE ?3 OR flags LIKE ?4;")));
 	const FString Spec = TEXT("Abstract");
 	Stmt.SetBindingValueByIndex(1, Spec);
 	Stmt.SetBindingValueByIndex(2, Spec + TEXT(":%"));
@@ -393,6 +395,31 @@ bool FCppReflectFindSpecifierTest::RunTest(const FString& /*Parameters*/)
 		if (CName == TEXT("ASampleActor")) { bFoundASampleActor = true; }
 	}
 	TestTrue(TEXT("ASampleActor surfaces under specifier 'Abstract'"), bFoundASampleActor);
+
+	// Case-insensitivity: a LOWERCASE specifier input must still match the
+	// canonically-cased stored token ("Abstract"), exercising COLLATE NOCASE on
+	// the exact arm. This locks in the case-insensitive guarantee the adapter's
+	// `WHERE flags = ?1 COLLATE NOCASE` change introduced.
+	FSQLitePreparedStatement LowerStmt;
+	TestTrue(TEXT("Prepare lowercase specifier-search query"),
+		LowerStmt.Create(Db, TEXT(
+			"SELECT class_name FROM reflect_uclasses "
+			"WHERE flags = ?1 COLLATE NOCASE OR flags LIKE ?2 OR flags LIKE ?3 OR flags LIKE ?4;")));
+	const FString LowerSpec = TEXT("abstract");
+	LowerStmt.SetBindingValueByIndex(1, LowerSpec);
+	LowerStmt.SetBindingValueByIndex(2, LowerSpec + TEXT(":%"));
+	LowerStmt.SetBindingValueByIndex(3, FString(TEXT("%:")) + LowerSpec + TEXT(":%"));
+	LowerStmt.SetBindingValueByIndex(4, FString(TEXT("%:")) + LowerSpec);
+
+	bool bFoundASampleActorCaseInsensitive = false;
+	while (LowerStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString CName;
+		LowerStmt.GetColumnValueByIndex(0, CName);
+		if (CName == TEXT("ASampleActor")) { bFoundASampleActorCaseInsensitive = true; }
+	}
+	TestTrue(TEXT("ASampleActor surfaces under lowercase specifier 'abstract' (COLLATE NOCASE)"),
+		bFoundASampleActorCaseInsensitive);
 
 	Db.Close();
 	IFileManager::Get().Delete(*DbPath, false, true);

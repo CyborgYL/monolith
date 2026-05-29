@@ -108,7 +108,7 @@ void FMonolithReflectionIntelModule::StartupModule()
 	// Phase 2 (v0.17.0) — risk_query namespace + source_query audit action.
 	RegisterRiskActions();
 	RegisterSourceAuditActions();
-	// Phase 3a (v0.17.0) — cppreflect_query namespace (5 actions).
+	// Phase 3a (v0.17.0) — cppreflect_query namespace (6 actions).
 	RegisterCppReflectActions();
 	// Phase 4a (v0.17.0) — network_query namespace (4 actions) + 4 audit
 	// actions on existing namespaces + pipeline_query namespace (2 composers).
@@ -136,7 +136,7 @@ void FMonolithReflectionIntelModule::StartupModule()
 	UE_LOG(LogMonolithReflectionIntel, Log,
 		TEXT("Monolith — ReflectionIntel module loaded (decision_query: 5 actions, "
 		     "risk_query: 5 actions, source_query: +1 audit action, "
-		     "cppreflect_query: 5 actions, network_query: 4 actions, "
+		     "cppreflect_query: 6 actions, network_query: 4 actions, "
 		     "material/niagara/blueprint/project: +1 audit each, "
 		     "pipeline_query: 2 composers)"));
 }

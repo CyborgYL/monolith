@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Plan: Plugins/Monolith/Docs/plans/2026-05-28-reflection-intelligence.md (Phase 3a — v0.17.0).
 //
-// FCppReflectQueryAdapter — registers the `cppreflect` namespace (5 actions)
+// FCppReflectQueryAdapter — registers the `cppreflect` namespace (6 actions)
 // against the central FMonolithToolRegistry. Pure read-only handlers; no
 // indexing happens here (that's FUHTArtefactReader / FAssetGraphJoiner).
 //
 // DEVIATION (vs plan §7 handler enumeration): plan §7 lists SIX handlers
 // including `list_native_tags`. Phase 3a explicitly drops the native-tag
 // surface — that needs the tree-sitter vendoring deferred to Phase 3b. The
-// 5 actions shipped here are: get_uclass / list_uproperties / list_ufunctions
-// / find_interface_impls / find_class_specifier.
+// 6 actions shipped here are: get_uclass / list_uproperties / list_ufunctions
+// / find_interface_impls / find_class_specifier / list_class_specifiers.
 //
 // v0.17.0 ergonomics adoption (same shape as decision_query + risk_query):
 //   - `class_name` / `interface_name` / `specifier_name` are bare strings
@@ -29,7 +29,7 @@
 class MONOLITHREFLECTIONINTEL_API FCppReflectQueryAdapter
 {
 public:
-	/** Register all 5 cppreflect actions + dispatcher annotations. */
+	/** Register all 6 cppreflect actions + dispatcher annotations. */
 	static void RegisterActions(FMonolithToolRegistry& Registry);
 
 private:
@@ -39,6 +39,7 @@ private:
 	static FMonolithActionResult HandleListUFunctions(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleFindInterfaceImpls(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleFindClassSpecifier(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleListClassSpecifiers(const TSharedPtr<FJsonObject>& Params);
 
 	/** Shared DB accessor — routes through the module's cached query DB. */
 	static class FSQLiteDatabase* GetRawDB();
