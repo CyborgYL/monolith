@@ -20,7 +20,7 @@ I use it every day. It does what I need.
 
 ## What it does
 
-Monolith exposes **1386 actions across 25 in-tree namespaces** through a namespace-dispatch pattern: each domain registers a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` lists everything available.
+Monolith exposes **1387 actions across 25 in-tree namespaces** through a namespace-dispatch pattern: each domain registers a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` lists everything available.
 
 Covered domains: Blueprints, Materials, Animation, Niagara, Mesh, UI (incl. CommonUI), AI (Behavior Trees, State Trees, EQS, Smart Objects, Perception, Navigation), Gameplay Ability System, Logic Driver state machines, ComboGraph combo trees, Audio (Sound Cues + MetaSounds), Editor control (UBT builds, log capture, scene capture, asset preview & inspection), Engine source search (1M+ symbols, fully offline), Project asset search (SQLite FTS5), INI config, Level Sequences, a `bulk_fill` / `describe` reflection framework for deep property writes, a `monolith_guide` self-onboarding tool for your AI, plus the new v0.17.0 **Reflection Intelligence** layer: `decision` (architectural decision-record harvest), `risk` (repo-level hotspot + co-change + conditional-gate signals), `cppreflect` (UE 5.7 UHT reflection-edge queries cross-joined with the asset registry), `network` (replication inspection — replicated classes, RPCs, OnRep handlers, unbalanced-handler audits), `pipeline` (read-only composer actions for PR review + release pre-flight), and `reflect` (index maintenance — a project-only force-rebuild of the reflection tables). The `cppreflect` and `network` indexers scan your project plugins (InventorySystemX, CarnageFX, etc.) by default, so replicated classes and RPCs declared in plugins are in scope without extra setup; enabled marketplace plugins are gated behind a setting, and Epic engine built-ins stay excluded.
 
@@ -69,7 +69,7 @@ Project-instructions files (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, etc.) vary
 Two zero-dependency C++ executables ship in `Binaries/` and work without the editor:
 
 - **`monolith_proxy.exe`** — MCP stdio↔HTTP proxy. Keeps your AI session alive across editor restarts. Used by the `.mcp.json` config above.
-- **`monolith_query.exe`** — Offline DB query tool. Queries the engine source index and project asset index without launching UE (instant startup). Useful for terminal-side lookups and CI.
+- **`monolith_query.exe`** — Offline query tool. Serves the engine source index, project asset index, and the full Reflection Intelligence surface (`decision` / `risk` / `cppreflect` / `network`) without launching UE — byte-identical to the live server, verified by a ship-blocking parity guard. Instant startup; useful for terminal-side lookups and CI when the editor is down.
 
 Details: [wiki Tool Reference](https://github.com/tumourlove/monolith/wiki/Tool-Reference).
 
