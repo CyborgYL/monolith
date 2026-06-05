@@ -14,6 +14,7 @@
 #include "ChooserSignature.h"        // UChooserSignature (Public)
 #include "ChooserPropertyAccess.h"   // FContextObjectTypeBase/Class/Struct (Public)
 #include "ObjectChooser_Asset.h"     // FAssetChooser / FSoftAssetChooser (Internal, public path)
+#include "OutputObjectColumn.h"       // FOutputObjectColumn / FChooserOutputObjectRowData (Internal, public path)
 
 #include "StructUtils/InstancedStruct.h"
 #include "UObject/Class.h"
@@ -69,6 +70,16 @@ void FMonolithChooserActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("asset_path_value"), TEXT("string"), TEXT("New asset path to assign to the result row's Asset reference"))
 			.Build());
 
+	// --- set_evaluate_chooser_result_reference ---
+	Registry.RegisterAction(TEXT("chooser"), TEXT("set_evaluate_chooser_result_reference"),
+		TEXT("Rewrite the child UChooserTable an EvaluateChooser result row points at (FEvaluateChooser). Root/nested chooser rows are EvaluateChooser and are unsettable via set_result_asset_reference; this action handles them. Marks the package dirty and recompiles (Compile(true))."),
+		FMonolithActionHandler::CreateStatic(&HandleSetEvaluateChooserResultReference),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("UChooserTable asset to edit"))
+			.Required(TEXT("row"), TEXT("number"), TEXT("0-based result row index of the EvaluateChooser row to rewrite"))
+			.RequiredAssetPath(TEXT("child_chooser_path"), TEXT("UChooserTable to point the EvaluateChooser row at"))
+			.Build());
+
 	// --- validate_chooser ---
 	Registry.RegisterAction(TEXT("chooser"), TEXT("validate_chooser"),
 		TEXT("Compile a chooser table (Compile(true)) and validate it: optional expected context class + expected result type, plus null/stale result-row asset references. Read-only apart from the compile pass."),
@@ -97,6 +108,7 @@ FMonolithActionResult FMonolithChooserActions::HandleInspectChooser(const TShare
 FMonolithActionResult FMonolithChooserActions::HandleDuplicateChooserTree(const TSharedPtr<FJsonObject>&)  { return ChooserUnavailable(); }
 FMonolithActionResult FMonolithChooserActions::HandleSetContextObjectClass(const TSharedPtr<FJsonObject>&) { return ChooserUnavailable(); }
 FMonolithActionResult FMonolithChooserActions::HandleSetResultAssetReference(const TSharedPtr<FJsonObject>&){ return ChooserUnavailable(); }
+FMonolithActionResult FMonolithChooserActions::HandleSetEvaluateChooserResultReference(const TSharedPtr<FJsonObject>&){ return ChooserUnavailable(); }
 FMonolithActionResult FMonolithChooserActions::HandleValidateChooser(const TSharedPtr<FJsonObject>&)       { return ChooserUnavailable(); }
 
 #else // WITH_CHOOSER
@@ -297,7 +309,32 @@ FMonolithActionResult FMonolithChooserActions::HandleDuplicateChooserTree(const 
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: destination_folder"));
 	}
 
-	// Build the remap table (old asset path -> new asset path).
+	// Normalize an asset reference to a comparable package path: strip any
+	// "object-name" suffix ("/Game/X/CHT.CHT" -> "/Game/X/CHT") and any sub-object
+	// suffix, and drop a trailing class-name part. UObject::GetPathName() yields the
+	// "package.object" form, whereas remap_rules keys are typically bare package
+	// paths ("/Game/X/CHT"); normalizing BOTH sides makes them compare equal.
+	auto NormalizePackagePath = [](const FString& InPath) -> FString
+	{
+		FString Path = InPath;
+		// Drop a sub-object path first ("/Game/X/CHT.CHT:Sub" -> "/Game/X/CHT.CHT").
+		int32 SubIdx = INDEX_NONE;
+		if (Path.FindChar(TEXT(':'), SubIdx))
+		{
+			Path.LeftInline(SubIdx, EAllowShrinking::No);
+		}
+		// Drop the object-name suffix ("/Game/X/CHT.CHT" -> "/Game/X/CHT").
+		int32 DotIdx = INDEX_NONE;
+		if (Path.FindChar(TEXT('.'), DotIdx))
+		{
+			Path.LeftInline(DotIdx, EAllowShrinking::No);
+		}
+		return Path;
+	};
+
+	// Build the remap table keyed on NORMALIZED package paths so GetPathName()
+	// object-path lookups ("/Game/X/CHT.CHT") match bare package-path rules
+	// ("/Game/X/CHT"). The value (new path) is preserved verbatim.
 	TMap<FString, FString> Remap;
 	const TSharedPtr<FJsonObject>* RemapObj = nullptr;
 	if (Params->TryGetObjectField(TEXT("remap_rules"), RemapObj) && RemapObj && RemapObj->IsValid())
@@ -307,23 +344,45 @@ FMonolithActionResult FMonolithChooserActions::HandleDuplicateChooserTree(const 
 			FString Val;
 			if (Pair.Value.IsValid() && Pair.Value->TryGetString(Val))
 			{
-				Remap.Add(Pair.Key, Val);
+				Remap.Add(NormalizePackagePath(Pair.Key), Val);
 			}
 		}
 	}
 
-	auto ApplyRemap = [&Remap](const FString& InPath) -> FString
+	auto ApplyRemap = [&Remap, &NormalizePackagePath](const FString& InPath) -> FString
 	{
+		// Try an exact match first (preserves prior behavior for already-matching keys),
+		// then fall back to a normalized package-path match.
 		if (const FString* Found = Remap.Find(InPath))
 		{
 			return *Found;
 		}
+		if (const FString* FoundNorm = Remap.Find(NormalizePackagePath(InPath)))
+		{
+			return *FoundNorm;
+		}
 		return InPath;
 	};
+
+	// One record per successfully-duplicated source. The remap walk in PASS 2 reads
+	// these AFTER every duplicate exists on disk, so the remap-target lookup always
+	// resolves regardless of the order sources are listed in source_assets.
+	struct FDupRecord
+	{
+		TSharedPtr<FJsonObject> Entry;
+		UObject* Dup = nullptr;
+		UChooserTable* DupTable = nullptr;
+	};
+	TArray<FDupRecord> DupRecords;
 
 	TArray<TSharedPtr<FJsonValue>> Results;
 	int32 Duplicated = 0;
 
+	// -----------------------------------------------------------------------
+	// PASS 1: duplicate ALL sources first and SaveAsset each, so every
+	// duplicate (and its new remap-target path) exists on disk before any
+	// reference walk runs. No remap happens in this pass.
+	// -----------------------------------------------------------------------
 	for (const TSharedPtr<FJsonValue>& Val : *SourcesPtr)
 	{
 		FString SourcePath;
@@ -348,16 +407,63 @@ FMonolithActionResult FMonolithChooserActions::HandleDuplicateChooserTree(const 
 		Entry->SetStringField(TEXT("destination"), Dup->GetPathName());
 		++Duplicated;
 
-		UChooserTable* DupTable = Cast<UChooserTable>(Dup);
-		if (DupTable && Remap.Num() > 0)
+		// Persist the bare duplicate now so its new path is resolvable from disk
+		// when PASS 2 walks any OTHER duplicate that references it.
+		const bool bSaved = UEditorAssetLibrary::SaveAsset(Dup->GetPathName(), /*bOnlyIfIsDirty=*/false);
+		Entry->SetBoolField(TEXT("saved"), bSaved);
+		Entry->SetBoolField(TEXT("ok"), true);
+
+		FDupRecord Rec;
+		Rec.Entry = Entry;
+		Rec.Dup = Dup;
+		Rec.DupTable = Cast<UChooserTable>(Dup);
+		DupRecords.Add(Rec);
+
+		Results.Add(MakeShared<FJsonValueObject>(Entry));
+	}
+
+	// -----------------------------------------------------------------------
+	// PASS 2: now that ALL duplicates exist on disk, remap references on each.
+	// The remap lambdas write into the CURRENT record's RefsRemapped / RowReport
+	// via these cursors, reset per iteration below.
+	// -----------------------------------------------------------------------
+	if (Remap.Num() > 0)
+	{
+		int32 CurRefsRemapped = 0;
+		TArray<TSharedPtr<FJsonValue>> CurRowReport;
+
+		auto AddRowReport = [&CurRowReport](int32 RowIndex, const FString& StructType,
+			const FString& OldPath, const FString& NewPath, bool bRemapped, const FString& Note)
 		{
-			int32 RefsRemapped = 0;
+			TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+			Obj->SetNumberField(TEXT("row_index"), RowIndex);
+			Obj->SetStringField(TEXT("struct_type"), StructType);
+			Obj->SetStringField(TEXT("old_path"), OldPath);
+			Obj->SetStringField(TEXT("new_path"), NewPath);
+			Obj->SetBoolField(TEXT("remapped"), bRemapped);
+			if (!Note.IsEmpty())
+			{
+				Obj->SetStringField(TEXT("note"), Note);
+			}
+			CurRowReport.Add(MakeShared<FJsonValueObject>(Obj));
+		};
 
 #if WITH_EDITORONLY_DATA
-			// Remap result-row asset references on the duplicate (never the source).
-			for (FInstancedStruct& Row : DupTable->ResultsStructs)
+		int32& RefsRemapped = CurRefsRemapped;
+		// Remap a single result FInstancedStruct (a result row, the table's
+			// FallbackResult, or an FOutputObjectColumn cell value). Handles all four
+			// chooser result struct types and ALWAYS emits a diagnostic report entry,
+			// including for structs that match none of the known branches. This makes an
+			// empty row_remap_report impossible and records the actual struct type name so
+			// a future run shows exactly what each location holds.
+			//
+			// `Where` labels the container (e.g. "row", "fallback", "column[2].row[3]");
+			// `RowIdx` is the row index for ResultsStructs, INDEX_NONE for non-row sites.
+			auto RemapResultStruct =
+				[&AddRowReport, &ApplyRemap, &RefsRemapped]
+				(FInstancedStruct& S, int32 RowIdx, const FString& Where)
 			{
-				if (FAssetChooser* Hard = Row.GetMutablePtr<FAssetChooser>())
+				if (FAssetChooser* Hard = S.GetMutablePtr<FAssetChooser>())
 				{
 					if (Hard->Asset)
 					{
@@ -369,19 +475,208 @@ FMonolithActionResult FMonolithChooserActions::HandleDuplicateChooserTree(const 
 							{
 								Hard->Asset = Loaded;
 								++RefsRemapped;
+								AddRowReport(RowIdx, FString::Printf(TEXT("FAssetChooser@%s"), *Where), OldRef, NewRef, true, FString());
+							}
+							else
+							{
+								AddRowReport(RowIdx, FString::Printf(TEXT("FAssetChooser@%s"), *Where), OldRef, NewRef, false,
+									TEXT("remap target not found; kept original reference"));
 							}
 						}
+						else
+						{
+							AddRowReport(RowIdx, FString::Printf(TEXT("FAssetChooser@%s"), *Where), OldRef, OldRef, false,
+								TEXT("no remap rule matched this reference"));
+						}
+					}
+					else
+					{
+						AddRowReport(RowIdx, FString::Printf(TEXT("FAssetChooser@%s"), *Where), FString(), FString(), false,
+							TEXT("FAssetChooser with null Asset"));
 					}
 				}
-				else if (FSoftAssetChooser* Soft = Row.GetMutablePtr<FSoftAssetChooser>())
+				else if (FSoftAssetChooser* Soft = S.GetMutablePtr<FSoftAssetChooser>())
 				{
 					const FString OldRef = Soft->Asset.ToSoftObjectPath().ToString();
 					const FString NewRef = ApplyRemap(OldRef);
 					if (NewRef != OldRef)
 					{
+						// Soft references do not require the target to be loaded.
 						Soft->Asset = TSoftObjectPtr<UObject>(FSoftObjectPath(NewRef));
 						++RefsRemapped;
+						AddRowReport(RowIdx, FString::Printf(TEXT("FSoftAssetChooser@%s"), *Where), OldRef, NewRef, true, FString());
 					}
+					else
+					{
+						AddRowReport(RowIdx, FString::Printf(TEXT("FSoftAssetChooser@%s"), *Where), OldRef, OldRef, false,
+							TEXT("no remap rule matched this reference"));
+					}
+				}
+				else if (FEvaluateChooser* Eval = S.GetMutablePtr<FEvaluateChooser>())
+				{
+					// FEvaluateChooser references a SEPARATE chooser asset (root/nested
+					// chooser rows). Without remapping these, the duplicate still points at
+					// the ORIGINAL child chooser tables.
+					if (Eval->Chooser)
+					{
+						const FString OldRef = Eval->Chooser->GetPathName();
+						const FString NewRef = ApplyRemap(OldRef);
+						if (NewRef != OldRef)
+						{
+							if (UChooserTable* NewChild = FMonolithAssetUtils::LoadAssetByPath<UChooserTable>(NewRef))
+							{
+								Eval->Chooser = NewChild;
+								++RefsRemapped;
+								AddRowReport(RowIdx, FString::Printf(TEXT("FEvaluateChooser@%s"), *Where), OldRef, NewRef, true, FString());
+							}
+							else
+							{
+								AddRowReport(RowIdx, FString::Printf(TEXT("FEvaluateChooser@%s"), *Where), OldRef, NewRef, false,
+									TEXT("child chooser not found at remap target; kept original reference"));
+							}
+						}
+						else
+						{
+							AddRowReport(RowIdx, FString::Printf(TEXT("FEvaluateChooser@%s"), *Where), OldRef, OldRef, false,
+								TEXT("no remap rule matched this child chooser path"));
+						}
+					}
+					else
+					{
+						AddRowReport(RowIdx, FString::Printf(TEXT("FEvaluateChooser@%s"), *Where), FString(), FString(), false,
+							TEXT("FEvaluateChooser with null Chooser"));
+					}
+				}
+				else if (FNestedChooser* Nested = S.GetMutablePtr<FNestedChooser>())
+				{
+					// FNestedChooser references a chooser table EMBEDDED in this asset.
+					// Mirror the FEvaluateChooser branch: remap its child table reference.
+					if (Nested->Chooser)
+					{
+						const FString OldRef = Nested->Chooser->GetPathName();
+						const FString NewRef = ApplyRemap(OldRef);
+						if (NewRef != OldRef)
+						{
+							if (UChooserTable* NewChild = FMonolithAssetUtils::LoadAssetByPath<UChooserTable>(NewRef))
+							{
+								Nested->Chooser = NewChild;
+								++RefsRemapped;
+								AddRowReport(RowIdx, FString::Printf(TEXT("FNestedChooser@%s"), *Where), OldRef, NewRef, true, FString());
+							}
+							else
+							{
+								AddRowReport(RowIdx, FString::Printf(TEXT("FNestedChooser@%s"), *Where), OldRef, NewRef, false,
+									TEXT("nested chooser not found at remap target; kept original reference"));
+							}
+						}
+						else
+						{
+							AddRowReport(RowIdx, FString::Printf(TEXT("FNestedChooser@%s"), *Where), OldRef, OldRef, false,
+								TEXT("no remap rule matched this nested chooser path"));
+						}
+					}
+					else
+					{
+						AddRowReport(RowIdx, FString::Printf(TEXT("FNestedChooser@%s"), *Where), FString(), FString(), false,
+							TEXT("FNestedChooser with null Chooser"));
+					}
+				}
+				else
+				{
+					// DIAGNOSTIC: a result struct that matches none of the known branches.
+					// Record the actual struct type so a future run reveals what it is.
+					const UScriptStruct* SS = S.GetScriptStruct();
+					AddRowReport(RowIdx, FString::Printf(TEXT("%s@%s"),
+						SS ? *SS->GetName() : TEXT("<null-struct>"), *Where),
+						FString(), FString(), false,
+						TEXT("unhandled result struct type; no remap attempted"));
+				}
+			};
+
+			// Walk one table's three reference locations (ResultsStructs, FallbackResult,
+			// FOutputObjectColumn cells) — mirrors the engine's ReplaceReferencesInTable
+			// (SNestedChooserTree.cpp ~46-100). `Prefix` namespaces the diagnostic labels
+			// so root-table sites read "row"/"fallback"/"column[..]" while embedded-child
+			// sites read "nested[n].row"/"nested[n].fallback"/... .
+			auto WalkTableReferences =
+				[&RemapResultStruct](UChooserTable* Tbl, const FString& Prefix)
+			{
+				if (!Tbl)
+				{
+					return;
+				}
+
+				// 1) Result rows. Every row reports.
+				for (int32 RowIdx = 0; RowIdx < Tbl->ResultsStructs.Num(); ++RowIdx)
+				{
+					RemapResultStruct(Tbl->ResultsStructs[RowIdx], RowIdx, Prefix + TEXT("row"));
+				}
+
+				// 2) The table's FallbackResult (a single FInstancedStruct).
+				if (Tbl->FallbackResult.IsValid())
+				{
+					RemapResultStruct(Tbl->FallbackResult, INDEX_NONE, Prefix + TEXT("fallback"));
+				}
+
+				// 3) FOutputObjectColumn cell values. Each column is an FInstancedStruct in
+				//    ColumnsStructs; for output-object columns, remap per-row RowValues[].Value,
+				//    plus FallbackValue.Value and (editor-only) DefaultRowValue.Value.
+				for (int32 ColIdx = 0; ColIdx < Tbl->ColumnsStructs.Num(); ++ColIdx)
+				{
+					FInstancedStruct& ColumnData = Tbl->ColumnsStructs[ColIdx];
+					if (FOutputObjectColumn* OutCol = ColumnData.GetMutablePtr<FOutputObjectColumn>())
+					{
+						for (int32 CellIdx = 0; CellIdx < OutCol->RowValues.Num(); ++CellIdx)
+						{
+							if (OutCol->RowValues[CellIdx].Value.IsValid())
+							{
+								RemapResultStruct(OutCol->RowValues[CellIdx].Value, CellIdx,
+									Prefix + FString::Printf(TEXT("column[%d].row[%d]"), ColIdx, CellIdx));
+							}
+						}
+						if (OutCol->FallbackValue.Value.IsValid())
+						{
+							RemapResultStruct(OutCol->FallbackValue.Value, INDEX_NONE,
+								Prefix + FString::Printf(TEXT("column[%d].fallback"), ColIdx));
+						}
+						if (OutCol->DefaultRowValue.Value.IsValid())
+						{
+							RemapResultStruct(OutCol->DefaultRowValue.Value, INDEX_NONE,
+								Prefix + FString::Printf(TEXT("column[%d].default"), ColIdx));
+						}
+					}
+				}
+			};
+#endif // WITH_EDITORONLY_DATA (RemapResultStruct / WalkTableReferences definitions)
+
+		// Run the remap over EVERY duplicate, now that all of them (and their new
+		// remap-target paths) exist on disk from PASS 1. Order-independent.
+		for (FDupRecord& Rec : DupRecords)
+		{
+			UChooserTable* DupTable = Rec.DupTable;
+			if (!DupTable)
+			{
+				continue;
+			}
+
+			// Reset the cursors the lambdas write into for this duplicate.
+			CurRefsRemapped = 0;
+			CurRowReport.Reset();
+
+#if WITH_EDITORONLY_DATA
+			// Walk the root duplicate's own references...
+			WalkTableReferences(DupTable, FString());
+
+			// ...then recurse into embedded child choosers. The engine's ReplaceReferences
+			// (SNestedChooserTree.cpp ~104-121) iterates RootTable->NestedObjects, casts each
+			// to UChooserTable, and runs ReplaceReferencesInTable on every embedded child.
+			// For the pose-search root chooser, the child choosers are embedded NestedObjects
+			// and THEIR FNestedChooser/FEvaluateChooser rows hold the unremapped references.
+			for (int32 NestedIdx = 0; NestedIdx < DupTable->NestedObjects.Num(); ++NestedIdx)
+			{
+				if (UChooserTable* NestedChild = Cast<UChooserTable>(DupTable->NestedObjects[NestedIdx]))
+				{
+					WalkTableReferences(NestedChild, FString::Printf(TEXT("nested[%d]."), NestedIdx));
 				}
 			}
 
@@ -401,17 +696,21 @@ FMonolithActionResult FMonolithChooserActions::HandleDuplicateChooserTree(const 
 				const FString NewRoot = ApplyRemap(DupTable->RootChooser->GetPathName());
 				if (UChooserTable* R = FMonolithAssetUtils::LoadAssetByPath<UChooserTable>(NewRoot))
 				{
-					if (R != DupTable->RootChooser) { DupTable->RootChooser = R; ++RefsRemapped; }
+					if (R != DupTable->RootChooser) { DupTable->RootChooser = R; ++CurRefsRemapped; }
 				}
 			}
 
 			DupTable->MarkPackageDirty();
 			DupTable->Compile(/*bForce=*/true);
-			Entry->SetNumberField(TEXT("refs_remapped"), RefsRemapped);
-		}
 
-		Entry->SetBoolField(TEXT("ok"), true);
-		Results.Add(MakeShared<FJsonValueObject>(Entry));
+			// Re-save now that references are remapped, so a re-test reading from
+			// disk sees the remapped refs (PASS 1 saved only the bare duplicate).
+			const bool bResaved = UEditorAssetLibrary::SaveAsset(Rec.Dup->GetPathName(), /*bOnlyIfIsDirty=*/false);
+
+			Rec.Entry->SetNumberField(TEXT("refs_remapped"), CurRefsRemapped);
+			Rec.Entry->SetArrayField(TEXT("row_remap_report"), CurRowReport);
+			Rec.Entry->SetBoolField(TEXT("saved"), bResaved);
+		}
 	}
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
@@ -585,6 +884,74 @@ FMonolithActionResult FMonolithChooserActions::HandleSetResultAssetReference(con
 	Root->SetNumberField(TEXT("row"), Row);
 	Root->SetStringField(TEXT("old_asset"), OldRef);
 	Root->SetStringField(TEXT("new_asset"), NewAssetPath);
+	return FMonolithActionResult::Success(Root);
+#else
+	return FMonolithActionResult::Error(TEXT("ResultsStructs is editor-only data; not available in this build"));
+#endif
+}
+
+// ===========================================================================
+// set_evaluate_chooser_result_reference
+// ===========================================================================
+
+FMonolithActionResult FMonolithChooserActions::HandleSetEvaluateChooserResultReference(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	const FString ChildChooserPath = Params->GetStringField(TEXT("child_chooser_path"));
+
+	double RowVal = 0.0;
+	if (!Params->TryGetNumberField(TEXT("row"), RowVal))
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: row"));
+	}
+	const int32 Row = static_cast<int32>(RowVal);
+
+	if (ChildChooserPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: child_chooser_path"));
+	}
+
+	UChooserTable* Table = FMonolithAssetUtils::LoadAssetByPath<UChooserTable>(AssetPath);
+	if (!Table)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("ChooserTable not found: %s"), *AssetPath));
+	}
+
+#if WITH_EDITORONLY_DATA
+	if (!Table->ResultsStructs.IsValidIndex(Row))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("result row %d out of range (have %d rows)"), Row, Table->ResultsStructs.Num()));
+	}
+
+	FInstancedStruct& RowStruct = Table->ResultsStructs[Row];
+	FEvaluateChooser* Eval = RowStruct.GetMutablePtr<FEvaluateChooser>();
+	if (!Eval)
+	{
+		const UScriptStruct* SS = RowStruct.GetScriptStruct();
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("result row %d is not an EvaluateChooser row (type: %s); use set_result_asset_reference for asset rows"),
+			Row, SS ? *SS->GetName() : TEXT("<null>")));
+	}
+
+	UChooserTable* ChildTable = FMonolithAssetUtils::LoadAssetByPath<UChooserTable>(ChildChooserPath);
+	if (!ChildTable)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("child ChooserTable not found: %s"), *ChildChooserPath));
+	}
+
+	const FString OldRef = Eval->Chooser ? Eval->Chooser->GetPathName() : TEXT("");
+	Eval->Chooser = ChildTable;
+
+	Table->MarkPackageDirty();
+	Table->Compile(/*bForce=*/true);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), Table->GetPathName());
+	Root->SetNumberField(TEXT("row"), Row);
+	Root->SetStringField(TEXT("old_child_chooser"), OldRef);
+	Root->SetStringField(TEXT("new_child_chooser"), ChildTable->GetPathName());
 	return FMonolithActionResult::Success(Root);
 #else
 	return FMonolithActionResult::Error(TEXT("ResultsStructs is editor-only data; not available in this build"));
