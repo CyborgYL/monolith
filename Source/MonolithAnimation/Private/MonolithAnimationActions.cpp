@@ -51,6 +51,10 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "UObject/UnrealType.h" // FObjectProperty / FindFProperty (reflective Chooser read)
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
+#include "EdGraph/EdGraphPin.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonReader.h"
 #include "Editor.h"
@@ -64,11 +68,106 @@
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/Kismet2NameValidators.h"
 #include "K2Node_VariableGet.h"
+#include "K2Node_CallFunction.h"          // compare/Abs nodes for float transition rules (Phase 6)
+#include "Kismet/KismetMathLibrary.h"     // *_DoubleDouble comparisons + Abs(double)
+#include "Kismet2/CompilerResultsLog.h"   // compile + error harvest on rule authoring
+#include "Logging/TokenizedMessage.h"     // EMessageSeverity for harvested compiler messages
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "PhysicsEngine/SkeletalBodySetup.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "PhysicsEngine/PhysicsConstraintTemplate.h"
 #include "PhysicsEngine/BodyInstance.h"
+
+#if WITH_CHOOSER
+// Phase-2 read-only recursive chooser-tree collector (same module, MonolithAnimation).
+// Used to expand a referenced chooser's nested tree when recursive:true is requested.
+#include "MonolithChooserTreeCollector.h"
+// Chooser.h gives us the complete UChooserTable type for the Cast<> in the recursive branch.
+// (Chooser.Build.cs exposes this header; the module dep is added under bHasChooser.)
+#include "Chooser.h"
+#endif
+
+// ---------------------------------------------------------------------------
+// AnimGraph chooser-node resolution (file-local helpers)
+// ---------------------------------------------------------------------------
+//
+// The EvaluateChooser graph node exists in TWO forms, BOTH declared in a PRIVATE engine
+// header (ChooserUncooked/Private/EvaluateChooserNode.h) that we deliberately do NOT and
+// CANNOT #include:
+//   - v1  UK2Node_EvaluateChooser  : UCLASS(MinimalAPI, Hidden), DEPRECATED ("old
+//                                     implementation, not accessible to create new
+//                                     instances"). A modern AnimBP will not contain a
+//                                     freshly-created v1 node, but a legacy one may exist.
+//   - v2  UK2Node_EvaluateChooser2 : the modern node a real AnimBP contains today.
+//
+// Both are plain UK2Node subclasses (NOT UAnimGraphNode_*), and on BOTH the `Chooser`
+// UPROPERTY (TObjectPtr<UChooserTable>) is C++ `private`. We therefore:
+//   1. Match the node by class-name PREFIX "K2Node_EvaluateChooser" — this prefix is
+//      INTENTIONAL: it catches BOTH v1 and v2 in one test, so we never miss a legacy node
+//      while still resolving modern v2 nodes.
+//   2. Read the `Chooser` reference REFLECTIVELY via FindFProperty<FObjectProperty> +
+//      GetObjectPropertyValue_InContainer. Reflection bypasses C++ access control, which is
+//      exactly why this path is mandatory: a hard cast / Private-header #include would be
+//      impossible to compile AND would still hit an inaccessible C++ member.
+//
+// DO NOT "fix" this into a hard cast or a #include of EvaluateChooserNode.h — it is a
+// Private module header and the property is private. The reflective read is correct and
+// deliberate.
+namespace MonolithAnimGraphChooser
+{
+	/** Class-name prefix that matches BOTH v1 (UK2Node_EvaluateChooser) and v2
+	 *  (UK2Node_EvaluateChooser2). GetClass()->GetName() drops the leading 'U'. */
+	static const TCHAR* const EvaluateChooserClassPrefix = TEXT("K2Node_EvaluateChooser");
+
+	/** True if Node is an EvaluateChooser graph node (v1 or v2), matched by class-name prefix. */
+	static bool IsEvaluateChooserNode(const UEdGraphNode* Node)
+	{
+		return Node && Node->GetClass()->GetName().StartsWith(EvaluateChooserClassPrefix);
+	}
+
+	/**
+	 * Reflectively resolve the chooser asset referenced by an EvaluateChooser node.
+	 *
+	 * Reads the PRIVATE `Chooser` UPROPERTY by reflection (see file-header comment for why a
+	 * hard cast/include is impossible AND undesirable). Writes resolution status into OutObj:
+	 *   resolved        : bool — true only when the Chooser property was found AND held an asset
+	 *   chooser_asset   : string — asset path name, or empty
+	 *   resolve_detail  : string — present only on failure, why resolution failed
+	 *
+	 * @return the referenced UObject* (the UChooserTable) or nullptr on any failure.
+	 */
+	static UObject* ResolveChooserAsset(const UEdGraphNode* Node, const TSharedPtr<FJsonObject>& OutObj)
+	{
+		OutObj->SetBoolField(TEXT("resolved"), false);
+		OutObj->SetStringField(TEXT("chooser_asset"), FString());
+
+		if (!Node)
+		{
+			OutObj->SetStringField(TEXT("resolve_detail"), TEXT("null node"));
+			return nullptr;
+		}
+
+		// Read the private `Chooser` UPROPERTY reflectively — see file-header comment.
+		FObjectProperty* ChooserProp = FindFProperty<FObjectProperty>(Node->GetClass(), TEXT("Chooser"));
+		if (!ChooserProp)
+		{
+			OutObj->SetStringField(TEXT("resolve_detail"),
+				TEXT("no 'Chooser' FObjectProperty on node class (engine API may have changed)"));
+			return nullptr;
+		}
+
+		UObject* ChooserObj = ChooserProp->GetObjectPropertyValue_InContainer(Node);
+		if (!ChooserObj)
+		{
+			OutObj->SetStringField(TEXT("resolve_detail"), TEXT("'Chooser' property is unset (no asset assigned)"));
+			return nullptr;
+		}
+
+		OutObj->SetBoolField(TEXT("resolved"), true);
+		OutObj->SetStringField(TEXT("chooser_asset"), ChooserObj->GetPathName());
+		return ChooserObj;
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -185,6 +284,14 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
 			.Optional(TEXT("node_class_filter"), TEXT("string"), TEXT("Only include nodes whose class contains this substring"))
 			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Filter to a specific graph"))
+			.Optional(TEXT("include_anim_graph"), TEXT("bool"), TEXT("Also traverse the main AnimGraph (and all graphs) and surface EvaluateChooser nodes with their referenced chooser asset"), TEXT("false"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_anim_graph_choosers"),
+		TEXT("Enumerate the AnimBlueprint's EvaluateChooser graph nodes and report each node's resolved chooser asset path"),
+		FMonolithActionHandler::CreateStatic(&HandleGetAnimGraphChoosers),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Optional(TEXT("recursive"), TEXT("bool"), TEXT("Expand each referenced chooser's full nested tree (root->child) in the output"), TEXT("false"))
 			.Build());
 
 	// Notify Editing
@@ -649,14 +756,24 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("to_state"), TEXT("string"), TEXT("Destination state name"))
 			.Build());
 	Registry.RegisterAction(TEXT("animation"), TEXT("set_transition_rule"),
-		TEXT("Wire a boolean variable as the condition for a state machine transition"),
+		TEXT("Author a state machine transition's condition: a boolean variable, the sequence-player auto rule, or a numeric comparison (var/Abs(var) vs constant). Transaction-safe: rolls back on compile failure with no dirty package."),
 		FMonolithActionHandler::CreateStatic(&HandleSetTransitionRule),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
 			.Required(TEXT("machine_name"), TEXT("string"), TEXT("State machine name"))
 			.Required(TEXT("from_state"), TEXT("string"), TEXT("Source state name"))
 			.Required(TEXT("to_state"), TEXT("string"), TEXT("Destination state name"))
-			.Required(TEXT("variable_name"), TEXT("string"), TEXT("Boolean variable name to use as transition condition"))
+			.Optional(TEXT("variable_name"), TEXT("string"), TEXT("Legacy/back-compat: boolean variable name. Equivalent to rule={kind:bool, variable:<name>}. Use 'rule' for non-bool conditions."))
+			.Optional(TEXT("rule"), TEXT("object"), TEXT("Structured rule. String 'auto'/'automatic' or a bool variable name also accepted. Object forms: {kind:'bool', variable:'X'} | {kind:'auto'} | {kind:'compare', lhs:'X' or 'Abs(X)', op:'>'|'<'|'>='|'<='|'=='|'!=', rhs:<number>}. (kind:'expression' is not yet supported.)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_transition_rule"),
+		TEXT("Read back a state machine transition's current rule as structured data (kind=auto/bool/compare/none/custom, operands, op, rhs, comparison string)."),
+		FMonolithActionHandler::CreateStatic(&HandleGetTransitionRule),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("machine_name"), TEXT("string"), TEXT("State machine name"))
+			.Required(TEXT("from_state"), TEXT("string"), TEXT("Source state name"))
+			.Required(TEXT("to_state"), TEXT("string"), TEXT("Destination state name"))
 			.Build());
 
 	// Wave 16 — State Machine Authoring (#13 / #14)
@@ -678,7 +795,7 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("state_machine_name"), TEXT("string"), TEXT("Name for the state machine (default: 'New State Machine')"))
 			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Target anim graph name for layered ABPs (default: first AnimationGraphSchema graph)"))
 			.Required(TEXT("states"), TEXT("array"), TEXT("Array of {name, animation?} state specs"))
-			.Optional(TEXT("transitions"), TEXT("array"), TEXT("Array of {from, to, rule?} transition specs. rule may be a bool variable name or 'auto'/'automatic' for the sequence-player auto rule"))
+			.Optional(TEXT("transitions"), TEXT("array"), TEXT("Array of {from, to, rule?} transition specs. rule may be a bool variable name, 'auto'/'automatic' for the sequence-player auto rule, or a structured object {kind:'compare', lhs:'X' or 'Abs(X)', op:'>'|'<'|'>='|'<='|'=='|'!=', rhs:<number>}"))
 			.Optional(TEXT("entry_state"), TEXT("string"), TEXT("State to wire as the initial/entry state"))
 			.Build());
 
@@ -2026,6 +2143,8 @@ FMonolithActionResult FMonolithAnimationActions::HandleGetNodes(const TSharedPtr
 	Params->TryGetStringField(TEXT("node_class_filter"), NodeClassFilter);
 	FString GraphFilter;
 	Params->TryGetStringField(TEXT("graph_name"), GraphFilter);
+	bool bIncludeAnimGraph = false;
+	Params->TryGetBoolField(TEXT("include_anim_graph"), bIncludeAnimGraph);
 
 	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
 	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
@@ -2075,8 +2194,138 @@ FMonolithActionResult FMonolithAnimationActions::HandleGetNodes(const TSharedPtr
 		}
 	}
 
+	// Optional: also traverse the main AnimGraph (and all other graphs) for EvaluateChooser
+	// K2Nodes — these are NOT UAnimGraphNode_Base subclasses, so the loop above skips them.
+	// Surfacing them with their reflectively-resolved chooser asset is the additive behavior
+	// gated behind include_anim_graph (default off, so the existing output shape is unchanged).
+	if (bIncludeAnimGraph)
+	{
+		TArray<UEdGraph*> AllGraphs;
+		ABP->GetAllGraphs(AllGraphs); // anim graph + function graphs + ubergraph pages + sub-graphs
+		for (UEdGraph* Graph : AllGraphs)
+		{
+			if (!Graph) continue;
+			if (!GraphFilter.IsEmpty() && Graph->GetName() != GraphFilter) continue;
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				if (!MonolithAnimGraphChooser::IsEvaluateChooserNode(Node)) continue;
+
+				FString ClassName = Node->GetClass()->GetName();
+				if (!NodeClassFilter.IsEmpty() && !ClassName.Contains(NodeClassFilter)) continue;
+
+				TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+				NodeObj->SetStringField(TEXT("class"), ClassName);
+				NodeObj->SetStringField(TEXT("name"), Node->GetName());
+				NodeObj->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+				NodeObj->SetStringField(TEXT("graph"), Graph->GetName());
+				NodeObj->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+
+				// Reflectively resolve the private `Chooser` UPROPERTY (see file-header comment).
+				MonolithAnimGraphChooser::ResolveChooserAsset(Node, NodeObj);
+
+				TArray<TSharedPtr<FJsonValue>> PinsArr;
+				for (UEdGraphPin* Pin : Node->Pins)
+				{
+					if (!Pin || Pin->LinkedTo.Num() == 0) continue;
+					TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
+					PinObj->SetStringField(TEXT("name"), Pin->GetName());
+					PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Input ? TEXT("Input") : TEXT("Output"));
+					PinObj->SetNumberField(TEXT("connections"), Pin->LinkedTo.Num());
+					PinsArr.Add(MakeShared<FJsonValueObject>(PinObj));
+				}
+				NodeObj->SetArrayField(TEXT("connected_pins"), PinsArr);
+				NodesArr.Add(MakeShared<FJsonValueObject>(NodeObj));
+			}
+		}
+	}
+
 	Root->SetArrayField(TEXT("nodes"), NodesArr);
 	Root->SetNumberField(TEXT("count"), NodesArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetAnimGraphChoosers(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	bool bRecursive = false;
+	Params->TryGetBoolField(TEXT("recursive"), bRecursive);
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetBoolField(TEXT("recursive"), bRecursive);
+	TArray<TSharedPtr<FJsonValue>> ChoosersArr;
+
+	// Walk EVERY graph in the AnimBP (main AnimGraph, function graphs, ubergraph pages,
+	// nested sub-graphs) — an EvaluateChooser K2Node can live in any of them.
+	TArray<UEdGraph*> AllGraphs;
+	ABP->GetAllGraphs(AllGraphs);
+	for (UEdGraph* Graph : AllGraphs)
+	{
+		if (!Graph) continue;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			// Prefix match catches BOTH the deprecated v1 and the modern v2 node — see the
+			// file-header comment on MonolithAnimGraphChooser for the v1/v2 rationale.
+			if (!MonolithAnimGraphChooser::IsEvaluateChooserNode(Node)) continue;
+
+			TSharedPtr<FJsonObject> ChooserObj = MakeShared<FJsonObject>();
+			ChooserObj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+			ChooserObj->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+			ChooserObj->SetStringField(TEXT("node_title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+			ChooserObj->SetStringField(TEXT("graph"), Graph->GetName());
+
+			// Reflectively resolve the private `Chooser` UPROPERTY (see file-header comment for
+			// why this is deliberately a reflective read, never a hard cast / Private #include).
+			UObject* ChooserAsset = MonolithAnimGraphChooser::ResolveChooserAsset(Node, ChooserObj);
+
+			// Surface the node's output-pin link endpoints (chooser nodes feed downstream nodes).
+			TArray<TSharedPtr<FJsonValue>> OutputLinksArr;
+			for (UEdGraphPin* Pin : Node->Pins)
+			{
+				if (!Pin || Pin->Direction != EGPD_Output) continue;
+				for (UEdGraphPin* Linked : Pin->LinkedTo)
+				{
+					if (!Linked || !Linked->GetOwningNodeUnchecked()) continue;
+					TSharedPtr<FJsonObject> LinkObj = MakeShared<FJsonObject>();
+					LinkObj->SetStringField(TEXT("from_pin"), Pin->GetName());
+					LinkObj->SetStringField(TEXT("to_node"), Linked->GetOwningNode()->GetName());
+					LinkObj->SetStringField(TEXT("to_pin"), Linked->GetName());
+					OutputLinksArr.Add(MakeShared<FJsonValueObject>(LinkObj));
+				}
+			}
+			ChooserObj->SetArrayField(TEXT("output_pin_links"), OutputLinksArr);
+
+			// Optional recursive expansion of the referenced chooser's nested tree, via the
+			// Phase-2 shared collector. Two gates: WITH_CHOOSER (the UChooserTable type + the
+			// collector) AND WITH_EDITORONLY_DATA (the chooser ROW DATA the collector walks).
+			// Outside those configs (cooked/release) the expansion is simply skipped — the node
+			// + resolved asset path still surface, keeping the action release-build-safe.
+			if (bRecursive && ChooserAsset)
+			{
+#if WITH_CHOOSER && WITH_EDITORONLY_DATA
+				if (UChooserTable* Table = Cast<UChooserTable>(ChooserAsset))
+				{
+					// Supply our own visited-set — REQUIRED by the collector's recursion-entry
+					// contract; it forces the cycle guard so reuse here cannot loop forever.
+					TSet<UChooserTable*> VisitedTables;
+					TSharedPtr<FJsonObject> Tree = MonolithChooserTree::CollectTree(Table, VisitedTables);
+					if (Tree.IsValid())
+					{
+						ChooserObj->SetObjectField(TEXT("chooser_tree"), Tree);
+					}
+				}
+#endif // WITH_CHOOSER && WITH_EDITORONLY_DATA
+			}
+
+			ChoosersArr.Add(MakeShared<FJsonValueObject>(ChooserObj));
+		}
+	}
+
+	Root->SetArrayField(TEXT("choosers"), ChoosersArr);
+	Root->SetNumberField(TEXT("count"), ChoosersArr.Num());
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -4835,6 +5084,108 @@ static UAnimationStateMachineGraph* FindStateMachineGraphByName(UAnimBlueprint* 
 	return nullptr;
 }
 
+// Helper: true if VariableName resolves to an inherited Blueprint-visible bool on the
+// ABP's skeleton/generated/parent class chain (e.g. a BlueprintReadOnly bool UPROPERTY on a
+// native AnimInstance parent). NewVariables-only validation misses these, so transition-rule
+// gates use this fallback before rejecting. Downstream SetSelfMember already resolves them.
+static bool IsInheritedBlueprintVisibleBool(UAnimBlueprint* ABP, const FString& VariableName)
+{
+	if (!ABP) return false;
+	UClass* SearchClass = ABP->SkeletonGeneratedClass ? ABP->SkeletonGeneratedClass : ABP->GeneratedClass;
+	if (!SearchClass) return false;
+	const FBoolProperty* BoolProp = FindFProperty<FBoolProperty>(SearchClass, *VariableName);
+	return BoolProp && BoolProp->HasAnyPropertyFlags(CPF_BlueprintVisible);
+}
+
+// Helper: true if VariableName resolves to an inherited Blueprint-visible float/double
+// UPROPERTY on the ABP's skeleton/generated/parent class chain. Mirrors the inherited-bool
+// fallback above for Phase 6 float-comparison operands (a compare LHS may be an inherited C++
+// float UPROPERTY such as a movement-speed accessor on a native AnimInstance parent).
+// Blueprint "float" maps to FDoubleProperty in UE5; legacy FFloatProperty is also accepted.
+static bool IsInheritedBlueprintVisibleFloat(UAnimBlueprint* ABP, const FString& VariableName)
+{
+	if (!ABP) return false;
+	UClass* SearchClass = ABP->SkeletonGeneratedClass ? ABP->SkeletonGeneratedClass : ABP->GeneratedClass;
+	if (!SearchClass) return false;
+	if (const FDoubleProperty* DblProp = FindFProperty<FDoubleProperty>(SearchClass, *VariableName))
+	{
+		return DblProp->HasAnyPropertyFlags(CPF_BlueprintVisible);
+	}
+	if (const FFloatProperty* FltProp = FindFProperty<FFloatProperty>(SearchClass, *VariableName))
+	{
+		return FltProp->HasAnyPropertyFlags(CPF_BlueprintVisible);
+	}
+	return false;
+}
+
+// Helper: validate that VariableName is a usable float/numeric operand for a compare rule —
+// either a BP-declared NewVariables float/double/int, or an inherited Blueprint-visible
+// float/double UPROPERTY. Returns true if usable; fills OutFoundCategory for diagnostics.
+static bool IsUsableFloatOperand(UAnimBlueprint* ABP, const FString& VariableName, FString& OutFoundCategory)
+{
+	if (!ABP) return false;
+	for (const FBPVariableDescription& V : ABP->NewVariables)
+	{
+		if (V.VarName.ToString() == VariableName)
+		{
+			const FString Cat = V.VarType.PinCategory.ToString();
+			OutFoundCategory = Cat;
+			// UE5 numeric pin categories: "real" (float/double) and "int"/"int64".
+			return Cat.Equals(TEXT("real"), ESearchCase::IgnoreCase)
+				|| Cat.Equals(TEXT("float"), ESearchCase::IgnoreCase)
+				|| Cat.Equals(TEXT("double"), ESearchCase::IgnoreCase)
+				|| Cat.Equals(TEXT("int"), ESearchCase::IgnoreCase)
+				|| Cat.Equals(TEXT("int64"), ESearchCase::IgnoreCase);
+		}
+	}
+	if (IsInheritedBlueprintVisibleFloat(ABP, VariableName))
+	{
+		OutFoundCategory = TEXT("inherited-float");
+		return true;
+	}
+	return false;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — float/compare transition rules (shared rule-graph authoring)
+// ---------------------------------------------------------------------------
+//
+// Maps a compare operator token to the KismetMathLibrary double-comparison function name.
+// Blueprint "float" is a double in UE5, so the *_DoubleDouble variants are correct.
+// Verified offline (UE 5.7 KismetMathLibrary.h): Greater_DoubleDouble / Less_DoubleDouble /
+// GreaterEqual_DoubleDouble / LessEqual_DoubleDouble / EqualEqual_DoubleDouble /
+// NotEqual_DoubleDouble, all (double A, double B) -> bool.
+static FName CompareOpToKismetFunctionName(const FString& Op)
+{
+	if (Op == TEXT(">"))  return TEXT("Greater_DoubleDouble");
+	if (Op == TEXT("<"))  return TEXT("Less_DoubleDouble");
+	if (Op == TEXT(">=")) return TEXT("GreaterEqual_DoubleDouble");
+	if (Op == TEXT("<=")) return TEXT("LessEqual_DoubleDouble");
+	if (Op == TEXT("==")) return TEXT("EqualEqual_DoubleDouble");
+	if (Op == TEXT("!=")) return TEXT("NotEqual_DoubleDouble");
+	return NAME_None;
+}
+
+// Resolve the variable-value output pin from a freshly-allocated VariableGet node, tolerant of
+// pin-name variance (named pin first, then any non-self output). Mirrors the existing
+// bool-rule wiring at HandleSetTransitionRule.
+static UEdGraphPin* FindVariableGetOutputPin(UK2Node_VariableGet* VarGetNode, const FString& VariableName)
+{
+	if (!VarGetNode) return nullptr;
+	if (UEdGraphPin* Named = VarGetNode->FindPin(FName(*VariableName), EGPD_Output))
+	{
+		return Named;
+	}
+	for (UEdGraphPin* Pin : VarGetNode->Pins)
+	{
+		if (Pin && Pin->Direction == EGPD_Output && Pin->PinName != TEXT("self"))
+		{
+			return Pin;
+		}
+	}
+	return nullptr;
+}
+
 // Helper: find a state node by exact name within a state machine graph
 static UAnimStateNode* FindStateNodeByName(UAnimationStateMachineGraph* SMGraph, const FString& StateName)
 {
@@ -4981,68 +5332,433 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddTransition(const TShar
 	return FMonolithActionResult::Success(Root);
 }
 
-FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const TSharedPtr<FJsonObject>& Params)
+// Parsed representation of a structured transition rule. A plain-string `rule` collapses to
+// kind=bool (variable) or kind=auto, preserving full back-compat with the legacy string form.
+struct FParsedTransitionRule
 {
-	FString AssetPath    = Params->GetStringField(TEXT("asset_path"));
-	FString MachineName  = Params->GetStringField(TEXT("machine_name"));
-	FString FromState    = Params->GetStringField(TEXT("from_state"));
-	FString ToState      = Params->GetStringField(TEXT("to_state"));
-	FString VariableName = Params->GetStringField(TEXT("variable_name"));
+	enum class EKind { Bool, Auto, Compare, Expression, Invalid };
+	EKind   Kind = EKind::Invalid;
+	FString Variable;     // bool: variable name; compare: lhs operand variable name
+	bool    bUseAbs = false; // compare: wrap lhs in Abs(...)
+	FString Op;           // compare: one of > < >= <= == !=
+	double  Rhs = 0.0;    // compare: constant right-hand side
+	FString ExpressionText; // expression kind: raw text (deferred)
+	FString ParseError;   // populated when Kind == Invalid
+};
 
-	if (MachineName.IsEmpty())  return FMonolithActionResult::Error(TEXT("Missing required parameter: machine_name"));
-	if (FromState.IsEmpty())    return FMonolithActionResult::Error(TEXT("Missing required parameter: from_state"));
-	if (ToState.IsEmpty())      return FMonolithActionResult::Error(TEXT("Missing required parameter: to_state"));
-	if (VariableName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: variable_name"));
+// Parse the JSON `rule` field into FParsedTransitionRule. Accepts BOTH the legacy plain-string
+// form (back-compat: "auto"/"automatic" -> auto, anything else -> bool variable) AND the
+// structured object form { kind: bool|auto|compare|expression, ... }.
+static FParsedTransitionRule ParseTransitionRule(const TSharedPtr<FJsonObject>& Params)
+{
+	FParsedTransitionRule Out;
 
-	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
-	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
-
-	// Validate variable exists and is boolean
-	const FBPVariableDescription* VarDesc = nullptr;
-	for (const FBPVariableDescription& V : ABP->NewVariables)
+	// Legacy/back-compat: a plain string `rule` field.
+	FString RuleStr;
+	if (Params->TryGetStringField(TEXT("rule"), RuleStr))
 	{
-		if (V.VarName.ToString() == VariableName)
+		if (RuleStr.Equals(TEXT("auto"), ESearchCase::IgnoreCase) || RuleStr.Equals(TEXT("automatic"), ESearchCase::IgnoreCase))
 		{
-			VarDesc = &V;
-			break;
+			Out.Kind = FParsedTransitionRule::EKind::Auto;
 		}
-	}
-	if (!VarDesc)
-	{
-		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Variable '%s' not found in ABP. Use get_abp_variables to list available variables."), *VariableName));
-	}
-	if (!VarDesc->VarType.PinCategory.ToString().Equals(TEXT("bool"), ESearchCase::IgnoreCase))
-	{
-		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Variable '%s' is type '%s', not bool. Transition rules require a boolean variable."),
-			*VariableName, *VarDesc->VarType.PinCategory.ToString()));
+		else
+		{
+			Out.Kind = FParsedTransitionRule::EKind::Bool;
+			Out.Variable = RuleStr;
+		}
+		return Out;
 	}
 
-	UAnimationStateMachineGraph* SMGraph = FindStateMachineGraphByName(ABP, MachineName);
-	if (!SMGraph) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' not found in ABP"), *MachineName));
+	// Structured object `rule`.
+	const TSharedPtr<FJsonObject>* RuleObjPtr = nullptr;
+	if (!Params->TryGetObjectField(TEXT("rule"), RuleObjPtr) || !RuleObjPtr || !RuleObjPtr->IsValid())
+	{
+		Out.Kind = FParsedTransitionRule::EKind::Invalid;
+		Out.ParseError = TEXT("Missing 'rule'. Provide either a string (bool variable name or 'auto') or an object { kind: bool|auto|compare|expression, ... }.");
+		return Out;
+	}
+	const TSharedPtr<FJsonObject>& RuleObj = *RuleObjPtr;
 
-	// Find the transition node connecting the two states
-	UAnimStateTransitionNode* TransNode = nullptr;
+	FString Kind = RuleObj->HasField(TEXT("kind")) ? RuleObj->GetStringField(TEXT("kind")) : FString();
+	if (Kind.Equals(TEXT("auto"), ESearchCase::IgnoreCase))
+	{
+		Out.Kind = FParsedTransitionRule::EKind::Auto;
+		return Out;
+	}
+	if (Kind.Equals(TEXT("bool"), ESearchCase::IgnoreCase))
+	{
+		FString VarName;
+		if (!RuleObj->TryGetStringField(TEXT("variable"), VarName) || VarName.IsEmpty())
+		{
+			Out.Kind = FParsedTransitionRule::EKind::Invalid;
+			Out.ParseError = TEXT("rule.kind=bool requires a non-empty 'variable' field.");
+			return Out;
+		}
+		Out.Kind = FParsedTransitionRule::EKind::Bool;
+		Out.Variable = VarName;
+		return Out;
+	}
+	if (Kind.Equals(TEXT("compare"), ESearchCase::IgnoreCase))
+	{
+		FString Lhs;
+		if (!RuleObj->TryGetStringField(TEXT("lhs"), Lhs) || Lhs.IsEmpty())
+		{
+			Out.Kind = FParsedTransitionRule::EKind::Invalid;
+			Out.ParseError = TEXT("rule.kind=compare requires a non-empty 'lhs' field (variable name, optionally wrapped as Abs(Var)).");
+			return Out;
+		}
+		// Allow lhs of the form "Abs(Var)" as a convenience for the common magnitude compare.
+		FString LhsTrimmed = Lhs.TrimStartAndEnd();
+		if (LhsTrimmed.StartsWith(TEXT("Abs(")) && LhsTrimmed.EndsWith(TEXT(")")))
+		{
+			Out.bUseAbs = true;
+			Out.Variable = LhsTrimmed.Mid(4, LhsTrimmed.Len() - 5).TrimStartAndEnd();
+		}
+		else
+		{
+			// Explicit abs flag also supported.
+			RuleObj->TryGetBoolField(TEXT("abs"), Out.bUseAbs);
+			Out.Variable = LhsTrimmed;
+		}
+		if (Out.Variable.IsEmpty())
+		{
+			Out.Kind = FParsedTransitionRule::EKind::Invalid;
+			Out.ParseError = TEXT("rule.kind=compare 'lhs' resolved to an empty operand name.");
+			return Out;
+		}
+
+		FString Op;
+		if (!RuleObj->TryGetStringField(TEXT("op"), Op) || CompareOpToKismetFunctionName(Op).IsNone())
+		{
+			Out.Kind = FParsedTransitionRule::EKind::Invalid;
+			Out.ParseError = TEXT("rule.kind=compare requires 'op' to be one of: > < >= <= == != .");
+			return Out;
+		}
+		Out.Op = Op;
+
+		double Rhs = 0.0;
+		if (!RuleObj->TryGetNumberField(TEXT("rhs"), Rhs))
+		{
+			Out.Kind = FParsedTransitionRule::EKind::Invalid;
+			Out.ParseError = TEXT("rule.kind=compare requires a numeric 'rhs' constant.");
+			return Out;
+		}
+		Out.Rhs = Rhs;
+		Out.Kind = FParsedTransitionRule::EKind::Compare;
+		return Out;
+	}
+	if (Kind.Equals(TEXT("expression"), ESearchCase::IgnoreCase))
+	{
+		// Arbitrary-expression graph authoring is intentionally NOT implemented in this pass —
+		// safe parsing + multi-node graph synthesis of free-form expressions is too large to do
+		// robustly here. Callers needing magnitude/threshold rules use kind=compare instead.
+		RuleObj->TryGetStringField(TEXT("text"), Out.ExpressionText);
+		Out.Kind = FParsedTransitionRule::EKind::Expression;
+		return Out;
+	}
+
+	Out.Kind = FParsedTransitionRule::EKind::Invalid;
+	Out.ParseError = FString::Printf(TEXT("Unknown rule.kind '%s'. Supported: bool, auto, compare. (expression is not yet supported.)"), *Kind);
+	return Out;
+}
+
+// Author a float-compare rule into a transition's bound rule graph: VariableGet(lhs) ->
+// [optional Abs] -> Compare(op, rhs) -> result.bCanEnterTransition. Pure node authoring +
+// wiring only; the CALLER owns the transaction, compile, and rollback. Returns true on full
+// wire-through; on any failure fills OutError and the caller must roll the transaction back.
+static bool AuthorCompareRuleNodes(
+	UEdGraph* RuleGraph,
+	UAnimGraphNode_TransitionResult* ResultNode,
+	UEdGraphPin* ResultPin,
+	const FString& Lhs,
+	bool bUseAbs,
+	const FString& Op,
+	double Rhs,
+	FString& OutError)
+{
+	if (!RuleGraph || !ResultNode || !ResultPin)
+	{
+		OutError = TEXT("Internal: null rule graph / result node / result pin.");
+		return false;
+	}
+
+	const UEdGraphSchema* RuleSchema = RuleGraph->GetSchema();
+	if (!RuleSchema)
+	{
+		OutError = TEXT("Rule graph has no schema.");
+		return false;
+	}
+
+	RuleGraph->Modify();
+	ResultPin->BreakAllPinLinks();
+
+	const int32 BaseX = ResultNode->NodePosX;
+	const int32 BaseY = ResultNode->NodePosY;
+
+	// 1) VariableGet for the lhs operand. SetSelfMember resolves inherited members too
+	//    (same idiom as the bool-rule path).
+	UK2Node_VariableGet* VarGetNode = NewObject<UK2Node_VariableGet>(RuleGraph);
+	VarGetNode->VariableReference.SetSelfMember(FName(*Lhs));
+	RuleGraph->AddNode(VarGetNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+	VarGetNode->NodePosX = BaseX - 600;
+	VarGetNode->NodePosY = BaseY;
+	VarGetNode->AllocateDefaultPins();
+
+	UEdGraphPin* VarOutPin = FindVariableGetOutputPin(VarGetNode, Lhs);
+	if (!VarOutPin)
+	{
+		OutError = FString::Printf(TEXT("Could not resolve output pin for operand '%s' (variable may not exist or is not readable)."), *Lhs);
+		return false;
+	}
+
+	// 2) Optional Abs(double) node.
+	UEdGraphPin* LhsValuePin = VarOutPin;
+	if (bUseAbs)
+	{
+		UFunction* AbsFn = UKismetMathLibrary::StaticClass()->FindFunctionByName(TEXT("Abs"));
+		if (!AbsFn)
+		{
+			OutError = TEXT("Internal: UKismetMathLibrary::Abs not found.");
+			return false;
+		}
+		UK2Node_CallFunction* AbsNode = NewObject<UK2Node_CallFunction>(RuleGraph);
+		AbsNode->SetFromFunction(AbsFn);
+		RuleGraph->AddNode(AbsNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+		AbsNode->NodePosX = BaseX - 400;
+		AbsNode->NodePosY = BaseY;
+		AbsNode->AllocateDefaultPins();
+
+		UEdGraphPin* AbsInPin  = AbsNode->FindPin(TEXT("A"), EGPD_Input);
+		UEdGraphPin* AbsOutPin = AbsNode->FindPin(TEXT("ReturnValue"), EGPD_Output);
+		if (!AbsInPin || !AbsOutPin)
+		{
+			OutError = TEXT("Abs node missing expected pins (A / ReturnValue).");
+			return false;
+		}
+		if (!RuleSchema->TryCreateConnection(VarOutPin, AbsInPin))
+		{
+			OutError = FString::Printf(TEXT("Failed to wire operand '%s' into Abs."), *Lhs);
+			return false;
+		}
+		LhsValuePin = AbsOutPin;
+	}
+
+	// 3) Comparison node.
+	const FName CmpFnName = CompareOpToKismetFunctionName(Op);
+	UFunction* CmpFn = UKismetMathLibrary::StaticClass()->FindFunctionByName(CmpFnName);
+	if (!CmpFn)
+	{
+		OutError = FString::Printf(TEXT("Internal: comparison function '%s' not found."), *CmpFnName.ToString());
+		return false;
+	}
+	UK2Node_CallFunction* CmpNode = NewObject<UK2Node_CallFunction>(RuleGraph);
+	CmpNode->SetFromFunction(CmpFn);
+	RuleGraph->AddNode(CmpNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+	CmpNode->NodePosX = BaseX - 200;
+	CmpNode->NodePosY = BaseY;
+	CmpNode->AllocateDefaultPins();
+
+	UEdGraphPin* CmpAPin   = CmpNode->FindPin(TEXT("A"), EGPD_Input);
+	UEdGraphPin* CmpBPin   = CmpNode->FindPin(TEXT("B"), EGPD_Input);
+	UEdGraphPin* CmpRetPin = CmpNode->FindPin(TEXT("ReturnValue"), EGPD_Output);
+	if (!CmpAPin || !CmpBPin || !CmpRetPin)
+	{
+		OutError = TEXT("Comparison node missing expected pins (A / B / ReturnValue).");
+		return false;
+	}
+
+	if (!RuleSchema->TryCreateConnection(LhsValuePin, CmpAPin))
+	{
+		OutError = TEXT("Failed to wire operand into comparison input A.");
+		return false;
+	}
+	// rhs constant -> default value on the B pin.
+	CmpBPin->DefaultValue = FString::SanitizeFloat(Rhs);
+
+	// 4) Compare result -> bCanEnterTransition.
+	if (!RuleSchema->TryCreateConnection(CmpRetPin, ResultPin))
+	{
+		OutError = TEXT("Failed to wire comparison result into bCanEnterTransition.");
+		return false;
+	}
+
+	OutError.Empty();
+	return true;
+}
+
+// Locate a transition node by from/to state names within a state machine graph.
+static UAnimStateTransitionNode* FindTransitionNode(UAnimationStateMachineGraph* SMGraph, const FString& FromState, const FString& ToState)
+{
+	if (!SMGraph) return nullptr;
 	for (UEdGraphNode* Node : SMGraph->Nodes)
 	{
 		UAnimStateTransitionNode* TN = Cast<UAnimStateTransitionNode>(Node);
 		if (!TN) continue;
-
 		UAnimStateNodeBase* PrevState = TN->GetPreviousState();
 		UAnimStateNodeBase* NextState = TN->GetNextState();
 		if (PrevState && NextState &&
 			PrevState->GetStateName() == FromState &&
 			NextState->GetStateName() == ToState)
 		{
-			TransNode = TN;
-			break;
+			return TN;
 		}
 	}
+	return nullptr;
+}
+
+// Harvest compiler errors/warnings from a results log into string arrays. Mirrors the
+// canonical capture in MonolithCommonUITemplateActions.cpp.
+static void HarvestCompilerMessages(const FCompilerResultsLog& Results, TArray<FString>& OutErrors, TArray<FString>& OutWarnings)
+{
+	for (const TSharedRef<FTokenizedMessage>& M : Results.Messages)
+	{
+		const FString Text = M->ToText().ToString();
+		const EMessageSeverity::Type Sev = M->GetSeverity();
+		if (Sev == EMessageSeverity::Error)
+		{
+			OutErrors.Add(Text);
+		}
+		else if (Sev == EMessageSeverity::Warning || Sev == EMessageSeverity::PerformanceWarning)
+		{
+			OutWarnings.Add(Text);
+		}
+	}
+}
+
+static FString BlueprintStatusToString(EBlueprintStatus Status)
+{
+	switch (Status)
+	{
+		case BS_UpToDate:             return TEXT("BS_UpToDate");
+		case BS_UpToDateWithWarnings: return TEXT("BS_UpToDateWithWarnings");
+		case BS_Dirty:                return TEXT("BS_Dirty");
+		case BS_Error:                return TEXT("BS_Error");
+		case BS_BeingCreated:         return TEXT("BS_BeingCreated");
+		default:                      return TEXT("BS_Unknown");
+	}
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath    = Params->GetStringField(TEXT("asset_path"));
+	FString MachineName  = Params->GetStringField(TEXT("machine_name"));
+	FString FromState    = Params->GetStringField(TEXT("from_state"));
+	FString ToState      = Params->GetStringField(TEXT("to_state"));
+
+	if (MachineName.IsEmpty())  return FMonolithActionResult::Error(TEXT("Missing required parameter: machine_name"));
+	if (FromState.IsEmpty())    return FMonolithActionResult::Error(TEXT("Missing required parameter: from_state"));
+	if (ToState.IsEmpty())      return FMonolithActionResult::Error(TEXT("Missing required parameter: to_state"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	// --- Resolve the rule spec (back-compat) ---------------------------------------------
+	// Legacy form: a bare `variable_name` (string) meaning a bool-variable rule. New form: a
+	// structured `rule` object (or plain `rule` string). If both are absent, error.
+	FParsedTransitionRule ParsedRule;
+	FString LegacyVariableName = Params->GetStringField(TEXT("variable_name"));
+	if (!Params->HasField(TEXT("rule")) && !LegacyVariableName.IsEmpty())
+	{
+		ParsedRule.Kind = FParsedTransitionRule::EKind::Bool;
+		ParsedRule.Variable = LegacyVariableName;
+	}
+	else
+	{
+		ParsedRule = ParseTransitionRule(Params);
+	}
+
+	if (ParsedRule.Kind == FParsedTransitionRule::EKind::Invalid)
+	{
+		return FMonolithActionResult::Error(ParsedRule.ParseError.IsEmpty()
+			? TEXT("Invalid rule. Provide 'variable_name' (legacy bool), or 'rule' as a string or { kind: bool|auto|compare }.")
+			: ParsedRule.ParseError);
+	}
+
+	// expression: explicit, clean deferral — no fragile graph surgery shipped this pass.
+	if (ParsedRule.Kind == FParsedTransitionRule::EKind::Expression)
+	{
+		return FMonolithActionResult::Error(
+			TEXT("kind:expression not yet supported. Use kind:compare for var/Abs(var) vs constant (op one of > < >= <= == !=)."));
+	}
+
+	// --- Operand validation (before touching the graph) ----------------------------------
+	if (ParsedRule.Kind == FParsedTransitionRule::EKind::Bool)
+	{
+		const FBPVariableDescription* VarDesc = nullptr;
+		for (const FBPVariableDescription& V : ABP->NewVariables)
+		{
+			if (V.VarName.ToString() == ParsedRule.Variable) { VarDesc = &V; break; }
+		}
+		if (VarDesc)
+		{
+			if (!VarDesc->VarType.PinCategory.ToString().Equals(TEXT("bool"), ESearchCase::IgnoreCase))
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Variable '%s' is type '%s', not bool. kind:bool rules require a boolean variable."),
+					*ParsedRule.Variable, *VarDesc->VarType.PinCategory.ToString()));
+			}
+		}
+		else if (!IsInheritedBlueprintVisibleBool(ABP, ParsedRule.Variable))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Variable '%s' not found in ABP (no BP variable or inherited Blueprint-visible bool). Use get_abp_variables to list available variables."), *ParsedRule.Variable));
+		}
+	}
+	else if (ParsedRule.Kind == FParsedTransitionRule::EKind::Compare)
+	{
+		FString FoundCat;
+		if (!IsUsableFloatOperand(ABP, ParsedRule.Variable, FoundCat))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Compare operand '%s' is not a usable numeric variable (no BP float/int or inherited Blueprint-visible float). Use get_abp_variables to list available variables."), *ParsedRule.Variable));
+		}
+	}
+
+	UAnimationStateMachineGraph* SMGraph = FindStateMachineGraphByName(ABP, MachineName);
+	if (!SMGraph) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' not found in ABP"), *MachineName));
+
+	UAnimStateTransitionNode* TransNode = FindTransitionNode(SMGraph, FromState, ToState);
 	if (!TransNode)
 	{
 		return FMonolithActionResult::Error(FString::Printf(
 			TEXT("No transition found from '%s' to '%s'. Use add_transition first."), *FromState, *ToState));
+	}
+
+	// --- auto rule: no rule-graph wiring required ----------------------------------------
+	if (ParsedRule.Kind == FParsedTransitionRule::EKind::Auto)
+	{
+		const bool bWasDirty = ABP->GetOutermost()->IsDirty();
+		GEditor->BeginTransaction(FText::FromString(TEXT("Set Transition Rule (auto)")));
+		TransNode->Modify();
+		TransNode->bAutomaticRuleBasedOnSequencePlayerInState = true;
+		GEditor->EndTransaction();
+
+		FCompilerResultsLog Results; Results.bSilentMode = true;
+		FKismetEditorUtilities::CompileBlueprint(ABP, EBlueprintCompileOptions::None, &Results);
+
+		TArray<FString> Errors, Warnings;
+		HarvestCompilerMessages(Results, Errors, Warnings);
+
+		if (ABP->Status == BS_Error)
+		{
+			// Transaction already committed — revert via the editor undo buffer.
+			GEditor->UndoTransaction();
+			FKismetEditorUtilities::CompileBlueprint(ABP);
+			ABP->GetOutermost()->SetDirtyFlag(bWasDirty);
+			return FMonolithActionResult::Error(
+				TEXT("Auto rule compiled with errors — rolled back, no package change."));
+		}
+
+		ABP->MarkPackageDirty();
+
+		TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetStringField(TEXT("asset_path"), AssetPath);
+		Root->SetStringField(TEXT("machine_name"), MachineName);
+		Root->SetStringField(TEXT("from_state"), FromState);
+		Root->SetStringField(TEXT("to_state"), ToState);
+		Root->SetStringField(TEXT("rule_kind"), TEXT("auto"));
+		Root->SetStringField(TEXT("compile_status"), BlueprintStatusToString(ABP->Status));
+		return FMonolithActionResult::Success(Root);
 	}
 
 	UEdGraph* RuleGraph = TransNode->GetBoundGraph();
@@ -5051,7 +5767,6 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 		return FMonolithActionResult::Error(TEXT("Transition has no bound rule graph"));
 	}
 
-	// Find the UAnimGraphNode_TransitionResult node in the rule graph
 	UAnimGraphNode_TransitionResult* ResultNode = nullptr;
 	for (UEdGraphNode* N : RuleGraph->Nodes)
 	{
@@ -5063,66 +5778,281 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 		return FMonolithActionResult::Error(TEXT("Transition rule graph has no result node"));
 	}
 
-	// Find bCanEnterTransition input pin on the result node
 	UEdGraphPin* ResultPin = ResultNode->FindPin(TEXT("bCanEnterTransition"), EGPD_Input);
 	if (!ResultPin)
 	{
 		return FMonolithActionResult::Error(TEXT("Could not find bCanEnterTransition pin on transition result node"));
 	}
 
-	GEditor->BeginTransaction(FText::FromString(TEXT("Set Transition Rule")));
-	RuleGraph->Modify();
+	// --- Transaction-safe authoring ------------------------------------------------------
+	// Rollback mechanism: record the package's pre-authoring dirty state, wrap the node
+	// authoring in a transaction (RuleGraph->Modify() snapshots the prior graph state), then
+	// compile AFTER closing the transaction. Two rollback paths:
+	//   * authoring fails BEFORE EndTransaction (operand/pin wire) -> CancelTransaction(Index)
+	//     discards the still-open transaction outright.
+	//   * compile fails AFTER EndTransaction (BS_Error) -> UndoTransaction() reverts the
+	//     committed authoring via the editor undo buffer.
+	// Either path then recompiles to a clean state and restores the dirty flag to its prior
+	// value, leaving NO half-authored graph and NO dirtied package. Only on success do we
+	// MarkPackageDirty.
+	const bool bWasDirty = ABP->GetOutermost()->IsDirty();
+	const int32 TxIndex = GEditor->BeginTransaction(FText::FromString(TEXT("Set Transition Rule")));
 
-	// Clear any existing wiring before connecting our getter
-	ResultPin->BreakAllPinLinks();
+	FString AuthorError;
+	bool bAuthored = false;
 
-	// Spawn a UK2Node_VariableGet for the boolean variable
-	UK2Node_VariableGet* VarGetNode = NewObject<UK2Node_VariableGet>(RuleGraph);
-	VarGetNode->VariableReference.SetSelfMember(FName(*VariableName));
-	RuleGraph->AddNode(VarGetNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
-	VarGetNode->NodePosX = ResultNode->NodePosX - 200;
-	VarGetNode->NodePosY = ResultNode->NodePosY;
-	VarGetNode->AllocateDefaultPins();
-
-	// Find the output value pin — first try the variable name, then any non-self output pin
-	UEdGraphPin* GetterOutputPin = VarGetNode->FindPin(FName(*VariableName), EGPD_Output);
-	if (!GetterOutputPin)
+	if (ParsedRule.Kind == FParsedTransitionRule::EKind::Bool)
 	{
-		for (UEdGraphPin* Pin : VarGetNode->Pins)
+		RuleGraph->Modify();
+		ResultPin->BreakAllPinLinks();
+
+		UK2Node_VariableGet* VarGetNode = NewObject<UK2Node_VariableGet>(RuleGraph);
+		VarGetNode->VariableReference.SetSelfMember(FName(*ParsedRule.Variable));
+		RuleGraph->AddNode(VarGetNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+		VarGetNode->NodePosX = ResultNode->NodePosX - 200;
+		VarGetNode->NodePosY = ResultNode->NodePosY;
+		VarGetNode->AllocateDefaultPins();
+
+		UEdGraphPin* GetterOutputPin = FindVariableGetOutputPin(VarGetNode, ParsedRule.Variable);
+		const UEdGraphSchema* RuleSchema = RuleGraph->GetSchema();
+		if (GetterOutputPin && RuleSchema && RuleSchema->TryCreateConnection(GetterOutputPin, ResultPin))
 		{
-			if (Pin && Pin->Direction == EGPD_Output && Pin->PinName != TEXT("self"))
-			{
-				GetterOutputPin = Pin;
-				break;
-			}
+			bAuthored = true;
+		}
+		else
+		{
+			AuthorError = FString::Printf(TEXT("Failed to wire bool variable '%s' into the rule result."), *ParsedRule.Variable);
 		}
 	}
-
-	bool bWired = false;
-	if (GetterOutputPin)
+	else // Compare
 	{
-		const UEdGraphSchema* RuleSchema = RuleGraph->GetSchema();
-		if (RuleSchema)
-		{
-			bWired = RuleSchema->TryCreateConnection(GetterOutputPin, ResultPin);
-		}
+		bAuthored = AuthorCompareRuleNodes(RuleGraph, ResultNode, ResultPin,
+			ParsedRule.Variable, ParsedRule.bUseAbs, ParsedRule.Op, ParsedRule.Rhs, AuthorError);
+	}
+
+	if (!bAuthored)
+	{
+		GEditor->CancelTransaction(TxIndex);
+		// Recompile to restore a clean, consistent state, then reset the dirty flag.
+		FKismetEditorUtilities::CompileBlueprint(ABP);
+		ABP->GetOutermost()->SetDirtyFlag(bWasDirty);
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Rule authoring failed (rolled back, no package change): %s"), *AuthorError));
 	}
 
 	GEditor->EndTransaction();
 
-	FKismetEditorUtilities::CompileBlueprint(ABP);
+	// Compile + harvest. If the compile errored, roll back the authored nodes.
+	FCompilerResultsLog Results; Results.bSilentMode = true;
+	FKismetEditorUtilities::CompileBlueprint(ABP, EBlueprintCompileOptions::None, &Results);
+
+	TArray<FString> Errors, Warnings;
+	HarvestCompilerMessages(Results, Errors, Warnings);
+
+	if (ABP->Status == BS_Error)
+	{
+		// Transaction already committed — revert via the editor undo buffer, recompile to a
+		// clean state, restore dirty flag.
+		GEditor->UndoTransaction();
+		FKismetEditorUtilities::CompileBlueprint(ABP);
+		ABP->GetOutermost()->SetDirtyFlag(bWasDirty);
+
+		TArray<TSharedPtr<FJsonValue>> ErrArr;
+		for (const FString& E : Errors) { ErrArr.Add(MakeShared<FJsonValueString>(E)); }
+		TSharedPtr<FJsonObject> ErrObj = MakeShared<FJsonObject>();
+		ErrObj->SetArrayField(TEXT("compile_errors"), ErrArr);
+		return FMonolithActionResult::Error(
+			TEXT("Rule compiled with errors — rolled back, no package change. See compile_errors."))
+			.WithErrorData(ErrObj);
+	}
+
 	ABP->MarkPackageDirty();
+
+	// --- Success payload (rule-graph readback of the authored comparison) ----------------
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("machine_name"), MachineName);
+	Root->SetStringField(TEXT("from_state"), FromState);
+	Root->SetStringField(TEXT("to_state"), ToState);
+	Root->SetStringField(TEXT("compile_status"), BlueprintStatusToString(ABP->Status));
+
+	if (ParsedRule.Kind == FParsedTransitionRule::EKind::Bool)
+	{
+		Root->SetStringField(TEXT("rule_kind"), TEXT("bool"));
+		Root->SetStringField(TEXT("variable_name"), ParsedRule.Variable);
+		Root->SetBoolField(TEXT("pin_wired"), true);
+	}
+	else // Compare
+	{
+		Root->SetStringField(TEXT("rule_kind"), TEXT("compare"));
+		const FString LhsDisplay = ParsedRule.bUseAbs
+			? FString::Printf(TEXT("Abs(%s)"), *ParsedRule.Variable)
+			: ParsedRule.Variable;
+		Root->SetStringField(TEXT("lhs"), LhsDisplay);
+		Root->SetStringField(TEXT("operand"), ParsedRule.Variable);
+		Root->SetBoolField(TEXT("abs"), ParsedRule.bUseAbs);
+		Root->SetStringField(TEXT("op"), ParsedRule.Op);
+		Root->SetNumberField(TEXT("rhs"), ParsedRule.Rhs);
+		Root->SetStringField(TEXT("comparison"),
+			FString::Printf(TEXT("%s %s %s"), *LhsDisplay, *ParsedRule.Op, *FString::SanitizeFloat(ParsedRule.Rhs)));
+		Root->SetBoolField(TEXT("pin_wired"), true);
+	}
+
+	if (Warnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarnArr;
+		for (const FString& W : Warnings) { WarnArr.Add(MakeShared<FJsonValueString>(W)); }
+		Root->SetArrayField(TEXT("compile_warnings"), WarnArr);
+	}
+	return FMonolithActionResult::Success(Root);
+}
+
+// Read back a transition's current rule (kind + operands + comparison) as structured data.
+// Inspects the transition's bound rule graph: bAutomaticRuleBasedOnSequencePlayerInState ->
+// auto; a single bool VariableGet feeding the result -> bool; a comparison CallFunction (with
+// optional Abs upstream) -> compare. Anything else is reported as kind:custom with the node
+// titles, rather than failing.
+FMonolithActionResult FMonolithAnimationActions::HandleGetTransitionRule(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath   = Params->GetStringField(TEXT("asset_path"));
+	FString MachineName = Params->GetStringField(TEXT("machine_name"));
+	FString FromState   = Params->GetStringField(TEXT("from_state"));
+	FString ToState     = Params->GetStringField(TEXT("to_state"));
+
+	if (MachineName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: machine_name"));
+	if (FromState.IsEmpty())   return FMonolithActionResult::Error(TEXT("Missing required parameter: from_state"));
+	if (ToState.IsEmpty())     return FMonolithActionResult::Error(TEXT("Missing required parameter: to_state"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UAnimationStateMachineGraph* SMGraph = FindStateMachineGraphByName(ABP, MachineName);
+	if (!SMGraph) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' not found in ABP"), *MachineName));
+
+	UAnimStateTransitionNode* TransNode = FindTransitionNode(SMGraph, FromState, ToState);
+	if (!TransNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No transition found from '%s' to '%s'."), *FromState, *ToState));
+	}
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("asset_path"), AssetPath);
 	Root->SetStringField(TEXT("machine_name"), MachineName);
 	Root->SetStringField(TEXT("from_state"), FromState);
 	Root->SetStringField(TEXT("to_state"), ToState);
-	Root->SetStringField(TEXT("variable_name"), VariableName);
-	Root->SetBoolField(TEXT("pin_wired"), bWired);
-	if (!bWired)
+
+	if (TransNode->bAutomaticRuleBasedOnSequencePlayerInState)
 	{
-		Root->SetStringField(TEXT("warning"), TEXT("Variable getter node was created but output pin could not be found. Manual wiring may be needed."));
+		Root->SetStringField(TEXT("rule_kind"), TEXT("auto"));
+		return FMonolithActionResult::Success(Root);
+	}
+
+	UEdGraph* RuleGraph = TransNode->GetBoundGraph();
+	UAnimGraphNode_TransitionResult* ResultNode = nullptr;
+	if (RuleGraph)
+	{
+		for (UEdGraphNode* N : RuleGraph->Nodes)
+		{
+			ResultNode = Cast<UAnimGraphNode_TransitionResult>(N);
+			if (ResultNode) break;
+		}
+	}
+	UEdGraphPin* ResultPin = ResultNode ? ResultNode->FindPin(TEXT("bCanEnterTransition"), EGPD_Input) : nullptr;
+
+	if (!ResultPin || ResultPin->LinkedTo.Num() == 0)
+	{
+		Root->SetStringField(TEXT("rule_kind"), TEXT("none"));
+		return FMonolithActionResult::Success(Root);
+	}
+
+	UEdGraphNode* DrivingNode = ResultPin->LinkedTo[0] ? ResultPin->LinkedTo[0]->GetOwningNode() : nullptr;
+
+	// Bool: a VariableGet drives the result directly.
+	if (UK2Node_VariableGet* VarGet = Cast<UK2Node_VariableGet>(DrivingNode))
+	{
+		Root->SetStringField(TEXT("rule_kind"), TEXT("bool"));
+		Root->SetStringField(TEXT("variable_name"), VarGet->VariableReference.GetMemberName().ToString());
+		return FMonolithActionResult::Success(Root);
+	}
+
+	// Compare: a comparison CallFunction drives the result.
+	if (UK2Node_CallFunction* CmpNode = Cast<UK2Node_CallFunction>(DrivingNode))
+	{
+		const FName FnName = CmpNode->FunctionReference.GetMemberName();
+		auto KismetFnToOp = [](const FName& N) -> FString
+		{
+			if (N == TEXT("Greater_DoubleDouble"))      return TEXT(">");
+			if (N == TEXT("Less_DoubleDouble"))         return TEXT("<");
+			if (N == TEXT("GreaterEqual_DoubleDouble")) return TEXT(">=");
+			if (N == TEXT("LessEqual_DoubleDouble"))    return TEXT("<=");
+			if (N == TEXT("EqualEqual_DoubleDouble"))   return TEXT("==");
+			if (N == TEXT("NotEqual_DoubleDouble"))     return TEXT("!=");
+			return FString();
+		};
+		const FString Op = KismetFnToOp(FnName);
+		if (Op.IsEmpty())
+		{
+			Root->SetStringField(TEXT("rule_kind"), TEXT("custom"));
+			Root->SetStringField(TEXT("driving_function"), FnName.ToString());
+			return FMonolithActionResult::Success(Root);
+		}
+
+		Root->SetStringField(TEXT("rule_kind"), TEXT("compare"));
+		Root->SetStringField(TEXT("op"), Op);
+
+		// rhs = default value on the B pin.
+		double Rhs = 0.0;
+		if (UEdGraphPin* BPin = CmpNode->FindPin(TEXT("B"), EGPD_Input))
+		{
+			Rhs = FCString::Atod(*BPin->DefaultValue);
+		}
+		Root->SetNumberField(TEXT("rhs"), Rhs);
+
+		// lhs operand: trace the A pin upstream through an optional Abs node to the VariableGet.
+		bool bUsesAbs = false;
+		FString OperandName;
+		if (UEdGraphPin* APin = CmpNode->FindPin(TEXT("A"), EGPD_Input))
+		{
+			if (APin->LinkedTo.Num() > 0 && APin->LinkedTo[0])
+			{
+				UEdGraphNode* UpstreamNode = APin->LinkedTo[0]->GetOwningNode();
+				if (UK2Node_CallFunction* MaybeAbs = Cast<UK2Node_CallFunction>(UpstreamNode))
+				{
+					if (MaybeAbs->FunctionReference.GetMemberName() == TEXT("Abs"))
+					{
+						bUsesAbs = true;
+						if (UEdGraphPin* AbsAPin = MaybeAbs->FindPin(TEXT("A"), EGPD_Input))
+						{
+							if (AbsAPin->LinkedTo.Num() > 0 && AbsAPin->LinkedTo[0])
+							{
+								if (UK2Node_VariableGet* InnerVar = Cast<UK2Node_VariableGet>(AbsAPin->LinkedTo[0]->GetOwningNode()))
+								{
+									OperandName = InnerVar->VariableReference.GetMemberName().ToString();
+								}
+							}
+						}
+					}
+				}
+				else if (UK2Node_VariableGet* DirectVar = Cast<UK2Node_VariableGet>(UpstreamNode))
+				{
+					OperandName = DirectVar->VariableReference.GetMemberName().ToString();
+				}
+			}
+		}
+		Root->SetBoolField(TEXT("abs"), bUsesAbs);
+		Root->SetStringField(TEXT("operand"), OperandName);
+		const FString LhsDisplay = bUsesAbs ? FString::Printf(TEXT("Abs(%s)"), *OperandName) : OperandName;
+		Root->SetStringField(TEXT("lhs"), LhsDisplay);
+		Root->SetStringField(TEXT("comparison"),
+			FString::Printf(TEXT("%s %s %s"), *LhsDisplay, *Op, *FString::SanitizeFloat(Rhs)));
+		return FMonolithActionResult::Success(Root);
+	}
+
+	// Unrecognized driver — report it without failing.
+	Root->SetStringField(TEXT("rule_kind"), TEXT("custom"));
+	if (DrivingNode)
+	{
+		Root->SetStringField(TEXT("driving_node_title"), DrivingNode->GetNodeTitle(ENodeTitleType::ListView).ToString());
 	}
 	return FMonolithActionResult::Success(Root);
 }
@@ -5491,7 +6421,65 @@ FMonolithActionResult FMonolithAnimationActions::HandleBuildStateMachine(const T
 			// Optional rule.
 			if ((*TObj)->HasField(TEXT("rule")) && TransNode)
 			{
+				// Structured compare rule: { kind:'compare', lhs, op, rhs }. Parsed via the
+				// shared ParseTransitionRule so build_state_machine matches set_transition_rule.
+				// (auto / bool string forms continue to use the legacy fast path below.)
+				FParsedTransitionRule Parsed = ParseTransitionRule(*TObj);
+				if (Parsed.Kind == FParsedTransitionRule::EKind::Compare)
+				{
+					FString FoundCat;
+					if (!IsUsableFloatOperand(ABP, Parsed.Variable, FoundCat))
+					{
+						Rep->SetStringField(TEXT("rule_deferred"), FString::Printf(
+							TEXT("compare operand '%s' is not a usable numeric variable."), *Parsed.Variable));
+					}
+					else
+					{
+						UEdGraph* RuleGraph = TransNode->GetBoundGraph();
+						UAnimGraphNode_TransitionResult* ResultNode = nullptr;
+						if (RuleGraph)
+						{
+							for (UEdGraphNode* N : RuleGraph->Nodes)
+							{
+								ResultNode = Cast<UAnimGraphNode_TransitionResult>(N);
+								if (ResultNode) break;
+							}
+						}
+						UEdGraphPin* ResultPin = ResultNode ? ResultNode->FindPin(TEXT("bCanEnterTransition"), EGPD_Input) : nullptr;
+						FString CmpErr;
+						const bool bCmpOk = ResultPin && AuthorCompareRuleNodes(
+							RuleGraph, ResultNode, ResultPin, Parsed.Variable, Parsed.bUseAbs, Parsed.Op, Parsed.Rhs, CmpErr);
+						const FString LhsDisplay = Parsed.bUseAbs ? FString::Printf(TEXT("Abs(%s)"), *Parsed.Variable) : Parsed.Variable;
+						Rep->SetStringField(TEXT("rule_applied"), bCmpOk
+							? FString::Printf(TEXT("compare %s %s %s"), *LhsDisplay, *Parsed.Op, *FString::SanitizeFloat(Parsed.Rhs))
+							: FString::Printf(TEXT("compare authoring failed: %s"), *CmpErr));
+					}
+					TransReport.Add(MakeShared<FJsonValueObject>(Rep));
+					continue;
+				}
+				if (Parsed.Kind == FParsedTransitionRule::EKind::Expression)
+				{
+					Rep->SetStringField(TEXT("rule_deferred"), TEXT("kind:expression not yet supported. Use kind:compare."));
+					TransReport.Add(MakeShared<FJsonValueObject>(Rep));
+					continue;
+				}
+
+				// Object-form auto/bool: resolve the variable name from the parsed spec so a
+				// structured { kind:'auto' } / { kind:'bool', variable } also works here. A plain
+				// string `rule` yields an empty GetStringField only when it was an object, so we
+				// prefer the parsed value when the raw string is empty.
 				FString Rule = (*TObj)->GetStringField(TEXT("rule"));
+				if (Rule.IsEmpty())
+				{
+					if (Parsed.Kind == FParsedTransitionRule::EKind::Auto)
+					{
+						Rule = TEXT("auto");
+					}
+					else if (Parsed.Kind == FParsedTransitionRule::EKind::Bool)
+					{
+						Rule = Parsed.Variable;
+					}
+				}
 				if (Rule.Equals(TEXT("auto"), ESearchCase::IgnoreCase) || Rule.Equals(TEXT("automatic"), ESearchCase::IgnoreCase))
 				{
 					// Sequence-player auto rule — no graph logic required.
@@ -5503,16 +6491,19 @@ FMonolithActionResult FMonolithAnimationActions::HandleBuildStateMachine(const T
 				{
 					// Treat as a boolean variable name. Validate it is a bool var
 					// (mirrors HandleSetTransitionRule's policy); anything else is deferred.
+					// Accept either a BP-declared NewVariables bool OR an inherited
+					// Blueprint-visible bool UPROPERTY on a native AnimInstance parent.
 					const FBPVariableDescription* VarDesc = nullptr;
 					for (const FBPVariableDescription& V : ABP->NewVariables)
 					{
 						if (V.VarName.ToString() == Rule) { VarDesc = &V; break; }
 					}
-					if (!VarDesc)
+					const bool bInheritedBool = !VarDesc && IsInheritedBlueprintVisibleBool(ABP, Rule);
+					if (!VarDesc && !bInheritedBool)
 					{
 						Rep->SetStringField(TEXT("rule_deferred"), FString::Printf(TEXT("unsupported rule expression (deferred): '%s' is not a known ABP variable. Only bool variables and 'auto' are supported this pass."), *Rule));
 					}
-					else if (!VarDesc->VarType.PinCategory.ToString().Equals(TEXT("bool"), ESearchCase::IgnoreCase))
+					else if (VarDesc && !VarDesc->VarType.PinCategory.ToString().Equals(TEXT("bool"), ESearchCase::IgnoreCase))
 					{
 						Rep->SetStringField(TEXT("rule_deferred"), FString::Printf(TEXT("unsupported rule expression (deferred): variable '%s' is type '%s', not bool."), *Rule, *VarDesc->VarType.PinCategory.ToString()));
 					}

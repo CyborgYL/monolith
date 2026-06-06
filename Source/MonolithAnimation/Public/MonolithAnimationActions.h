@@ -39,6 +39,9 @@ public:
 	static FMonolithActionResult HandleGetLinkedLayers(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetGraphs(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetNodes(const TSharedPtr<FJsonObject>& Params);
+	// Enumerate AnimGraph EvaluateChooser (v1/v2) nodes + reflectively-resolved chooser asset;
+	// optional recursive nested-tree expansion via the Phase-2 MonolithChooserTreeCollector.
+	static FMonolithActionResult HandleGetAnimGraphChoosers(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Notify Editing (2) ---
 	static FMonolithActionResult HandleSetNotifyTime(const TSharedPtr<FJsonObject>& Params);
@@ -144,6 +147,8 @@ public:
 	static FMonolithActionResult HandleAddStateToMachine(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddTransition(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetTransitionRule(const TSharedPtr<FJsonObject>& Params);
+	// Phase 6 — read back a transition's authored rule (kind + operands + comparison).
+	static FMonolithActionResult HandleGetTransitionRule(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Wave 16: State Machine Authoring (#13/#14) ---
 	// create_state_machine — spawn a UAnimGraphNode_StateMachine into an ABP's anim graph.
