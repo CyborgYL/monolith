@@ -34,6 +34,7 @@ public class MonolithAnimation : ModuleRules
 			"RigVM",
 			"RigVMDeveloper",
 			"PoseSearchEditor",    // UAnimGraphNode_MotionMatching (Wave 7 ABP graph wiring)
+			"BlendStackEditor",    // UAnimGraphNode_BlendStack_Base (Sprint 4 BoundGraph-node spawn fix)
 		});
 
 		// --- Conditional: Chooser (UChooserTable authoring) ---

@@ -38,6 +38,17 @@
 
 // PoseSearchEditor module — provides UAnimGraphNode_MotionMatching
 #include "AnimGraphNode_MotionMatching.h"
+// PoseSearchEditor module — provides UAnimGraphNode_PoseSearchHistoryCollector (Sprint 4 MM graph)
+#include "AnimGraphNode_PoseSearchHistoryCollector.h"
+// AnimGraph module — provides UAnimGraphNode_Inertialization (Sprint 4 alias)
+#include "AnimGraphNode_Inertialization.h"
+// PoseSearch runtime — UPoseSearchDatabase (build_motion_matching_node Database write)
+#include "PoseSearch/PoseSearchDatabase.h"
+#include "Animation/BoneReference.h"
+// BlendStackEditor module — UAnimGraphNode_BlendStack_Base (BoundGraph-node spawn fix)
+#include "AnimGraphNode_BlendStack.h"
+// FGraphNodeCreator — pristine node spawn for BoundGraph-owning nodes
+#include "EdGraph/EdGraph.h"
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -122,6 +133,48 @@ void FMonolithAbpWriteActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Graph name to scope the search (default: searches all graphs)"))
 			.Optional(TEXT("state_name"), TEXT("string"), TEXT("State name to narrow the search to a specific state's inner graph"))
 			.Build());
+
+	// --- configure_pose_history_node (Sprint 4.2) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("configure_pose_history_node"),
+		TEXT("Configure a Pose History (PoseSearchHistoryCollector) anim graph node's FAnimNode_PoseSearchHistoryCollector_Base properties for Motion Matching. Trajectory is generated via bGenerateTrajectory (UE 5.7 has no CharacterTrajectoryComponent)."),
+		FMonolithActionHandler::CreateStatic(&FMonolithAbpWriteActions::HandleConfigurePoseHistoryNode),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("node_id"), TEXT("string"), TEXT("Pose History node UObject name (from add_anim_graph_node / get_graph_summary)"))
+			.Optional(TEXT("generate_trajectory"), TEXT("bool"), TEXT("bGenerateTrajectory — node generates trajectory from TrajectoryData instead of an input trajectory"))
+			.Optional(TEXT("pose_count"), TEXT("number"), TEXT("PoseCount — max stored poses (ClampMin 2)"))
+			.Optional(TEXT("sampling_interval"), TEXT("number"), TEXT("SamplingInterval — seconds between collected poses (0 = every update)"))
+			.Optional(TEXT("collected_bones"), TEXT("array"), TEXT("CollectedBones — bone names to collect (written as FBoneReference array)"))
+			.Optional(TEXT("trajectory_history_count"), TEXT("number"), TEXT("TrajectoryHistoryCount — past trajectory samples (ClampMin 2; used when generate_trajectory)"))
+			.Optional(TEXT("trajectory_prediction_count"), TEXT("number"), TEXT("TrajectoryPredictionCount — future trajectory samples (ClampMin 2; used when generate_trajectory)"))
+			.Build());
+
+	// --- configure_motion_matching_node (Sprint 4.3) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("configure_motion_matching_node"),
+		TEXT("Configure a Motion Matching anim graph node's FAnimNode_MotionMatching + FAnimNode_BlendStack_Standalone base properties. PoseJumpThresholdTime is an FFloatInterval (min/max)."),
+		FMonolithActionHandler::CreateStatic(&FMonolithAbpWriteActions::HandleConfigureMotionMatchingNode),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("node_id"), TEXT("string"), TEXT("Motion Matching node UObject name (from add_anim_graph_node / get_graph_summary)"))
+			.Optional(TEXT("blend_time"), TEXT("number"), TEXT("BlendTime — seconds to blend out to the new pose"))
+			.Optional(TEXT("pose_jump_threshold_min"), TEXT("number"), TEXT("PoseJumpThresholdTime.Min (FFloatInterval)"))
+			.Optional(TEXT("pose_jump_threshold_max"), TEXT("number"), TEXT("PoseJumpThresholdTime.Max (FFloatInterval)"))
+			.Optional(TEXT("search_throttle"), TEXT("number"), TEXT("SearchThrottleTime — min seconds between searches"))
+			.Optional(TEXT("use_inertial_blend"), TEXT("bool"), TEXT("bUseInertialBlend — requires an Inertialization node downstream"))
+			.Optional(TEXT("should_filter_notifies"), TEXT("bool"), TEXT("bShouldFilterNotifies — on the BlendStack base struct"))
+			.Optional(TEXT("notify_recency_timeout"), TEXT("number"), TEXT("NotifyRecencyTimeOut — on the BlendStack base struct"))
+			.Optional(TEXT("max_active_blends"), TEXT("number"), TEXT("MaxActiveBlends — on the BlendStack base struct (0 = inertialization-only)"))
+			.Build());
+
+	// --- build_motion_matching_node (Sprint 4.4 — COMPOSITE) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("build_motion_matching_node"),
+		TEXT("Composite: spawn a Pose History + Motion Matching node in the AnimGraph, wire History pose-out -> MM pose-in, assign the MM Database, apply sensible MM/history defaults, and compile. Optionally set chooser-driven DB selection."),
+		FMonolithActionHandler::CreateStatic(&FMonolithAbpWriteActions::HandleBuildMotionMatchingNode),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.RequiredAssetPath(TEXT("database_path"), TEXT("UPoseSearchDatabase asset path assigned to the MM node's Database"))
+			.Optional(TEXT("chooser_path"), TEXT("string"), TEXT("Optional UChooserTable asset path for chooser-driven database selection (best-effort; Database is always set as fallback)"))
+			.Build());
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +199,15 @@ UClass* ResolveNodeTypeAlias(const FString& NodeType)
 		return UAnimGraphNode_LayeredBoneBlend::StaticClass();
 	if (NodeType.Equals(TEXT("MotionMatching"), ESearchCase::IgnoreCase))
 		return UAnimGraphNode_MotionMatching::StaticClass();
+	// Sprint 4 (4.1): PoseHistory node — UE 5.7 class is UAnimGraphNode_PoseSearchHistoryCollector,
+	// NOT the old UAnimGraphNode_PoseHistory (gotcha #2).
+	if (NodeType.Equals(TEXT("pose_history"), ESearchCase::IgnoreCase)
+		|| NodeType.Equals(TEXT("PoseHistory"), ESearchCase::IgnoreCase)
+		|| NodeType.Equals(TEXT("PoseSearchHistoryCollector"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_PoseSearchHistoryCollector::StaticClass();
+	if (NodeType.Equals(TEXT("inertialization"), ESearchCase::IgnoreCase)
+		|| NodeType.Equals(TEXT("Inertialization"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_Inertialization::StaticClass();
 	if (NodeType.Equals(TEXT("TwoBoneIK"), ESearchCase::IgnoreCase))
 		return UAnimGraphNode_TwoBoneIK::StaticClass();
 	if (NodeType.Equals(TEXT("ModifyBone"), ESearchCase::IgnoreCase))
@@ -623,6 +685,48 @@ FMonolithActionResult FMonolithAbpWriteActions::HandleAddAnimGraphNode(const TSh
 	FString GraphError;
 	UEdGraph* TargetGraph = ResolveTargetGraph(ABP, GraphName, StateName, GraphError);
 	if (!TargetGraph) return FMonolithActionResult::Error(GraphError);
+
+	// ---- BlendStack-derived nodes (MotionMatching, MotionMatchingInteraction) ----
+	// These own a UPROPERTY BoundGraph and CreateGraph() does check(BoundGraph == nullptr)
+	// inside PostPlacedNewNode (AnimGraphNode_BlendStack.cpp:261). The default template
+	// path (NewObject template -> FEdGraphSchemaAction_K2NewNode::PerformAction) duplicates
+	// the template via DuplicateObject, which copies the BoundGraph UPROPERTY, so the
+	// duplicated node already carries a non-null BoundGraph and PostPlacedNewNode asserts.
+	// Spawn these via FGraphNodeCreator instead: it builds a PRISTINE node (no template
+	// duplication, BoundGraph stays null) and runs PostPlacedNewNode exactly once in
+	// Finalize(). All other node classes keep the existing template/PerformAction path.
+	if (NodeClass->IsChildOf(UAnimGraphNode_BlendStack_Base::StaticClass()))
+	{
+		GEditor->BeginTransaction(FText::FromString(TEXT("Add Anim Graph Node")));
+		TargetGraph->Modify();
+
+		FGraphNodeCreator<UAnimGraphNode_Base> Creator(*TargetGraph);
+		UAnimGraphNode_Base* NewNode = Creator.CreateNode(/*bSelectNewNode=*/false, NodeClass);
+		if (!NewNode)
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("FGraphNodeCreator failed to create node for class '%s'"), *NodeClass->GetPathName()));
+		}
+		NewNode->NodePosX = static_cast<int32>(PosX);
+		NewNode->NodePosY = static_cast<int32>(PosY);
+		Creator.Finalize(); // runs PostPlacedNewNode (CreateGraph) once on the pristine node
+
+		GEditor->EndTransaction();
+
+		// Do NOT ReconstructNode() here — the node is already fully formed by Finalize().
+		ABP->MarkPackageDirty();
+
+		TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetStringField(TEXT("node_name"), NewNode->GetName());
+		Root->SetStringField(TEXT("node_class"), NewNode->GetClass()->GetName());
+		Root->SetStringField(TEXT("node_class_path"), NewNode->GetClass()->GetPathName());
+		Root->SetStringField(TEXT("node_guid"), NewNode->NodeGuid.ToString());
+		Root->SetNumberField(TEXT("position_x"), NewNode->NodePosX);
+		Root->SetNumberField(TEXT("position_y"), NewNode->NodePosY);
+		Root->SetArrayField(TEXT("pins"), BuildPinList(NewNode));
+		return FMonolithActionResult::Success(Root);
+	}
 
 	// Create the template node on the transient package (will be duplicated by PerformAction)
 	UAnimGraphNode_Base* Template = Cast<UAnimGraphNode_Base>(NewObject<UObject>(GetTransientPackage(), NodeClass));
@@ -1192,6 +1296,105 @@ bool ResolvePropertyPath(UStruct* StructType, void* StructAddr, const FString& P
 	OutError = TEXT("unreachable");
 	return false;
 }
+
+// ---------------------------------------------------------------------------
+// Shared FAnimNode reflection helpers (Sprint 4 — reused by the MM graph
+// configure/build handlers; mirror the resolution path in
+// HandleSetAnimGraphNodeProperty).
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the inner FAnimNode struct (its UStruct + value address) on an
+ * editor UAnimGraphNode_Base. Every UAnimGraphNode_X holds a UPROPERTY-tagged
+ * FAnimNode_X member; we scan for the first FStructProperty derived from
+ * FAnimNode_Base (same heuristic as HandleSetAnimGraphNodeProperty).
+ */
+bool ResolveInnerAnimNode(UAnimGraphNode_Base* AnimNode, UScriptStruct*& OutStruct,
+                          void*& OutAddr, FString& OutError)
+{
+	OutStruct = nullptr;
+	OutAddr = nullptr;
+	for (TFieldIterator<FStructProperty> It(AnimNode->GetClass()); It; ++It)
+	{
+		FStructProperty* P = *It;
+		if (!P || !P->Struct) continue;
+		if (P->Struct->IsChildOf(FAnimNode_Base::StaticStruct()))
+		{
+			OutStruct = P->Struct;
+			OutAddr   = P->ContainerPtrToValuePtr<void>(AnimNode);
+			return true;
+		}
+	}
+	OutError = FString::Printf(
+		TEXT("Could not locate FAnimNode struct on '%s' — does the class inherit from FAnimNode_Base?"),
+		*AnimNode->GetClass()->GetName());
+	return false;
+}
+
+/** Write a named property on a struct via ImportText (the Details-panel parser). Searches superstructs. */
+bool ImportTextOntoStruct(UScriptStruct* Struct, void* StructAddr, const FName& PropName,
+                          const FString& Value, UObject* Owner, FString& OutError)
+{
+	FProperty* Prop = Struct ? Struct->FindPropertyByName(PropName) : nullptr;
+	if (!Prop)
+	{
+		OutError = FString::Printf(TEXT("Property '%s' not found on %s"),
+			*PropName.ToString(), Struct ? *Struct->GetName() : TEXT("<null>"));
+		return false;
+	}
+	void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(StructAddr);
+	const TCHAR* Result = Prop->ImportText_Direct(*Value, ValuePtr, Owner, PPF_None);
+	if (!Result)
+	{
+		OutError = FString::Printf(TEXT("ImportText failed for '%s' with value '%s'"),
+			*PropName.ToString(), *Value);
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Write a TArray<FBoneReference> property from an array of bone-name strings.
+ * Builds the array element-by-element via reflection so we never depend on
+ * the typed FBoneReference header layout beyond its `BoneName` FName field.
+ */
+bool WriteBoneReferenceArray(UScriptStruct* Struct, void* StructAddr, const FName& PropName,
+                             const TArray<FString>& BoneNames, FString& OutError)
+{
+	FProperty* Prop = Struct ? Struct->FindPropertyByName(PropName) : nullptr;
+	FArrayProperty* ArrayProp = CastField<FArrayProperty>(Prop);
+	if (!ArrayProp)
+	{
+		OutError = FString::Printf(TEXT("Property '%s' is not an array property"), *PropName.ToString());
+		return false;
+	}
+	FStructProperty* ElemStructProp = CastField<FStructProperty>(ArrayProp->Inner);
+	if (!ElemStructProp || !ElemStructProp->Struct)
+	{
+		OutError = FString::Printf(TEXT("Array '%s' inner is not a struct"), *PropName.ToString());
+		return false;
+	}
+	FProperty* BoneNameProp = ElemStructProp->Struct->FindPropertyByName(TEXT("BoneName"));
+	FNameProperty* NameProp = CastField<FNameProperty>(BoneNameProp);
+	if (!NameProp)
+	{
+		OutError = FString::Printf(TEXT("Element struct of '%s' has no FName 'BoneName' field"), *PropName.ToString());
+		return false;
+	}
+
+	void* ArrayValuePtr = ArrayProp->ContainerPtrToValuePtr<void>(StructAddr);
+	FScriptArrayHelper Helper(ArrayProp, ArrayValuePtr);
+	Helper.EmptyValues();
+	for (const FString& BoneName : BoneNames)
+	{
+		const int32 Index = Helper.AddValue();
+		void* ElemPtr = Helper.GetRawPtr(Index);
+		void* NamePtr = NameProp->ContainerPtrToValuePtr<void>(ElemPtr);
+		NameProp->SetPropertyValue(NamePtr, FName(*BoneName));
+	}
+	return true;
+}
+
 } // anonymous namespace
 
 FMonolithActionResult FMonolithAbpWriteActions::HandleSetAnimGraphNodeProperty(const TSharedPtr<FJsonObject>& Params)
@@ -1294,5 +1497,354 @@ FMonolithActionResult FMonolithAbpWriteActions::HandleSetAnimGraphNodeProperty(c
 	Root->SetStringField(TEXT("property_path"), PropertyPath);
 	Root->SetStringField(TEXT("old_value"), OldValueText);
 	Root->SetStringField(TEXT("new_value"), NewValueText);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Action: configure_pose_history_node (Sprint 4.2)
+// Writes FAnimNode_PoseSearchHistoryCollector_Base properties by reflection.
+// Trajectory comes from bGenerateTrajectory — there is NO CharacterTrajectoryComponent
+// in UE 5.7 (gotcha #3).
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAbpWriteActions::HandleConfigurePoseHistoryNode(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath = Params->GetStringField(TEXT("abp_path"));
+	const FString NodeId  = Params->GetStringField(TEXT("node_id"));
+	if (NodeId.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: node_id"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AbpPath));
+
+	UEdGraphNode* FoundNode = FindNodeByName(ABP, NodeId, nullptr);
+	if (!FoundNode) return FMonolithActionResult::Error(FString::Printf(TEXT("Node '%s' not found"), *NodeId));
+
+	UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(FoundNode);
+	if (!AnimNode) return FMonolithActionResult::Error(FString::Printf(
+		TEXT("Node '%s' is not a UAnimGraphNode_Base (class: %s)"), *NodeId, *FoundNode->GetClass()->GetName()));
+
+	UScriptStruct* NodeStruct = nullptr;
+	void* NodeAddr = nullptr;
+	FString ResolveError;
+	if (!ResolveInnerAnimNode(AnimNode, NodeStruct, NodeAddr, ResolveError))
+		return FMonolithActionResult::Error(ResolveError);
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Configure Pose History Node")));
+	AnimNode->Modify();
+
+	TSharedPtr<FJsonObject> Applied = MakeShared<FJsonObject>();
+	FString WriteError;
+	bool bAnyWrite = false;
+
+	bool bGenTraj;
+	if (Params->TryGetBoolField(TEXT("generate_trajectory"), bGenTraj))
+	{
+		if (!ImportTextOntoStruct(NodeStruct, NodeAddr, TEXT("bGenerateTrajectory"), bGenTraj ? TEXT("true") : TEXT("false"), AnimNode, WriteError))
+		{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+		Applied->SetBoolField(TEXT("bGenerateTrajectory"), bGenTraj); bAnyWrite = true;
+	}
+
+	double NumVal = 0.0;
+	if (Params->TryGetNumberField(TEXT("pose_count"), NumVal))
+	{
+		if (!ImportTextOntoStruct(NodeStruct, NodeAddr, TEXT("PoseCount"), FString::FromInt(static_cast<int32>(NumVal)), AnimNode, WriteError))
+		{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+		Applied->SetNumberField(TEXT("PoseCount"), static_cast<int32>(NumVal)); bAnyWrite = true;
+	}
+	if (Params->TryGetNumberField(TEXT("sampling_interval"), NumVal))
+	{
+		if (!ImportTextOntoStruct(NodeStruct, NodeAddr, TEXT("SamplingInterval"), FString::SanitizeFloat(NumVal), AnimNode, WriteError))
+		{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+		Applied->SetNumberField(TEXT("SamplingInterval"), NumVal); bAnyWrite = true;
+	}
+	if (Params->TryGetNumberField(TEXT("trajectory_history_count"), NumVal))
+	{
+		if (!ImportTextOntoStruct(NodeStruct, NodeAddr, TEXT("TrajectoryHistoryCount"), FString::FromInt(static_cast<int32>(NumVal)), AnimNode, WriteError))
+		{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+		Applied->SetNumberField(TEXT("TrajectoryHistoryCount"), static_cast<int32>(NumVal)); bAnyWrite = true;
+	}
+	if (Params->TryGetNumberField(TEXT("trajectory_prediction_count"), NumVal))
+	{
+		if (!ImportTextOntoStruct(NodeStruct, NodeAddr, TEXT("TrajectoryPredictionCount"), FString::FromInt(static_cast<int32>(NumVal)), AnimNode, WriteError))
+		{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+		Applied->SetNumberField(TEXT("TrajectoryPredictionCount"), static_cast<int32>(NumVal)); bAnyWrite = true;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* BonesArr = nullptr;
+	if (Params->TryGetArrayField(TEXT("collected_bones"), BonesArr) && BonesArr)
+	{
+		TArray<FString> BoneNames;
+		for (const TSharedPtr<FJsonValue>& V : *BonesArr)
+		{
+			if (V.IsValid()) BoneNames.Add(V->AsString());
+		}
+		if (!WriteBoneReferenceArray(NodeStruct, NodeAddr, TEXT("CollectedBones"), BoneNames, WriteError))
+		{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+		Applied->SetNumberField(TEXT("CollectedBones"), BoneNames.Num()); bAnyWrite = true;
+	}
+
+	GEditor->EndTransaction();
+
+	if (bAnyWrite)
+	{
+		AnimNode->ReconstructNode();
+		ABP->MarkPackageDirty();
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("node_id"), AnimNode->GetName());
+	Root->SetStringField(TEXT("node_struct"), NodeStruct->GetName());
+	Root->SetObjectField(TEXT("applied"), Applied);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Action: configure_motion_matching_node (Sprint 4.3)
+// Writes FAnimNode_MotionMatching props + base FAnimNode_BlendStack_Standalone
+// props by reflection. MaxActiveBlends / bShouldFilterNotifies / NotifyRecencyTimeOut
+// live on the BASE struct (gotcha #4); FindPropertyByName walks superstructs so the
+// reflection write resolves them regardless. PoseJumpThresholdTime is FFloatInterval
+// (gotcha #5) — written as (Min=..,Max=..).
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAbpWriteActions::HandleConfigureMotionMatchingNode(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath = Params->GetStringField(TEXT("abp_path"));
+	const FString NodeId  = Params->GetStringField(TEXT("node_id"));
+	if (NodeId.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: node_id"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AbpPath));
+
+	UEdGraphNode* FoundNode = FindNodeByName(ABP, NodeId, nullptr);
+	if (!FoundNode) return FMonolithActionResult::Error(FString::Printf(TEXT("Node '%s' not found"), *NodeId));
+
+	UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(FoundNode);
+	if (!AnimNode) return FMonolithActionResult::Error(FString::Printf(
+		TEXT("Node '%s' is not a UAnimGraphNode_Base (class: %s)"), *NodeId, *FoundNode->GetClass()->GetName()));
+
+	UScriptStruct* NodeStruct = nullptr;
+	void* NodeAddr = nullptr;
+	FString ResolveError;
+	if (!ResolveInnerAnimNode(AnimNode, NodeStruct, NodeAddr, ResolveError))
+		return FMonolithActionResult::Error(ResolveError);
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Configure Motion Matching Node")));
+	AnimNode->Modify();
+
+	TSharedPtr<FJsonObject> Applied = MakeShared<FJsonObject>();
+	FString WriteError;
+	bool bAnyWrite = false;
+	double NumVal = 0.0;
+	bool BoolVal = false;
+
+	auto WriteNum = [&](const TCHAR* JsonKey, const FName& Prop, bool bAsInt) -> bool
+	{
+		double V;
+		if (!Params->TryGetNumberField(JsonKey, V)) return true; // not provided — skip
+		const FString Text = bAsInt ? FString::FromInt(static_cast<int32>(V)) : FString::SanitizeFloat(V);
+		if (!ImportTextOntoStruct(NodeStruct, NodeAddr, Prop, Text, AnimNode, WriteError)) return false;
+		if (bAsInt) Applied->SetNumberField(Prop.ToString(), static_cast<int32>(V));
+		else        Applied->SetNumberField(Prop.ToString(), V);
+		bAnyWrite = true;
+		return true;
+	};
+
+	if (!WriteNum(TEXT("blend_time"), TEXT("BlendTime"), false))
+	{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+	if (!WriteNum(TEXT("search_throttle"), TEXT("SearchThrottleTime"), false))
+	{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+	if (!WriteNum(TEXT("notify_recency_timeout"), TEXT("NotifyRecencyTimeOut"), false))
+	{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+	if (!WriteNum(TEXT("max_active_blends"), TEXT("MaxActiveBlends"), true))
+	{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+
+	if (Params->TryGetBoolField(TEXT("use_inertial_blend"), BoolVal))
+	{
+		if (!ImportTextOntoStruct(NodeStruct, NodeAddr, TEXT("bUseInertialBlend"), BoolVal ? TEXT("true") : TEXT("false"), AnimNode, WriteError))
+		{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+		Applied->SetBoolField(TEXT("bUseInertialBlend"), BoolVal); bAnyWrite = true;
+	}
+	if (Params->TryGetBoolField(TEXT("should_filter_notifies"), BoolVal))
+	{
+		if (!ImportTextOntoStruct(NodeStruct, NodeAddr, TEXT("bShouldFilterNotifies"), BoolVal ? TEXT("true") : TEXT("false"), AnimNode, WriteError))
+		{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+		Applied->SetBoolField(TEXT("bShouldFilterNotifies"), BoolVal); bAnyWrite = true;
+	}
+
+	// PoseJumpThresholdTime is an FFloatInterval — resolve current Min/Max, override
+	// whichever was supplied, then write the whole struct via ImportText (Min=..,Max=..).
+	const bool bHasMin = Params->TryGetNumberField(TEXT("pose_jump_threshold_min"), NumVal);
+	double JumpMin = NumVal;
+	const bool bHasMax = Params->TryGetNumberField(TEXT("pose_jump_threshold_max"), NumVal);
+	double JumpMax = NumVal;
+	if (bHasMin || bHasMax)
+	{
+		FProperty* IntervalProp = NodeStruct->FindPropertyByName(TEXT("PoseJumpThresholdTime"));
+		FStructProperty* IntervalStructProp = CastField<FStructProperty>(IntervalProp);
+		if (!IntervalStructProp)
+		{ GEditor->EndTransaction(); return FMonolithActionResult::Error(TEXT("PoseJumpThresholdTime is not a struct property")); }
+
+		// Read existing values to preserve the un-supplied side.
+		void* IntervalAddr = IntervalStructProp->ContainerPtrToValuePtr<void>(NodeAddr);
+		double CurMin = 0.0, CurMax = 0.0;
+		if (FFloatProperty* MinP = CastField<FFloatProperty>(IntervalStructProp->Struct->FindPropertyByName(TEXT("Min"))))
+			CurMin = MinP->GetPropertyValue_InContainer(IntervalAddr);
+		if (FFloatProperty* MaxP = CastField<FFloatProperty>(IntervalStructProp->Struct->FindPropertyByName(TEXT("Max"))))
+			CurMax = MaxP->GetPropertyValue_InContainer(IntervalAddr);
+
+		const double FinalMin = bHasMin ? JumpMin : CurMin;
+		const double FinalMax = bHasMax ? JumpMax : CurMax;
+		const FString IntervalText = FString::Printf(TEXT("(Min=%s,Max=%s)"),
+			*FString::SanitizeFloat(FinalMin), *FString::SanitizeFloat(FinalMax));
+		if (!ImportTextOntoStruct(NodeStruct, NodeAddr, TEXT("PoseJumpThresholdTime"), IntervalText, AnimNode, WriteError))
+		{ GEditor->EndTransaction(); return FMonolithActionResult::Error(WriteError); }
+		Applied->SetStringField(TEXT("PoseJumpThresholdTime"), IntervalText); bAnyWrite = true;
+	}
+
+	GEditor->EndTransaction();
+
+	if (bAnyWrite)
+	{
+		AnimNode->ReconstructNode();
+		ABP->MarkPackageDirty();
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("node_id"), AnimNode->GetName());
+	Root->SetStringField(TEXT("node_struct"), NodeStruct->GetName());
+	Root->SetObjectField(TEXT("applied"), Applied);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Action: build_motion_matching_node (Sprint 4.4 — COMPOSITE)
+// Spawns a Pose History + Motion Matching node via the existing add_anim_graph_node
+// internals (using the 4.1 "pose_history" alias), wires History pose-out -> MM
+// pose-in via the connect internals, then assigns the MM Database pointer directly
+// (a UObject pointer write, NOT AddAnimationAsset). Applies 4.2/4.3 defaults + compiles.
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAbpWriteActions::HandleBuildMotionMatchingNode(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath      = Params->GetStringField(TEXT("abp_path"));
+	const FString DatabasePath = Params->GetStringField(TEXT("database_path"));
+	FString ChooserPath;
+	Params->TryGetStringField(TEXT("chooser_path"), ChooserPath);
+
+	if (DatabasePath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: database_path"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AbpPath));
+
+	UPoseSearchDatabase* Database = FMonolithAssetUtils::LoadAssetByPath<UPoseSearchDatabase>(DatabasePath);
+	if (!Database) return FMonolithActionResult::Error(FString::Printf(TEXT("UPoseSearchDatabase not found: %s"), *DatabasePath));
+
+	// --- Spawn the Pose History node via existing add_anim_graph_node internals (alias from 4.1) ---
+	TSharedPtr<FJsonObject> HistParams = MakeShared<FJsonObject>();
+	HistParams->SetStringField(TEXT("asset_path"), AbpPath);
+	HistParams->SetStringField(TEXT("node_type"), TEXT("pose_history"));
+	HistParams->SetNumberField(TEXT("position_x"), 0.0);
+	HistParams->SetNumberField(TEXT("position_y"), 0.0);
+	FMonolithActionResult HistResult = HandleAddAnimGraphNode(HistParams);
+	if (!HistResult.bSuccess) return HistResult;
+	const FString HistNodeName = HistResult.Result.IsValid() ? HistResult.Result->GetStringField(TEXT("node_name")) : FString();
+
+	// --- Spawn the Motion Matching node ---
+	TSharedPtr<FJsonObject> MMParams = MakeShared<FJsonObject>();
+	MMParams->SetStringField(TEXT("asset_path"), AbpPath);
+	MMParams->SetStringField(TEXT("node_type"), TEXT("MotionMatching"));
+	MMParams->SetNumberField(TEXT("position_x"), -400.0);
+	MMParams->SetNumberField(TEXT("position_y"), 0.0);
+	FMonolithActionResult MMResult = HandleAddAnimGraphNode(MMParams);
+	if (!MMResult.bSuccess) return MMResult;
+	const FString MMNodeName = MMResult.Result.IsValid() ? MMResult.Result->GetStringField(TEXT("node_name")) : FString();
+
+	// --- Wire MM pose-out -> History pose-in via existing connect internals ---
+	// Topology (matches Epic GASP): the Motion Matching node is an asset player whose
+	// 'Pose' output feeds the Pose History collector's 'Source' input pose link; the
+	// History node's own 'Pose' output then flows downstream to the graph result.
+	// So the History node WRAPS the MM node's output, collecting its pose over time.
+	TSharedPtr<FJsonObject> ConnParams = MakeShared<FJsonObject>();
+	ConnParams->SetStringField(TEXT("asset_path"), AbpPath);
+	ConnParams->SetStringField(TEXT("source_node"), MMNodeName);
+	ConnParams->SetStringField(TEXT("source_pin"), TEXT("Pose"));
+	ConnParams->SetStringField(TEXT("target_node"), HistNodeName);
+	ConnParams->SetStringField(TEXT("target_pin"), TEXT("Source"));
+	ConnParams->SetBoolField(TEXT("compile"), false);
+	FMonolithActionResult ConnResult = HandleConnectAnimGraphPins(ConnParams);
+	const bool bWired = ConnResult.bSuccess;
+	FString WireNote = bWired ? TEXT("connected") : (ConnResult.ErrorMessage.IsEmpty() ? TEXT("not connected") : ConnResult.ErrorMessage);
+
+	// --- Assign the MM node's Database pointer directly (UObject pointer write) ---
+	UAnimBlueprint* ABP2 = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	UEdGraphNode* MMNode = FindNodeByName(ABP2, MMNodeName, nullptr);
+	UAnimGraphNode_Base* MMAnim = Cast<UAnimGraphNode_Base>(MMNode);
+	if (!MMAnim) return FMonolithActionResult::Error(TEXT("Spawned MotionMatching node could not be re-resolved"));
+
+	UScriptStruct* MMStruct = nullptr;
+	void* MMAddr = nullptr;
+	FString ResolveError;
+	if (!ResolveInnerAnimNode(MMAnim, MMStruct, MMAddr, ResolveError))
+		return FMonolithActionResult::Error(ResolveError);
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Assign Motion Matching Database")));
+	MMAnim->Modify();
+
+	// Database is TObjectPtr<const UPoseSearchDatabase> — the FObjectProperty carries no
+	// C++ const, so a direct reflection pointer set is the correct write (not AddAnimationAsset).
+	FProperty* DbProp = MMStruct->FindPropertyByName(TEXT("Database"));
+	FObjectPropertyBase* DbObjProp = CastField<FObjectPropertyBase>(DbProp);
+	if (!DbObjProp)
+	{ GEditor->EndTransaction(); return FMonolithActionResult::Error(TEXT("MM node has no FObjectProperty 'Database'")); }
+	DbObjProp->SetObjectPropertyValue_InContainer(MMAddr, Database);
+
+	GEditor->EndTransaction();
+
+	// --- Chooser-driven DB selection (best-effort note; Database is always set as fallback) ---
+	bool bChooserNoted = false;
+	if (!ChooserPath.IsEmpty())
+	{
+		// Chooser-driven selection is wired at runtime via an Anim Node Function calling
+		// SetDatabaseToSearch/SetDatabasesToSearch from a chooser result; that function
+		// graph wiring is out of scope for this composite. Database is set above as the
+		// always-valid fallback; record the chooser path for the caller to wire the function.
+		bChooserNoted = true;
+	}
+
+	// --- Apply 4.2 / 4.3 sensible defaults ---
+	{
+		TSharedPtr<FJsonObject> HistCfg = MakeShared<FJsonObject>();
+		HistCfg->SetStringField(TEXT("abp_path"), AbpPath);
+		HistCfg->SetStringField(TEXT("node_id"), HistNodeName);
+		HistCfg->SetBoolField(TEXT("generate_trajectory"), true);
+		HandleConfigurePoseHistoryNode(HistCfg);
+
+		TSharedPtr<FJsonObject> MMCfg = MakeShared<FJsonObject>();
+		MMCfg->SetStringField(TEXT("abp_path"), AbpPath);
+		MMCfg->SetStringField(TEXT("node_id"), MMNodeName);
+		MMCfg->SetNumberField(TEXT("blend_time"), 0.2);
+		MMCfg->SetNumberField(TEXT("max_active_blends"), 4);
+		HandleConfigureMotionMatchingNode(MMCfg);
+	}
+
+	MMAnim->ReconstructNode();
+	ABP2->MarkPackageDirty();
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP2);
+	FKismetEditorUtilities::CompileBlueprint(ABP2);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("pose_history_node"), HistNodeName);
+	Root->SetStringField(TEXT("motion_matching_node"), MMNodeName);
+	Root->SetStringField(TEXT("database"), DatabasePath);
+	Root->SetBoolField(TEXT("wired"), bWired);
+	Root->SetStringField(TEXT("wire_note"), WireNote);
+	if (bChooserNoted) Root->SetStringField(TEXT("chooser_path"), ChooserPath);
+	Root->SetBoolField(TEXT("compiled"), true);
 	return FMonolithActionResult::Success(Root);
 }

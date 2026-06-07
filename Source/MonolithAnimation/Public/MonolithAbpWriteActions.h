@@ -20,4 +20,9 @@ private:
 	static FMonolithActionResult HandleSetStateAnimation(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddVariableGet(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetAnimGraphNodeProperty(const TSharedPtr<FJsonObject>& Params);
+
+	// Sprint 4 — Motion Matching AnimBP graph authoring.
+	static FMonolithActionResult HandleConfigurePoseHistoryNode(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleConfigureMotionMatchingNode(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleBuildMotionMatchingNode(const TSharedPtr<FJsonObject>& Params);
 };
