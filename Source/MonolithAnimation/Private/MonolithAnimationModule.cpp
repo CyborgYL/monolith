@@ -9,6 +9,7 @@
 #include "MonolithAnimLayoutActions.h"
 #include "MonolithAnimationBulkFillAdapter.h"
 #include "MonolithChooserActions.h"
+#include "MonolithChooserAuthoringActions.h"
 #include "MonolithAbpGraphSurgeryActions.h"
 #include "MonolithToolRegistry.h"
 
@@ -24,6 +25,7 @@ void FMonolithAnimationModule::StartupModule()
 	FMonolithAbpWriteActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithAnimLayoutActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithChooserActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithChooserAuthoringActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithAbpGraphSurgeryActions::RegisterActions(FMonolithToolRegistry::Get());
 
 	// Phase 5 Step 6 (MCP Ergonomics, 2026-05-11) — register the animation adapter.

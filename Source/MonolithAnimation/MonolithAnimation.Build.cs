@@ -86,6 +86,11 @@ public class MonolithAnimation : ModuleRules
 		if (bHasChooser)
 		{
 			PrivateDependencyModuleNames.Add("Chooser");
+			// FGameplayTagColumn cells use FGameplayTagContainer + UGameplayTagsManager.
+			// Chooser keeps GameplayTags as a PRIVATE dep (not re-exported), so the
+			// chooser-authoring GameplayTag cell-write path needs it directly. Only
+			// linked when WITH_CHOOSER, matching the gated #if WITH_CHOOSER bodies.
+			PrivateDependencyModuleNames.Add("GameplayTags");
 			// PUBLIC so every TU in the module (including a sibling graph-surgery
 			// file added later) sees WITH_CHOOSER consistently.
 			PublicDefinitions.Add("WITH_CHOOSER=1");
