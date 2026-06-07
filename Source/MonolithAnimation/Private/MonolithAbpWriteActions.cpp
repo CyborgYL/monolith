@@ -2109,6 +2109,30 @@ FMonolithActionResult FMonolithAbpWriteActions::HandleBuildFootIkPass(const TSha
 		SetProp(IkRNode, TEXT("AlphaCurveName"), RightCurve);
 	}
 
+	// --- Make the skeletal-control nodes NON-INERT ---
+	// Without these, the pelvis ModifyBone leaves TranslationMode = BMM_Ignore (does nothing)
+	// and the TwoBoneIK nodes solve toward EffectorLocation (0,0,0) in component space — which
+	// yanks the feet to the component origin. Set real modes / reference frames so the pass is
+	// functional. EffectorLocation itself is exposed as an input pin (auto-exposed by
+	// add_anim_graph_node for TwoBoneIK) so a downstream ground-trace solve can drive it; until
+	// then BoneSpace + EffectorTarget=foot bone makes EffectorLocation(0,0,0) an identity solve
+	// (foot stays at its animated location) rather than a destructive component-origin pull.
+	//
+	// EBoneModificationMode: BMM_Ignore / BMM_Replace / BMM_Additive (AnimNode_ModifyBone.h:14-25).
+	// EBoneControlSpace: BCS_WorldSpace / BCS_ComponentSpace / BCS_ParentBoneSpace / BCS_BoneSpace.
+	// Enum names are imported by ImportText_Direct (the same parser the Details panel uses).
+
+	// Pelvis offset: additive vertical adjust in component space (the Translation pin drives the amount).
+	SetProp(PelvisNode, TEXT("TranslationMode"),  TEXT("BMM_Additive"));
+	SetProp(PelvisNode, TEXT("TranslationSpace"), TEXT("BCS_ComponentSpace"));
+
+	// Foot IK effectors: solve relative to the foot bone's own space, with the effector target
+	// bound to the foot bone, so EffectorLocation is a meaningful (non-component-origin) offset.
+	SetProp(IkLNode, TEXT("EffectorLocationSpace"), TEXT("BCS_BoneSpace"));
+	SetProp(IkLNode, TEXT("EffectorTarget.BoneReference.BoneName"), LeftFootBone);
+	SetProp(IkRNode, TEXT("EffectorLocationSpace"), TEXT("BCS_BoneSpace"));
+	SetProp(IkRNode, TEXT("EffectorTarget.BoneReference.BoneName"), RightFootBone);
+
 	// --- Wire the chain (verified pin names: LocalPose / ComponentPose / Pose / Result) ---
 	auto Connect = [&](const FString& SN, const FString& SP, const FString& TN, const FString& TP) -> bool
 	{

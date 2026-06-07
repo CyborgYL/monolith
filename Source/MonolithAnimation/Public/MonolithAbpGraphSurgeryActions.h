@@ -39,6 +39,13 @@ private:
 	static FMonolithActionResult HandleAddEvaluateChooserNode(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleWireChooserToMotionMatching(const TSharedPtr<FJsonObject>& Params);
 
+	// bind_chooser_database_via_threadsafe (WITH_CHOOSER): place the (exec-driven)
+	// EvaluateChooser2 inside a thread-safe FUNCTION graph with execute wired + context=self,
+	// store its Result into a SelectedDatabase var, and feed the MM node Database pin from a
+	// VariableGet of that var. This is the WORKING exec-driven pattern (a bare chooser dropped
+	// in the AnimGraph with execute unconnected is pruned by the compiler -> null database -> A-pose).
+	static FMonolithActionResult HandleBindChooserDatabaseViaThreadSafe(const TSharedPtr<FJsonObject>& Params);
+
 	// F11 — duplicate + reparent + dependency classification
 	static FMonolithActionResult HandleDuplicateReparentAndSanitize(const TSharedPtr<FJsonObject>& Params);
 

@@ -149,21 +149,32 @@ void FMonolithMotionMatchingScaffoldActions::RegisterActions(FMonolithToolRegist
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("scaffold_locomotion_anim_values"),
-		TEXT("COMPOSITE: ensure the thread-safe update + pawn-owner access exist, then create the locomotion anim "
-			 "variables (Velocity vector, GroundSpeed float, Acceleration vector, bIsMoving bool, bIsCrouched bool) "
-			 "and author nodes in the thread-safe update that derive them from the pawn/CMC (Velocity from GetVelocity, "
-			 "GroundSpeed = VSizeXY(Velocity), Acceleration from CMC GetCurrentAcceleration, bIsCrouched from "
-			 "ACharacter::IsCrouched) and SET each anim var. These vars feed the stance chooser. Reuses add_variable + "
-			 "add_property_access + add_nodes_bulk + connect_pins_bulk internals. All math sits behind the overridable "
-			 "thread-safe boundary so a future thread-safe anim-math BPFL is a drop-in."),
+		TEXT("COMPOSITE: ensure a thread-safe update/function graph exists, create the locomotion anim variables (Velocity vector, "
+			 "GroundSpeed float, Acceleration vector, bIsMoving bool, bIsCrouched bool), then author a FULLY WIRED node graph that "
+			 "reads pawn state via GENUINE thread-safe Property Access (UK2Node_PropertyAccess) and SETs each anim var. "
+			 "THREAD-SAFE BY CONSTRUCTION: the pawn-state SOURCES are Property Access reads (Velocity/Acceleration/crouch), NOT a "
+			 "TryGetPawnOwner -> Cast -> getter chain (that chain triggers 'Accessing an object reference is not thread-safe'). "
+			 "Velocity feeds Set Velocity + VSizeXY -> Set GroundSpeed; Acceleration feeds Set Acceleration; crouch feeds Set bIsCrouched; "
+			 "bIsMoving = (GroundSpeed > threshold AND NOT Acceleration.IsNearlyZero). The pure math (VSizeXY, compares, AND/NOT) and the "
+			 "Set-anim-var nodes are unchanged; only the read SOURCE is Property Access. "
+			 "PATHS: velocity_path / acceleration_path / crouch_path are verbatim Property Access resolution chains. They DEFAULT to the "
+			 "Game Animation Sample SandboxCharacter_CMC_ABP layout (a 'CharacterProperties' member struct populated game-thread-side: "
+			 "Velocity/InputAcceleration/Stance). If your AnimBP does NOT have that struct, supply paths into a source your AnimBP exposes "
+			 "(e.g. an AnimInstance member variable) — Property Access resolves a member of the AnimInstance itself, so the access root must "
+			 "exist on the AnimBP. Authors into BlueprintThreadSafeUpdateAnimation by default; pass target_graph to author into a named "
+			 "thread-safe FUNCTION graph (e.g. 'UpdateEssentialValues'). Reuses add_variable + add_property_access_node + add_nodes_bulk + connect_pins_bulk."),
 		FMonolithActionHandler::CreateStatic(&HandleScaffoldLocomotionAnimValues),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.Optional(TEXT("target_graph"),     TEXT("string"), TEXT("Thread-safe graph/function to author into (default 'BlueprintThreadSafeUpdateAnimation'). Pass a function name like 'UpdateEssentialValues' to write into that function graph; it must already exist (override/author it first)."), {TEXT("function_name"), TEXT("graph_name")})
 			.Optional(TEXT("velocity_var"),     TEXT("string"), TEXT("Name override for the Velocity vector var (default 'Velocity')"),         TEXT("Velocity"))
 			.Optional(TEXT("ground_speed_var"), TEXT("string"), TEXT("Name override for the GroundSpeed float var (default 'GroundSpeed')"),    TEXT("GroundSpeed"))
 			.Optional(TEXT("acceleration_var"), TEXT("string"), TEXT("Name override for the Acceleration vector var (default 'Acceleration')"), TEXT("Acceleration"))
 			.Optional(TEXT("is_moving_var"),    TEXT("string"), TEXT("Name override for the bIsMoving bool var (default 'bIsMoving')"),         TEXT("bIsMoving"))
 			.Optional(TEXT("is_crouched_var"),  TEXT("string"), TEXT("Name override for the bIsCrouched bool var (default 'bIsCrouched')"),     TEXT("bIsCrouched"))
+			.Optional(TEXT("velocity_path"),     TEXT("array"), TEXT("Property Access path (array of strings) for Velocity. Default: ['CharacterProperties','Velocity'] (Game Animation Sample). For a UserDefinedStruct field use the GUID-suffixed internal name."))
+			.Optional(TEXT("acceleration_path"), TEXT("array"), TEXT("Property Access path for Acceleration. Default: ['CharacterProperties','InputAcceleration']."))
+			.Optional(TEXT("crouch_path"),       TEXT("array"), TEXT("Property Access path for the crouch SOURCE (must resolve to a BOOL to feed the bIsCrouched var cleanly). NO default — the Game Animation Sample exposes a Stance ENUM, not a bool, so crouch is SKIPPED unless you supply a bool path. When omitted, the bIsCrouched var is created but left unset (no dangling pin)."))
 			.Build());
 
 	// -----------------------------------------------------------------------
@@ -1307,6 +1318,32 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldLoco
 	const FString IsMovingVar     = VarName(TEXT("is_moving_var"),    TEXT("bIsMoving"));
 	const FString IsCrouchedVar   = VarName(TEXT("is_crouched_var"),  TEXT("bIsCrouched"));
 
+	// Target graph: default to the thread-safe update; allow a named thread-safe FUNCTION graph.
+	const FString TargetGraphName = VarName(TEXT("target_graph"), kThreadSafeUpdateFuncName);
+
+	// Property Access paths for the pawn-state SOURCES. velocity/acceleration default to the
+	// Game Animation Sample 'CharacterProperties' member-struct layout; crouch has no default
+	// (the sample's crouch source is an enum, not a bool) and is skipped when omitted.
+	auto ParsePath = [&Params](const TCHAR* Key, const TArray<FString>& Default) -> TArray<FString>
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Params->TryGetArrayField(Key, Arr) && Arr && Arr->Num() > 0)
+		{
+			TArray<FString> Out;
+			for (const TSharedPtr<FJsonValue>& E : *Arr)
+			{
+				FString S;
+				if (E.IsValid() && E->TryGetString(S) && !S.IsEmpty()) Out.Add(S);
+			}
+			if (Out.Num() > 0) return Out;
+		}
+		return Default;
+	};
+	const TArray<FString> VelocityPath     = ParsePath(TEXT("velocity_path"),     { TEXT("CharacterProperties"), TEXT("Velocity") });
+	const TArray<FString> AccelerationPath  = ParsePath(TEXT("acceleration_path"), { TEXT("CharacterProperties"), TEXT("InputAcceleration") });
+	const TArray<FString> CrouchPath        = ParsePath(TEXT("crouch_path"),       {});  // no default — skip when empty
+	const bool bWireCrouch = CrouchPath.Num() > 0;
+
 	TArray<TSharedPtr<FJsonValue>> Steps;
 	auto NoteStep = [&Steps](const FString& Name, bool bOk, const FString& Detail)
 	{
@@ -1317,7 +1354,15 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldLoco
 		Steps.Add(MakeShared<FJsonValueObject>(S));
 	};
 
-	// 1) Ensure thread-safe update + pawn access (compose A.1 + A.2).
+	// 1) Ensure the TARGET thread-safe graph exists.
+	//    - Default target (BlueprintThreadSafeUpdateAnimation): author the override if absent.
+	//    - Named function target (e.g. UpdateEssentialValues): it must already exist — we do NOT
+	//      synthesise an arbitrary function here (use add_function / scaffold_threadsafe_update or
+	//      author it first). We only verify presence so the writes land in a real graph.
+	//    No pawn/cast chain is authored — the pawn-state SOURCES are Property Access reads (Step 3b),
+	//    which is what makes the result thread-safe.
+	const bool bTargetIsThreadSafeUpdate = TargetGraphName.Equals(kThreadSafeUpdateFuncName, ESearchCase::IgnoreCase);
+	if (bTargetIsThreadSafeUpdate)
 	{
 		bool bCreated = false; FString Err;
 		if (!EnsureThreadSafeUpdate(AbpPath, ABP, bCreated, Err))
@@ -1326,12 +1371,16 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldLoco
 				TEXT("scaffold_locomotion_anim_values: thread-safe update unavailable — %s"), *Err));
 		}
 		NoteStep(TEXT("scaffold_threadsafe_update"), true, bCreated ? TEXT("created") : TEXT("already existed"));
-
-		TSharedRef<FJsonObject> PawnSub = MakeShared<FJsonObject>();
-		PawnSub->SetStringField(TEXT("abp_path"), AbpPath);
-		PawnSub->SetStringField(TEXT("cast_class"), TEXT("Character"));
-		FMonolithActionResult PR = HandleAddPawnOwnerAccess(PawnSub);
-		NoteStep(TEXT("add_pawn_owner_access"), PR.bSuccess, PR.bSuccess ? TEXT("") : PR.ErrorMessage);
+	}
+	else
+	{
+		if (!MonolithBlueprintInternal::FindGraphByName(ABP, TargetGraphName))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("scaffold_locomotion_anim_values: target_graph '%s' not found on the AnimBP. Create/override it first "
+				     "(it must be a thread-safe function graph)."), *TargetGraphName));
+		}
+		NoteStep(TEXT("verify_target_graph"), true, TargetGraphName);
 	}
 
 	// 2) Create the locomotion anim variables (idempotent — add_variable warns/errors on
@@ -1359,26 +1408,37 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldLoco
 			VR.bSuccess ? FString(V.Type) : VR.ErrorMessage);
 	}
 
-	// 3) Author the read+SET nodes inside the thread-safe update via add_nodes_bulk.
-	//    The pawn/CMC reads (GetVelocity, GetCurrentAcceleration, IsCrouched) and the
-	//    VSizeXY math are dropped as CallFunction nodes; each anim var gets a VariableSet.
-	//    Inter-node pin wiring (cast-result -> getters, getters -> setters) is intentionally
-	//    LEFT to a follow-up connect_pins_bulk call by the asset-build sequence (§7.2.d) —
-	//    add_property_access/add_nodes_bulk return the node ids needed for that wiring, and
-	//    keeping the wiring caller-driven matches how scaffold_locomotion_input composes.
+	// 3) Author a FULLY WIRED node graph inside the target thread-safe graph.
+	//
+	//    Topology (all inside TargetGraphName):
+	//      FunctionEntry.then -> set_velocity -> set_groundspeed -> set_accel -> [set_iscrouched ->] set_ismoving (exec)
+	//      pa_velocity.Value -> set_velocity.<Velocity> AND -> vsize_xy.A
+	//      vsize_xy.ReturnValue -> set_groundspeed.<GroundSpeed> AND -> speed_gt.A
+	//      pa_accel.Value -> set_accel.<Acceleration> AND -> accel_nz.A
+	//      [pa_crouch.Value -> set_iscrouched.<bIsCrouched>]
+	//      speed_gt.ReturnValue -> moving_and.A ; accel_nz.ReturnValue -> not_accel.A ; not_accel.ReturnValue -> moving_and.B
+	//      moving_and.ReturnValue -> set_ismoving.<bIsMoving>
+	//
+	//    The pawn-state SOURCES (Velocity / Acceleration / crouch) are GENUINE thread-safe
+	//    Property Access reads (add_property_access_node — real UK2Node_PropertyAccess), NOT a
+	//    TryGetPawnOwner -> Cast -> getter chain. That is the entire point: a cast-result self-pin
+	//    deref on the worker thread is what raises 'Accessing an object reference is not thread-safe'.
+	//    Property Access is resolved thread-safe (or game-thread-cached) by the AnimBP compiler.
+
+	// 3a) Bulk-author the pure math + the setters (no pawn/cast chain, no getter calls).
 	TSharedRef<FJsonObject> NodesSub = MakeShared<FJsonObject>();
 	NodesSub->SetStringField(TEXT("asset_path"), AbpPath);
-	NodesSub->SetStringField(TEXT("graph_name"), kThreadSafeUpdateFuncName);
+	NodesSub->SetStringField(TEXT("graph_name"), TargetGraphName);
 	{
 		TArray<TSharedPtr<FJsonValue>> Nodes;
 
-		auto AddCall = [&Nodes](const TCHAR* TempId, const TCHAR* Func, const TCHAR* TargetClass)
+		auto AddCallNoTarget = [&Nodes](const TCHAR* TempId, const TCHAR* Func)
 		{
 			TSharedPtr<FJsonObject> N = MakeShared<FJsonObject>();
 			N->SetStringField(TEXT("temp_id"), TempId);
 			N->SetStringField(TEXT("node_type"), TEXT("call_function"));
 			N->SetStringField(TEXT("function_name"), Func);
-			N->SetStringField(TEXT("target_class"), TargetClass);
+			N->SetStringField(TEXT("target_class"), TEXT("KismetMathLibrary"));
 			Nodes.Add(MakeShared<FJsonValueObject>(N));
 		};
 		auto AddSet = [&Nodes](const TCHAR* TempId, const FString& VarName)
@@ -1390,17 +1450,18 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldLoco
 			Nodes.Add(MakeShared<FJsonValueObject>(N));
 		};
 
-		// Reads from the pawn / movement component.
-		AddCall(TEXT("get_velocity"), TEXT("GetVelocity"), TEXT("Actor"));
-		AddCall(TEXT("vsize_xy"),     TEXT("VSizeXY"),     TEXT("KismetMathLibrary"));
-		AddCall(TEXT("get_accel"),    TEXT("GetCurrentAcceleration"), TEXT("CharacterMovementComponent"));
-		AddCall(TEXT("is_crouched"),  TEXT("IsCrouched"),  TEXT("Character"));
+		// Pure math — KismetMathLibrary statics (no self pin, inherently thread-safe).
+		AddCallNoTarget(TEXT("vsize_xy"),   TEXT("VSizeXY"));
+		AddCallNoTarget(TEXT("speed_gt"),   TEXT("Greater_DoubleDouble"));
+		AddCallNoTarget(TEXT("accel_nz"),   TEXT("Vector_IsNearlyZero"));
+		AddCallNoTarget(TEXT("not_accel"),  TEXT("Not_PreBool"));
+		AddCallNoTarget(TEXT("moving_and"), TEXT("BooleanAND"));
 
 		// Setters for each anim var.
 		AddSet(TEXT("set_velocity"),    VelocityVar);
 		AddSet(TEXT("set_groundspeed"), GroundSpeedVar);
 		AddSet(TEXT("set_accel"),       AccelerationVar);
-		AddSet(TEXT("set_iscrouched"),  IsCrouchedVar);
+		if (bWireCrouch) AddSet(TEXT("set_iscrouched"), IsCrouchedVar);
 		AddSet(TEXT("set_ismoving"),    IsMovingVar);
 
 		NodesSub->SetArrayField(TEXT("nodes"), Nodes);
@@ -1410,14 +1471,147 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldLoco
 	FMonolithActionResult NR = FMonolithBlueprintNodeActions::HandleAddNodesBulk(NodesSub);
 	NoteStep(TEXT("add_nodes_bulk"), NR.bSuccess, NR.bSuccess ? TEXT("") : NR.ErrorMessage);
 
-	// Surface the temp_id -> node_id map so the asset-build sequence can wire the chain.
 	TMap<FString, FString> IdMap;
 	ExtractBulkNodeIds(NR, IdMap);
+
+	// 3b) Author the pawn-state SOURCES as GENUINE thread-safe Property Access nodes.
+	auto AddPropAccessNode = [&](const TArray<FString>& APath) -> FString
+	{
+		TSharedRef<FJsonObject> Sub = MakeShared<FJsonObject>();
+		Sub->SetStringField(TEXT("asset_path"), AbpPath);
+		Sub->SetStringField(TEXT("graph_name"), TargetGraphName);
+		TArray<TSharedPtr<FJsonValue>> PathArr;
+		for (const FString& S : APath) { PathArr.Add(MakeShared<FJsonValueString>(S)); }
+		Sub->SetArrayField(TEXT("path"), PathArr);
+		FMonolithActionResult R = FMonolithBlueprintNodeActions::HandleAddPropertyAccessNode(Sub);
+		if (!R.bSuccess || !R.Result.IsValid()) return FString();
+		FString NodeId; R.Result->TryGetStringField(TEXT("node_id"), NodeId);
+		return NodeId;
+	};
+	const FString PaVelocityId = AddPropAccessNode(VelocityPath);
+	const FString PaAccelId     = AddPropAccessNode(AccelerationPath);
+	const FString PaCrouchId    = bWireCrouch ? AddPropAccessNode(CrouchPath) : FString();
+	NoteStep(TEXT("add_property_access_node"),
+		!PaVelocityId.IsEmpty() && !PaAccelId.IsEmpty() && (!bWireCrouch || !PaCrouchId.IsEmpty()),
+		FString::Printf(TEXT("velocity=%s acceleration=%s crouch=%s"),
+			*PaVelocityId, *PaAccelId, bWireCrouch ? *PaCrouchId : TEXT("(skipped)")));
+
+	// 3c) Resolve the FunctionEntry node id (exec source for the chain).
+	FString EntryNodeId;
+	if (UEdGraph* TsGraph = MonolithBlueprintInternal::FindGraphByName(ABP, TargetGraphName))
+	{
+		for (UEdGraphNode* Node : TsGraph->Nodes)
+		{
+			if (Node && Node->GetClass() && Node->GetClass()->GetName().Contains(TEXT("FunctionEntry")))
+			{
+				EntryNodeId = Node->GetName();
+				break;
+			}
+		}
+	}
+
+	// 3d) Wire every connection via connect_pins_bulk. Pin names are engine defaults:
+	//      CallFunction pure return = "ReturnValue"; FunctionEntry exec out = "then";
+	//      VariableSet: exec "execute"/"then", value-in = the variable name.
+	//      Property Access node: output data pin = "Value" (the resolved leaf read).
+	const FString VSizeXY   = IdMap.FindRef(TEXT("vsize_xy"));
+	const FString SpeedGt   = IdMap.FindRef(TEXT("speed_gt"));
+	const FString AccelNz   = IdMap.FindRef(TEXT("accel_nz"));
+	const FString NotAccel  = IdMap.FindRef(TEXT("not_accel"));
+	const FString MovingAnd = IdMap.FindRef(TEXT("moving_and"));
+	const FString SetVel    = IdMap.FindRef(TEXT("set_velocity"));
+	const FString SetGspd   = IdMap.FindRef(TEXT("set_groundspeed"));
+	const FString SetAccel  = IdMap.FindRef(TEXT("set_accel"));
+	const FString SetCrouch = bWireCrouch ? IdMap.FindRef(TEXT("set_iscrouched")) : FString();
+	const FString SetMoving = IdMap.FindRef(TEXT("set_ismoving"));
+
+	TArray<TSharedPtr<FJsonValue>> Conns;
+	auto Wire = [&Conns](const FString& SN, const TCHAR* SP, const FString& TN, const TCHAR* TP)
+	{
+		if (SN.IsEmpty() || TN.IsEmpty()) return;
+		TSharedPtr<FJsonObject> C = MakeShared<FJsonObject>();
+		C->SetStringField(TEXT("source_node"), SN);
+		C->SetStringField(TEXT("source_pin"), SP);
+		C->SetStringField(TEXT("target_node"), TN);
+		C->SetStringField(TEXT("target_pin"), TP);
+		Conns.Add(MakeShared<FJsonValueObject>(C));
+	};
+
+	// Exec chain: Entry -> SetVel -> SetGspd -> SetAccel -> [SetCrouch ->] SetMoving.
+	Wire(EntryNodeId, TEXT("then"), SetVel,   TEXT("execute"));
+	Wire(SetVel,      TEXT("then"), SetGspd,  TEXT("execute"));
+	Wire(SetGspd,     TEXT("then"), SetAccel, TEXT("execute"));
+	if (bWireCrouch)
+	{
+		Wire(SetAccel,  TEXT("then"), SetCrouch, TEXT("execute"));
+		Wire(SetCrouch, TEXT("then"), SetMoving, TEXT("execute"));
+	}
+	else
+	{
+		Wire(SetAccel,  TEXT("then"), SetMoving, TEXT("execute"));
+	}
+
+	// Velocity SOURCE = Property Access 'Value' -> Set Velocity + VSizeXY.A.
+	Wire(PaVelocityId, TEXT("Value"), SetVel,  *VelocityVar);
+	Wire(PaVelocityId, TEXT("Value"), VSizeXY, TEXT("A"));
+
+	// GroundSpeed -> Set GroundSpeed + Greater compare A.
+	Wire(VSizeXY, TEXT("ReturnValue"), SetGspd, *GroundSpeedVar);
+	Wire(VSizeXY, TEXT("ReturnValue"), SpeedGt, TEXT("A"));
+
+	// Acceleration SOURCE = Property Access 'Value' -> Set Acceleration + IsNearlyZero A.
+	Wire(PaAccelId, TEXT("Value"), SetAccel, *AccelerationVar);
+	Wire(PaAccelId, TEXT("Value"), AccelNz,  TEXT("A"));
+
+	// crouch SOURCE = Property Access 'Value' -> Set bIsCrouched (only when a bool path was supplied).
+	if (bWireCrouch)
+	{
+		Wire(PaCrouchId, TEXT("Value"), SetCrouch, *IsCrouchedVar);
+	}
+
+	// bIsMoving = (GroundSpeed > threshold) AND NOT (Accel.IsNearlyZero).
+	Wire(SpeedGt,   TEXT("ReturnValue"), MovingAnd, TEXT("A"));
+	Wire(AccelNz,   TEXT("ReturnValue"), NotAccel,  TEXT("A"));
+	Wire(NotAccel,  TEXT("ReturnValue"), MovingAnd, TEXT("B"));
+	Wire(MovingAnd, TEXT("ReturnValue"), SetMoving, *IsMovingVar);
+
+	int32 Connected = 0;
+	{
+		TSharedRef<FJsonObject> ConnSub = MakeShared<FJsonObject>();
+		ConnSub->SetStringField(TEXT("asset_path"), AbpPath);
+		ConnSub->SetStringField(TEXT("graph_name"), TargetGraphName);
+		ConnSub->SetArrayField(TEXT("connections"), Conns);
+		FMonolithActionResult CR = FMonolithBlueprintNodeActions::HandleConnectPinsBulk(ConnSub);
+		if (CR.bSuccess && CR.Result.IsValid())
+		{
+			double C = 0.0; CR.Result->TryGetNumberField(TEXT("connected"), C);
+			Connected = (int32)C;
+		}
+		NoteStep(TEXT("connect_pins_bulk"), CR.bSuccess,
+			FString::Printf(TEXT("%d/%d connected"), Connected, Conns.Num()));
+	}
+
+	// Set the GroundSpeed threshold default on the compare's B pin (3.0 cm/s).
+	{
+		TSharedRef<FJsonObject> DefSub = MakeShared<FJsonObject>();
+		DefSub->SetStringField(TEXT("asset_path"), AbpPath);
+		DefSub->SetStringField(TEXT("graph_name"), TargetGraphName);
+		DefSub->SetStringField(TEXT("node_id"), SpeedGt);
+		DefSub->SetStringField(TEXT("pin_name"), TEXT("B"));
+		DefSub->SetStringField(TEXT("value"), TEXT("3.0"));
+		FMonolithBlueprintNodeActions::HandleSetPinDefault(DefSub); // best-effort
+	}
+
+	// Surface the temp_id -> node_id map (plus the property-access node ids) for callers.
 	TSharedPtr<FJsonObject> NodeIdMap = MakeShared<FJsonObject>();
 	for (const TPair<FString, FString>& KV : IdMap)
 	{
 		NodeIdMap->SetStringField(KV.Key, KV.Value);
 	}
+	if (!PaVelocityId.IsEmpty()) NodeIdMap->SetStringField(TEXT("pa_velocity"), PaVelocityId);
+	if (!PaAccelId.IsEmpty())    NodeIdMap->SetStringField(TEXT("pa_acceleration"), PaAccelId);
+	if (!PaCrouchId.IsEmpty())   NodeIdMap->SetStringField(TEXT("pa_crouch"), PaCrouchId);
+	if (!EntryNodeId.IsEmpty())  NodeIdMap->SetStringField(TEXT("function_entry"), EntryNodeId);
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(ABP);
 
@@ -1426,9 +1620,10 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldLoco
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("abp_path"), AbpPath);
-	Root->SetStringField(TEXT("graph_name"), kThreadSafeUpdateFuncName);
+	Root->SetStringField(TEXT("graph_name"), TargetGraphName);
 	Root->SetArrayField(TEXT("anim_variables"), VarNames);
 	Root->SetNumberField(TEXT("variables_created"), VarsCreated);
+	Root->SetNumberField(TEXT("connections_made"), Connected);
 	Root->SetArrayField(TEXT("steps"), Steps);
 	Root->SetObjectField(TEXT("node_id_map"), NodeIdMap);
 	Root->SetBoolField(TEXT("success"), true);

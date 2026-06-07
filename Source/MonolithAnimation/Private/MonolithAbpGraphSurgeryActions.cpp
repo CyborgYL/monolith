@@ -11,7 +11,10 @@
 #include "K2Node.h"
 #include "K2Node_DynamicCast.h"
 #include "K2Node_VariableGet.h"
+#include "K2Node_VariableSet.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_Self.h"
 #include "Engine/MemberReference.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
@@ -493,6 +496,19 @@ void FMonolithAbpGraphSurgeryActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Required(TEXT("chooser_node"), TEXT("string"), TEXT("UObject name of the Evaluate-Chooser node (from add_evaluate_chooser_node response)"))
 			.Required(TEXT("mm_node"), TEXT("string"), TEXT("UObject name of the Motion Matching node (from build_motion_matching_node response)"))
 			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Graph containing both nodes. Default: AnimGraph"), TEXT("AnimGraph"))
+			.Build());
+
+	// --- bind_chooser_database_via_threadsafe (Pack B) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("bind_chooser_database_via_threadsafe"),
+		TEXT("WORKING exec-driven chooser pattern. Places the (exec-driven) EvaluateChooser2 node inside a thread-safe FUNCTION graph: wires the function entry's exec into the chooser's 'execute', sets the chooser context to 'self' (the AnimInstance) via a Self node, stores the chooser 'Result' (UPoseSearchDatabase) into the named SelectedDatabase variable, then exposes the Motion Matching node's 'Database' pin and feeds it from a VariableGet of that variable. Fixes the A-pose failure where a bare chooser dropped in the AnimGraph with 'execute' unconnected is pruned by the compiler. The function graph is created if absent and marked Thread Safe. Requires the Chooser plugin (WITH_CHOOSER)."),
+		FMonolithActionHandler::CreateStatic(&HandleBindChooserDatabaseViaThreadSafe),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.RequiredAssetPath(TEXT("chooser_path"), TEXT("UChooserTable asset to bind"))
+			.Required(TEXT("mm_node"), TEXT("string"), TEXT("UObject name of the Motion Matching node (from build_motion_matching_node)"))
+			.Required(TEXT("selected_database_var"), TEXT("string"), TEXT("Name of the UPoseSearchDatabase variable to store the chooser result into (must already exist on the ABP)"))
+			.Optional(TEXT("function_name"), TEXT("string"), TEXT("Thread-safe function graph to author the chooser into (created if absent). Default: SelectLocomotionDatabase"), TEXT("SelectLocomotionDatabase"))
+			.Optional(TEXT("anim_graph_name"), TEXT("string"), TEXT("Graph containing the Motion Matching node. Default: AnimGraph"), TEXT("AnimGraph"))
 			.Build());
 
 	// --- duplicate_reparent_and_sanitize ---
@@ -1489,6 +1505,260 @@ FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleWireChooserToMotion
 	return FMonolithActionResult::Success(Root);
 }
 
+// ===========================================================================
+//  Pack B — bind_chooser_database_via_threadsafe (WORKING exec-driven pattern)
+// ===========================================================================
+
+FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleBindChooserDatabaseViaThreadSafe(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath     = Params->GetStringField(TEXT("abp_path"));
+	const FString ChooserPath = Params->GetStringField(TEXT("chooser_path"));
+	const FString MMNodeRef   = Params->GetStringField(TEXT("mm_node"));
+	const FString DbVar       = Params->GetStringField(TEXT("selected_database_var"));
+	FString FuncName = Params->HasField(TEXT("function_name")) ? Params->GetStringField(TEXT("function_name")) : TEXT("SelectLocomotionDatabase");
+	if (FuncName.IsEmpty()) FuncName = TEXT("SelectLocomotionDatabase");
+	FString AnimGraphName = Params->HasField(TEXT("anim_graph_name")) ? Params->GetStringField(TEXT("anim_graph_name")) : TEXT("AnimGraph");
+	if (AnimGraphName.IsEmpty()) AnimGraphName = TEXT("AnimGraph");
+
+	if (DbVar.IsEmpty()) return FMonolithActionResult::Error(TEXT("selected_database_var is required"));
+	if (MMNodeRef.IsEmpty()) return FMonolithActionResult::Error(TEXT("mm_node is required"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Animation Blueprint not found: %s"), *AbpPath));
+	}
+
+	UClass* EvalClass = ResolveEvaluateChooser2Class();
+	if (!EvalClass)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Could not resolve Evaluate-Chooser node class at '%s'. Is the Chooser plugin enabled and loaded?"),
+			EvaluateChooser2ClassPath));
+	}
+
+	UChooserTable* Chooser = FMonolithAssetUtils::LoadAssetByPath<UChooserTable>(ChooserPath);
+	if (!Chooser)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Chooser table not found: %s"), *ChooserPath));
+	}
+
+	// --- 1) Ensure the thread-safe FUNCTION graph exists. ---
+	UEdGraph* FuncGraph = nullptr;
+	for (UEdGraph* G : ABP->FunctionGraphs)
+	{
+		if (G && G->GetName() == FuncName) { FuncGraph = G; break; }
+	}
+	bool bFuncCreated = false;
+	if (!FuncGraph)
+	{
+		FuncGraph = FBlueprintEditorUtils::CreateNewGraph(
+			ABP, FName(*FuncName), UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+		if (!FuncGraph)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create function graph: %s"), *FuncName));
+		}
+		FBlueprintEditorUtils::AddFunctionGraph<UClass>(ABP, FuncGraph, /*bIsUserCreated=*/true, /*SignatureFromObject=*/(UClass*)nullptr);
+		bFuncCreated = true;
+	}
+
+	// Locate the function entry node and mark the function Thread Safe.
+	UK2Node_FunctionEntry* EntryNode = nullptr;
+	for (UEdGraphNode* Node : FuncGraph->Nodes)
+	{
+		EntryNode = Cast<UK2Node_FunctionEntry>(Node);
+		if (EntryNode) break;
+	}
+	if (!EntryNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No function entry node in graph '%s'"), *FuncName));
+	}
+	EntryNode->Modify();
+	EntryNode->MetaData.bThreadSafe = true;
+
+	// --- 2) Spawn the EvaluateChooser2 node inside the function graph (reuse shared helper). ---
+	UK2Node* ChooserNode = SpawnEvaluateChooser2Node(FuncGraph, EvalClass, Chooser, 300, 0);
+	if (!ChooserNode)
+	{
+		return FMonolithActionResult::Error(TEXT("Reflective UK2Node_EvaluateChooser2 spawn failed (no 'Chooser' FObjectProperty or node could not be created)."));
+	}
+
+	// Assert the chooser object is non-null (so the node is not pruned for an empty binding).
+	if (FObjectProperty* ChooserProp = FindFProperty<FObjectProperty>(EvalClass, TEXT("Chooser")))
+	{
+		if (ChooserProp->GetObjectPropertyValue_InContainer(ChooserNode) == nullptr)
+		{
+			return FMonolithActionResult::Error(TEXT("Chooser binding is null after spawn — node would be pruned. Aborting."));
+		}
+	}
+
+	const UEdGraphSchema* Schema = FuncGraph->GetSchema();
+	if (!Schema) return FMonolithActionResult::Error(TEXT("Function graph has no schema"));
+
+	// --- 3) Wire FunctionEntry exec -> chooser 'execute' input. ---
+	int32 Wired = 0;
+	UEdGraphPin* EntryThen = FindPinByNameDir(EntryNode, UEdGraphSchema_K2::PN_Then, EGPD_Output);
+	UEdGraphPin* ChooserExecIn = FindPinByNameDir(ChooserNode, UEdGraphSchema_K2::PN_Execute, EGPD_Input);
+	if (EntryThen && ChooserExecIn && Schema->TryCreateConnection(EntryThen, ChooserExecIn)) ++Wired;
+
+	// --- 4) Context = self. Spawn a Self node and wire it to the chooser's context (object) input. ---
+	//    The context input pin is named after the chooser's configured context class FName, so we
+	//    locate it generically: the first NON-exec, NON-'Result' object/interface INPUT pin.
+	UK2Node_Self* SelfNode = NewObject<UK2Node_Self>(FuncGraph);
+	FuncGraph->AddNode(SelfNode, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+	SelfNode->CreateNewGuid();
+	SelfNode->NodePosX = 100;
+	SelfNode->NodePosY = 150;
+	SelfNode->AllocateDefaultPins();
+	UEdGraphPin* SelfOut = nullptr;
+	for (UEdGraphPin* P : SelfNode->Pins)
+	{
+		if (P && P->Direction == EGPD_Output) { SelfOut = P; break; }
+	}
+
+	UEdGraphPin* ContextPin = nullptr;
+	for (UEdGraphPin* P : ChooserNode->Pins)
+	{
+		if (!P || P->Direction != EGPD_Input) continue;
+		if (P->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+		if (P->PinName == FName(TEXT("Result"))) continue;
+		if (P->PinType.PinCategory == UEdGraphSchema_K2::PC_Object ||
+			P->PinType.PinCategory == UEdGraphSchema_K2::PC_Interface)
+		{
+			ContextPin = P;
+			break;
+		}
+	}
+	FString ContextPinName;
+	if (SelfOut && ContextPin)
+	{
+		ContextPinName = ContextPin->PinName.ToString();
+		const FPinConnectionResponse Resp = Schema->CanCreateConnection(SelfOut, ContextPin);
+		if (Resp.Response != CONNECT_RESPONSE_DISALLOW && Schema->TryCreateConnection(SelfOut, ContextPin)) ++Wired;
+	}
+
+	// --- 5) Spawn a VariableSet for the SelectedDatabase var; wire chooser.Result -> set value,
+	//        chooser exec out -> set exec in. ---
+	UK2Node_VariableSet* SetNode = NewObject<UK2Node_VariableSet>(FuncGraph);
+	SetNode->VariableReference.SetSelfMember(FName(*DbVar));
+	FuncGraph->AddNode(SetNode, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+	SetNode->CreateNewGuid();
+	SetNode->NodePosX = 600;
+	SetNode->NodePosY = 0;
+	SetNode->AllocateDefaultPins();
+
+	UEdGraphPin* ResultPin = FindPinByNameDir(ChooserNode, FName(TEXT("Result")), EGPD_Output);
+	if (!ResultPin)
+	{
+		for (UEdGraphPin* P : ChooserNode->Pins)
+		{
+			if (P && P->Direction == EGPD_Output && P->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{ ResultPin = P; break; }
+		}
+	}
+	// VariableSet value input pin is named after the variable.
+	UEdGraphPin* SetValuePin = FindPinByNameDir(SetNode, FName(*DbVar), EGPD_Input);
+	if (!SetValuePin)
+	{
+		for (UEdGraphPin* P : SetNode->Pins)
+		{
+			if (P && P->Direction == EGPD_Input && P->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{ SetValuePin = P; break; }
+		}
+	}
+	bool bResultWired = false;
+	if (ResultPin && SetValuePin)
+	{
+		const FPinConnectionResponse Resp = Schema->CanCreateConnection(ResultPin, SetValuePin);
+		if (Resp.Response != CONNECT_RESPONSE_DISALLOW)
+		{
+			bResultWired = Schema->TryCreateConnection(ResultPin, SetValuePin);
+			if (bResultWired) ++Wired;
+		}
+	}
+	// chooser exec out -> set exec in.
+	UEdGraphPin* ChooserExecOut = FindPinByNameDir(ChooserNode, UEdGraphSchema_K2::PN_Execute, EGPD_Output);
+	UEdGraphPin* SetExecIn = FindPinByNameDir(SetNode, UEdGraphSchema_K2::PN_Execute, EGPD_Input);
+	if (ChooserExecOut && SetExecIn && Schema->TryCreateConnection(ChooserExecOut, SetExecIn)) ++Wired;
+
+	// --- 6) AnimGraph side: spawn a VariableGet of the var and feed the MM 'Database' pin. ---
+	FString GraphErr;
+	UEdGraph* AnimGraph = ResolveGraphByName(ABP, AnimGraphName, GraphErr);
+	if (!AnimGraph)
+	{
+		return FMonolithActionResult::Error(GraphErr);
+	}
+	UEdGraphNode* MMNode = FindNodeByNameBP(ABP, MMNodeRef, AnimGraph);
+	if (!MMNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Motion Matching node '%s' not found in graph '%s'"), *MMNodeRef, *AnimGraphName));
+	}
+	UEdGraphPin* DatabasePin = FindPinByNameDir(MMNode, FName(TEXT("Database")), EGPD_Input);
+	if (!DatabasePin)
+	{
+		return FMonolithActionResult::Error(TEXT("Motion Matching node has no 'Database' input pin. Ensure the node is a UAnimGraphNode_MotionMatching with the Database pin shown."));
+	}
+
+	UK2Node_VariableGet* GetNode = NewObject<UK2Node_VariableGet>(AnimGraph);
+	GetNode->VariableReference.SetSelfMember(FName(*DbVar));
+	AnimGraph->AddNode(GetNode, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+	GetNode->CreateNewGuid();
+	GetNode->NodePosX = MMNode->NodePosX - 250;
+	GetNode->NodePosY = MMNode->NodePosY;
+	GetNode->AllocateDefaultPins();
+
+	UEdGraphPin* GetValuePin = FindPinByNameDir(GetNode, FName(*DbVar), EGPD_Output);
+	if (!GetValuePin)
+	{
+		for (UEdGraphPin* P : GetNode->Pins)
+		{
+			if (P && P->Direction == EGPD_Output && P->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{ GetValuePin = P; break; }
+		}
+	}
+	const UEdGraphSchema* AnimSchema = AnimGraph->GetSchema();
+	bool bDbWired = false;
+	FString DbWireError;
+	if (GetValuePin && AnimSchema)
+	{
+		const FPinConnectionResponse Resp = AnimSchema->CanCreateConnection(GetValuePin, DatabasePin);
+		if (Resp.Response != CONNECT_RESPONSE_DISALLOW)
+		{
+			bDbWired = AnimSchema->TryCreateConnection(GetValuePin, DatabasePin);
+			if (bDbWired) ++Wired;
+		}
+		else
+		{
+			DbWireError = Resp.Message.ToString();
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+	ABP->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("function_name"), FuncName);
+	Root->SetBoolField(TEXT("function_created"), bFuncCreated);
+	Root->SetBoolField(TEXT("function_thread_safe"), EntryNode->MetaData.bThreadSafe);
+	Root->SetStringField(TEXT("chooser_node"), ChooserNode->GetName());
+	Root->SetStringField(TEXT("chooser_path"), Chooser->GetPathName());
+	Root->SetStringField(TEXT("context_pin"), ContextPinName);
+	Root->SetStringField(TEXT("set_node"), SetNode->GetName());
+	Root->SetStringField(TEXT("get_node"), GetNode->GetName());
+	Root->SetStringField(TEXT("mm_node"), MMNode->GetName());
+	Root->SetStringField(TEXT("selected_database_var"), DbVar);
+	Root->SetBoolField(TEXT("result_wired_to_var"), bResultWired);
+	Root->SetBoolField(TEXT("database_pin_wired"), bDbWired);
+	if (!DbWireError.IsEmpty()) Root->SetStringField(TEXT("database_wire_error"), DbWireError);
+	Root->SetNumberField(TEXT("connections_made"), Wired);
+	Root->SetBoolField(TEXT("saved"), false);
+	return FMonolithActionResult::Success(Root);
+}
+
+
 #else // !WITH_CHOOSER
 
 // Off-gate stubs: register cleanly, return a precise "not available" error rather than failing to link.
@@ -1511,6 +1781,11 @@ FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleAddEvaluateChooserN
 FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleWireChooserToMotionMatching(const TSharedPtr<FJsonObject>& /*Params*/)
 {
 	return FMonolithActionResult::Error(TEXT("Chooser plugin not available (WITH_CHOOSER=0). wire_chooser_to_motion_matching is disabled in this build."));
+}
+
+FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleBindChooserDatabaseViaThreadSafe(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+	return FMonolithActionResult::Error(TEXT("Chooser plugin not available (WITH_CHOOSER=0). bind_chooser_database_via_threadsafe is disabled in this build."));
 }
 
 #endif // WITH_CHOOSER
