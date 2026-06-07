@@ -3,6 +3,8 @@
 #include "MonolithParamSchema.h"
 
 #include "Animation/AnimBlueprint.h"
+#include "Animation/AnimInstance.h"
+#include "Engine/SkeletalMesh.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/BlendSpace.h"
 #include "Animation/AnimationAsset.h"
@@ -185,6 +187,29 @@ void FMonolithAbpWriteActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
 			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Graph to inspect (default the main AnimGraph)"), TEXT("AnimGraph"))
+			.Build());
+
+	// --- build_foot_ik_pass (Pack C — COMPOSITE) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("build_foot_ik_pass"),
+		TEXT("Composite: insert a lightweight foot IK pass (two TwoBoneIK nodes on the foot IK bones + a pelvis ModifyBone vertical offset) into the post-MM pose chain. Splices between whatever currently drives the Output Pose (e.g. Inertialization) and the Output Pose node. Foot IK alphas are gated by the contact_l/contact_r curves where supplied. Returns entry/exit node names for further splicing."),
+		FMonolithActionHandler::CreateStatic(&FMonolithAbpWriteActions::HandleBuildFootIkPass),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("left_foot_bone"), TEXT("string"), TEXT("Left foot IK end-of-chain bone (e.g. 'ik_foot_l')"))
+			.Required(TEXT("right_foot_bone"), TEXT("string"), TEXT("Right foot IK end-of-chain bone (e.g. 'ik_foot_r')"))
+			.Required(TEXT("pelvis_bone"), TEXT("string"), TEXT("Pelvis bone for the vertical (Z) root/pelvis offset (e.g. 'pelvis')"))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Target graph (default: AnimGraph)"), TEXT("AnimGraph"))
+			.Optional(TEXT("left_contact_curve"), TEXT("string"), TEXT("Anim curve gating left-foot IK alpha (default: contact_l)"), TEXT("contact_l"))
+			.Optional(TEXT("right_contact_curve"), TEXT("string"), TEXT("Anim curve gating right-foot IK alpha (default: contact_r)"), TEXT("contact_r"))
+			.Build());
+
+	// --- assign_post_process_anim_rig (Pack C) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("assign_post_process_anim_rig"),
+		TEXT("Set a skeletal mesh asset's PostProcessAnimBlueprint (post-process anim instance class) — runs after the main anim instance, before physics. Use to attach a post-process IK/Control-Rig ABP as an alternative to in-graph foot IK. Writes via USkeletalMesh::SetPostProcessAnimBlueprint."),
+		FMonolithActionHandler::CreateStatic(&FMonolithAbpWriteActions::HandleAssignPostProcessAnimRig),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("mesh_path"), TEXT("USkeletalMesh asset path to assign the post-process ABP on"))
+			.RequiredAssetPath(TEXT("post_process_abp_path"), TEXT("Post-process Animation Blueprint asset (its generated UAnimInstance class is assigned). Empty/None clears the assignment."))
 			.Build());
 }
 
@@ -1958,5 +1983,235 @@ FMonolithActionResult FMonolithAbpWriteActions::HandleGetAnimGraphOutputConnecti
 		Root->SetStringField(TEXT("source_node"), SrcNode ? SrcNode->GetName() : FString(TEXT("<unknown>")));
 		Root->SetStringField(TEXT("source_pin"), SrcPin ? SrcPin->PinName.ToString() : FString(TEXT("<unknown>")));
 	}
+	return FMonolithActionResult::Success(Root);
+}
+
+
+// ---------------------------------------------------------------------------
+// Pack C — build_foot_ik_pass (COMPOSITE)
+//
+// Inserts a lightweight foot-grounding pass into the post-MM pose chain. Foot IK
+// (TwoBoneIK) + pelvis offset (ModifyBone) are SkeletalControl nodes that operate
+// in COMPONENT space (their pose link is FComponentSpacePoseLink 'ComponentPose'),
+// so the pass is bracketed by a LocalToComponentSpace converter at entry and a
+// ComponentToLocalSpace converter at exit. The whole bracket is spliced between
+// whatever currently drives the Output Pose (e.g. Inertialization) and the Root.
+//
+// Chain (local -> ... -> local):
+//   [src] -> L2C(LocalPose) ==CS==> ModifyBone(pelvis) -> TwoBoneIK(L) -> TwoBoneIK(R) -> C2L -> [Root.Result]
+//
+// Foot IK alphas are driven by the contact_l/contact_r curves (AlphaInputType=Curve,
+// AlphaCurveName=<curve>) so the planted foot is locked and swing-foot IK relaxes.
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAbpWriteActions::HandleBuildFootIkPass(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath       = Params->GetStringField(TEXT("abp_path"));
+	const FString LeftFootBone  = Params->GetStringField(TEXT("left_foot_bone"));
+	const FString RightFootBone = Params->GetStringField(TEXT("right_foot_bone"));
+	const FString PelvisBone    = Params->GetStringField(TEXT("pelvis_bone"));
+	FString GraphName = Params->HasField(TEXT("graph_name")) ? Params->GetStringField(TEXT("graph_name")) : TEXT("AnimGraph");
+	if (GraphName.IsEmpty()) GraphName = TEXT("AnimGraph");
+	FString LeftCurve  = Params->HasField(TEXT("left_contact_curve"))  ? Params->GetStringField(TEXT("left_contact_curve"))  : TEXT("contact_l");
+	FString RightCurve = Params->HasField(TEXT("right_contact_curve")) ? Params->GetStringField(TEXT("right_contact_curve")) : TEXT("contact_r");
+
+	if (AbpPath.IsEmpty())       return FMonolithActionResult::Error(TEXT("Missing required parameter: abp_path"));
+	if (LeftFootBone.IsEmpty() || RightFootBone.IsEmpty() || PelvisBone.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("left_foot_bone, right_foot_bone and pelvis_bone are all required"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AbpPath));
+
+	FString GraphError;
+	UEdGraph* Graph = ResolveTargetGraph(ABP, GraphName, TEXT(""), GraphError);
+	if (!Graph) return FMonolithActionResult::Error(GraphError);
+
+	// --- Capture the current Output Pose source (the node feeding Root 'Result') ---
+	TArray<UAnimGraphNode_Root*> Roots;
+	Graph->GetNodesOfClass<UAnimGraphNode_Root>(Roots);
+	if (Roots.Num() == 0)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No Output Pose (UAnimGraphNode_Root) in graph '%s'"), *GraphName));
+	UAnimGraphNode_Root* RootNode = Roots[0];
+	UEdGraphPin* RootResultPin = RootNode->FindPin(FName(TEXT("Result")), EGPD_Input);
+	if (!RootResultPin)
+		return FMonolithActionResult::Error(TEXT("Output Pose node has no 'Result' input pin"));
+
+	FString SrcNodeName, SrcPinName;
+	if (RootResultPin->LinkedTo.Num() > 0 && RootResultPin->LinkedTo[0])
+	{
+		UEdGraphPin* SrcPin = RootResultPin->LinkedTo[0];
+		UEdGraphNode* SrcNode = SrcPin->GetOwningNodeUnchecked();
+		SrcNodeName = SrcNode ? SrcNode->GetName() : FString();
+		SrcPinName  = SrcPin->PinName.ToString();
+	}
+	const bool bHadSource = !SrcNodeName.IsEmpty();
+
+	// --- Local helper: spawn a node via add_anim_graph_node internals, return its node_name ---
+	auto SpawnNode = [&](const TSharedPtr<FJsonObject>& P) -> FString
+	{
+		P->SetStringField(TEXT("asset_path"), AbpPath);
+		P->SetStringField(TEXT("graph_name"), GraphName);
+		FMonolithActionResult R = HandleAddAnimGraphNode(P);
+		return (R.bSuccess && R.Result.IsValid()) ? R.Result->GetStringField(TEXT("node_name")) : FString();
+	};
+
+	// --- Spawn the bracket + IK nodes ---
+	TSharedPtr<FJsonObject> L2CParams = MakeShared<FJsonObject>();
+	L2CParams->SetStringField(TEXT("node_type"), TEXT("LocalToComponentSpace"));
+	L2CParams->SetNumberField(TEXT("position_x"), 300.0);
+	const FString L2CNode = SpawnNode(L2CParams);
+
+	TSharedPtr<FJsonObject> PelvisParams = MakeShared<FJsonObject>();
+	PelvisParams->SetStringField(TEXT("node_type"), TEXT("ModifyBone"));
+	PelvisParams->SetStringField(TEXT("bone_to_modify"), PelvisBone);
+	PelvisParams->SetNumberField(TEXT("position_x"), 500.0);
+	const FString PelvisNode = SpawnNode(PelvisParams);
+
+	TSharedPtr<FJsonObject> IkLParams = MakeShared<FJsonObject>();
+	IkLParams->SetStringField(TEXT("node_type"), TEXT("TwoBoneIK"));
+	IkLParams->SetStringField(TEXT("ik_bone"), LeftFootBone);
+	IkLParams->SetNumberField(TEXT("position_x"), 700.0);
+	const FString IkLNode = SpawnNode(IkLParams);
+
+	TSharedPtr<FJsonObject> IkRParams = MakeShared<FJsonObject>();
+	IkRParams->SetStringField(TEXT("node_type"), TEXT("TwoBoneIK"));
+	IkRParams->SetStringField(TEXT("ik_bone"), RightFootBone);
+	IkRParams->SetNumberField(TEXT("position_x"), 900.0);
+	const FString IkRNode = SpawnNode(IkRParams);
+
+	TSharedPtr<FJsonObject> C2LParams = MakeShared<FJsonObject>();
+	C2LParams->SetStringField(TEXT("node_type"), TEXT("ComponentToLocalSpace"));
+	C2LParams->SetNumberField(TEXT("position_x"), 1100.0);
+	const FString C2LNode = SpawnNode(C2LParams);
+
+	if (L2CNode.IsEmpty() || PelvisNode.IsEmpty() || IkLNode.IsEmpty() || IkRNode.IsEmpty() || C2LNode.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("One or more foot-IK pass nodes failed to spawn"));
+
+	// --- Gate foot IK alphas by the contact curves (skeletal-control alpha-as-curve) ---
+	auto SetProp = [&](const FString& NodeId, const FString& PropPath, const FString& Value)
+	{
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("asset_path"), AbpPath);
+		P->SetStringField(TEXT("graph_name"), GraphName);
+		P->SetStringField(TEXT("node_id"), NodeId);
+		P->SetStringField(TEXT("property_path"), PropPath);
+		P->SetStringField(TEXT("value"), Value);
+		HandleSetAnimGraphNodeProperty(P);
+	};
+	if (!LeftCurve.IsEmpty())
+	{
+		SetProp(IkLNode, TEXT("AlphaInputType"), TEXT("Curve"));
+		SetProp(IkLNode, TEXT("AlphaCurveName"), LeftCurve);
+	}
+	if (!RightCurve.IsEmpty())
+	{
+		SetProp(IkRNode, TEXT("AlphaInputType"), TEXT("Curve"));
+		SetProp(IkRNode, TEXT("AlphaCurveName"), RightCurve);
+	}
+
+	// --- Wire the chain (verified pin names: LocalPose / ComponentPose / Pose / Result) ---
+	auto Connect = [&](const FString& SN, const FString& SP, const FString& TN, const FString& TP) -> bool
+	{
+		TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("asset_path"), AbpPath);
+		P->SetStringField(TEXT("graph_name"), GraphName);
+		P->SetStringField(TEXT("source_node"), SN);
+		P->SetStringField(TEXT("source_pin"), SP);
+		P->SetStringField(TEXT("target_node"), TN);
+		P->SetStringField(TEXT("target_pin"), TP);
+		P->SetBoolField(TEXT("compile"), false);
+		return HandleConnectAnimGraphPins(P).bSuccess;
+	};
+
+	TSharedPtr<FJsonObject> Wires = MakeShared<FJsonObject>();
+	// entry: previous source (local) -> L2C 'LocalPose'
+	if (bHadSource)
+		Wires->SetBoolField(TEXT("src_to_entry"), Connect(SrcNodeName, SrcPinName, L2CNode, TEXT("LocalPose")));
+	// component-space chain: L2C 'ComponentPose' -> ModifyBone 'ComponentPose' -> IK_L 'ComponentPose' -> IK_R 'ComponentPose'
+	Wires->SetBoolField(TEXT("l2c_to_pelvis"), Connect(L2CNode, TEXT("ComponentPose"), PelvisNode, TEXT("ComponentPose")));
+	Wires->SetBoolField(TEXT("pelvis_to_ikl"), Connect(PelvisNode, TEXT("Pose"), IkLNode, TEXT("ComponentPose")));
+	Wires->SetBoolField(TEXT("ikl_to_ikr"),    Connect(IkLNode, TEXT("Pose"), IkRNode, TEXT("ComponentPose")));
+	// exit: IK_R 'Pose' (component) -> C2L 'ComponentPose' -> Root 'Result' (local)
+	Wires->SetBoolField(TEXT("ikr_to_c2l"),    Connect(IkRNode, TEXT("Pose"), C2LNode, TEXT("ComponentPose")));
+	Wires->SetBoolField(TEXT("exit_to_root"),  Connect(C2LNode, TEXT("Pose"), RootNode->GetName(), TEXT("Result")));
+
+	ABP->MarkPackageDirty();
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("graph_name"), GraphName);
+	Root->SetStringField(TEXT("previous_output_source"), bHadSource ? SrcNodeName : FString(TEXT("<none>")));
+	// entry/exit so the caller can re-splice: entry consumes the upstream pose, exit drives Output Pose.
+	Root->SetStringField(TEXT("entry_node"), L2CNode);
+	Root->SetStringField(TEXT("entry_pin"), TEXT("LocalPose"));
+	Root->SetStringField(TEXT("exit_node"), C2LNode);
+	Root->SetStringField(TEXT("exit_pin"), TEXT("Pose"));
+	Root->SetStringField(TEXT("pelvis_modify_node"), PelvisNode);
+	Root->SetStringField(TEXT("foot_ik_left_node"), IkLNode);
+	Root->SetStringField(TEXT("foot_ik_right_node"), IkRNode);
+	Root->SetStringField(TEXT("left_contact_curve"), LeftCurve);
+	Root->SetStringField(TEXT("right_contact_curve"), RightCurve);
+	Root->SetObjectField(TEXT("wires"), Wires);
+	Root->SetBoolField(TEXT("compiled"), true);
+	Root->SetBoolField(TEXT("saved"), false);
+	return FMonolithActionResult::Success(Root);
+}
+
+
+// ---------------------------------------------------------------------------
+// Pack C — assign_post_process_anim_rig
+//
+// Sets USkeletalMesh::PostProcessAnimBlueprint (the post-process anim instance
+// class), which runs after the main anim instance and before physics. Verified
+// accessor: USkeletalMesh::SetPostProcessAnimBlueprint(TSubclassOf<UAnimInstance>)
+// (SkeletalMesh.h:2235). Direct member access is deprecated; the setter is public.
+// An empty post_process_abp_path clears the assignment.
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAbpWriteActions::HandleAssignPostProcessAnimRig(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString MeshPath = Params->GetStringField(TEXT("mesh_path"));
+	FString PostAbpPath;
+	Params->TryGetStringField(TEXT("post_process_abp_path"), PostAbpPath);
+
+	if (MeshPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: mesh_path"));
+
+	USkeletalMesh* Mesh = FMonolithAssetUtils::LoadAssetByPath<USkeletalMesh>(MeshPath);
+	if (!Mesh) return FMonolithActionResult::Error(FString::Printf(TEXT("SkeletalMesh not found: %s"), *MeshPath));
+
+	TSubclassOf<UAnimInstance> PostClass = nullptr;
+	const bool bClearing = PostAbpPath.IsEmpty() || PostAbpPath.Equals(TEXT("None"), ESearchCase::IgnoreCase);
+	if (!bClearing)
+	{
+		// Accept either an AnimBlueprint asset (resolve its generated class) or a direct class path.
+		UAnimBlueprint* PostAbp = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(PostAbpPath);
+		if (PostAbp)
+		{
+			UClass* GenClass = PostAbp->GeneratedClass;
+			if (!GenClass || !GenClass->IsChildOf(UAnimInstance::StaticClass()))
+				return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint '%s' has no UAnimInstance generated class (recompile it first)"), *PostAbpPath));
+			PostClass = GenClass;
+		}
+		else
+		{
+			// Fall back to resolving as a class path (e.g. /Game/.../ABP_X.ABP_X_C).
+			UClass* AsClass = LoadClass<UAnimInstance>(nullptr, *PostAbpPath);
+			if (!AsClass)
+				return FMonolithActionResult::Error(FString::Printf(TEXT("Could not resolve post-process AnimBlueprint or AnimInstance class: %s"), *PostAbpPath));
+			PostClass = AsClass;
+		}
+	}
+
+	Mesh->Modify();
+	Mesh->SetPostProcessAnimBlueprint(PostClass);
+	Mesh->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("mesh_path"), MeshPath);
+	Root->SetBoolField(TEXT("cleared"), bClearing);
+	Root->SetStringField(TEXT("post_process_class"), PostClass ? PostClass->GetPathName() : FString(TEXT("<none>")));
+	Root->SetBoolField(TEXT("saved"), false);
 	return FMonolithActionResult::Success(Root);
 }

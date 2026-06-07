@@ -33,6 +33,12 @@ private:
 	static FMonolithActionResult HandleRebuildEvaluateChooserNode(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleReplaceEvaluateChooserNodes(const TSharedPtr<FJsonObject>& Params);
 
+	// Pack B — chooser-into-AnimGraph (WITH_CHOOSER)
+	// add_evaluate_chooser_node      : spawn a FRESH UK2Node_EvaluateChooser2 (reflective) bound to a chooser table.
+	// wire_chooser_to_motion_matching: connect the chooser 'Result' output to a Motion Matching node 'Database' input.
+	static FMonolithActionResult HandleAddEvaluateChooserNode(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleWireChooserToMotionMatching(const TSharedPtr<FJsonObject>& Params);
+
 	// F11 — duplicate + reparent + dependency classification
 	static FMonolithActionResult HandleDuplicateReparentAndSanitize(const TSharedPtr<FJsonObject>& Params);
 

@@ -54,6 +54,29 @@ Two navigation actions added for the test/profiling harness workflow (`MonolithA
 
 See [SPEC_CORE.md §11 Recent Fixes](../SPEC_CORE.md#recent-fixes-phase-j--shipped-in-0147) for the long-form descriptions.
 
+### Motion Matching AI-wander runtime surface (2026-06-07)
+
+A small runtime surface supporting a self-driving "wander" AI built on a Motion-Matching locomotion Anim Blueprint. These are **C++ runtime classes**, not MCP actions — they live in the running game / PIE and are referenced from authored Behavior Tree and AIController assets. The BT task classes are placed into a tree via the existing `add_bt_node` action (`node_class` = the task class).
+
+**Behavior Tree task classes (3 — `UBTTaskNode` subclasses, runtime, editor + PIE):**
+
+| Class | Behaviour |
+|-------|-----------|
+| `BTTask_SetMaxWalkSpeed` | Set the possessed pawn's `UCharacterMovementComponent::MaxWalkSpeed` to a configured value — drives walk/jog/sprint locomotion-state changes that the Motion-Matching ABP samples. |
+| `BTTask_SetCrouch` | Crouch or un-crouch the possessed character (toggles the movement-component crouch state). |
+| `BTTask_RandomizeFloat` | Write a random float in a configured `[min, max]` range into a named Blackboard key — feeds wander timers / target speeds without an extra service node. |
+
+**AIController class (1 — `AAIController` subclass, Blueprintable):**
+
+| Class | Behaviour |
+|-------|-----------|
+| `AMonolithBehaviorTreeAIController` | A Blueprintable `AAIController` carrying a Behavior Tree `UPROPERTY`. On `OnPossess` it runs the assigned tree, so possessing a pawn with this controller auto-starts the AI's BT. The canonical way to start an authored wander tree without hand-wiring a `RunBehaviorTree` call. |
+
+**Fixes (2026-06-07):**
+
+- `reorder_bt_children` — child reordering now persists. Sibling order is written through the nodes' `NodePosX` (the property the BT graph derives left-to-right execution order from), so a reorder survives save / reopen instead of reverting on recompile.
+- `build_behavior_tree_from_spec` — now links the Blackboard asset. The generated tree's `UBehaviorTree::BlackboardAsset` is assigned, so blackboard-key decorators / tasks resolve against the right Blackboard instead of failing to bind.
+
 ### Bulk Fill & Describe Surface (2026-05-11)
 
 `MonolithAIBulkFillAdapter` registers under `FMonolithBulkFillRegistry` for the `ai` namespace, exposed via the framework-level `bulk_fill_query("apply", ...)` and `describe_query("schema", ...)` dispatchers. Phase 5 of the MCP ergonomics rollout (design spec `Docs/plans/2026-05-11-monolith-mcp-ergonomics-design.md`, implementation plan `Docs/plans/2026-05-11-monolith-mcp-ergonomics.md`).

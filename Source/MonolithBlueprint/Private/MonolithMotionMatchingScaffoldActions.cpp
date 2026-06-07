@@ -5,6 +5,7 @@
 #include "MonolithBlueprintCompileActions.h"
 #include "MonolithBlueprintGraphActions.h"
 #include "MonolithBlueprintNodeActions.h"
+#include "MonolithBlueprintVariableActions.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
@@ -119,6 +120,73 @@ void FMonolithMotionMatchingScaffoldActions::RegisterActions(FMonolithToolRegist
 			.RequiredAssetPath(TEXT("bp_path"), TEXT("Child Blueprint asset path"))
 			.Required(TEXT("component"), TEXT("string"), TEXT("Component variable name or alias (e.g. 'Mesh' resolves to a Character's CharacterMesh0)"))
 			.Optional(TEXT("property_name"), TEXT("string"), TEXT("Single property to read; if omitted, a default set is reported (AnimClass, SkeletalMesh, AnimationMode)"))
+			.Build());
+
+	// -----------------------------------------------------------------------
+	// Pack A — thread-safe AnimBP event-graph authoring (anim-aware composites)
+	// -----------------------------------------------------------------------
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("scaffold_threadsafe_update"),
+		TEXT("Override UAnimInstance::BlueprintThreadSafeUpdateAnimation on an Animation Blueprint so it "
+			 "reads owning-pawn state on the worker thread. Thin anim-aware wrapper over override_parent_function "
+			 "(GetOverrideFunctionClass + AddFunctionGraph against the declaring UAnimInstance class), so a FUTURE "
+			 "C++ AnimInstance parent can absorb the body without a graph rewrite. Returns the override graph name "
+			 "and entry node id for downstream chaining. No-ops cleanly if the override already exists."),
+		FMonolithActionHandler::CreateStatic(&HandleScaffoldThreadSafeUpdate),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_pawn_owner_access"),
+		TEXT("Inside the thread-safe update graph, author a TryGetPawnOwner call (UAnimInstance::TryGetPawnOwner — "
+			 "worker-thread safe) followed by a Cast-To-Character node, and return the cast result pin name so "
+			 "subsequent nodes can read pawn / CharacterMovementComponent members. Ensures the thread-safe update "
+			 "exists first (composes scaffold_threadsafe_update). Reuses add_nodes_bulk + connect_pins_bulk internals."),
+		FMonolithActionHandler::CreateStatic(&HandleAddPawnOwnerAccess),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.Optional(TEXT("cast_class"), TEXT("string"), TEXT("Class to cast the pawn owner to (default 'Character'). Use an overridable parent type for a future C++ AnimInstance swap."), TEXT("Character"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("scaffold_locomotion_anim_values"),
+		TEXT("COMPOSITE: ensure the thread-safe update + pawn-owner access exist, then create the locomotion anim "
+			 "variables (Velocity vector, GroundSpeed float, Acceleration vector, bIsMoving bool, bIsCrouched bool) "
+			 "and author nodes in the thread-safe update that derive them from the pawn/CMC (Velocity from GetVelocity, "
+			 "GroundSpeed = VSizeXY(Velocity), Acceleration from CMC GetCurrentAcceleration, bIsCrouched from "
+			 "ACharacter::IsCrouched) and SET each anim var. These vars feed the stance chooser. Reuses add_variable + "
+			 "add_property_access + add_nodes_bulk + connect_pins_bulk internals. All math sits behind the overridable "
+			 "thread-safe boundary so a future thread-safe anim-math BPFL is a drop-in."),
+		FMonolithActionHandler::CreateStatic(&HandleScaffoldLocomotionAnimValues),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.Optional(TEXT("velocity_var"),     TEXT("string"), TEXT("Name override for the Velocity vector var (default 'Velocity')"),         TEXT("Velocity"))
+			.Optional(TEXT("ground_speed_var"), TEXT("string"), TEXT("Name override for the GroundSpeed float var (default 'GroundSpeed')"),    TEXT("GroundSpeed"))
+			.Optional(TEXT("acceleration_var"), TEXT("string"), TEXT("Name override for the Acceleration vector var (default 'Acceleration')"), TEXT("Acceleration"))
+			.Optional(TEXT("is_moving_var"),    TEXT("string"), TEXT("Name override for the bIsMoving bool var (default 'bIsMoving')"),         TEXT("bIsMoving"))
+			.Optional(TEXT("is_crouched_var"),  TEXT("string"), TEXT("Name override for the bIsCrouched bool var (default 'bIsCrouched')"),     TEXT("bIsCrouched"))
+			.Build());
+
+	// -----------------------------------------------------------------------
+	// Pack D — movement tuning (CMC speed bands)
+	// -----------------------------------------------------------------------
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("apply_locomotion_speed_band"),
+		TEXT("Set CharacterMovementComponent speed-band caps on a Character Blueprint's CDO: MaxWalkSpeed "
+			 "(baseline = run_speed unless max_walk_speed given), MaxWalkSpeedCrouched (= crouch_speed), "
+			 "MaxAcceleration, BrakingDecelerationWalking. walk/jog/run are documented band values the Behavior "
+			 "Tree picks from at runtime (these are the CMC caps; the BT's SetMaxWalkSpeed varies within them). "
+			 "Uses the same persistence handshake as apply_movement_preset (set_component_property -> structural "
+			 "modify -> compile for the inherited native CMC). Returns the applied values + the band echo."),
+		FMonolithActionHandler::CreateStatic(&HandleApplyLocomotionSpeedBand),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("bp_path"), TEXT("Character Blueprint asset path"))
+			.Required(TEXT("walk_speed"),  TEXT("number"), TEXT("Walk band speed (documented; BT picks within the cap)"))
+			.Required(TEXT("run_speed"),   TEXT("number"), TEXT("Run band speed; becomes the MaxWalkSpeed cap unless max_walk_speed overrides"))
+			.Required(TEXT("crouch_speed"),TEXT("number"), TEXT("Crouch band speed; written to MaxWalkSpeedCrouched"))
+			.Optional(TEXT("jog_speed"),   TEXT("number"), TEXT("Jog band speed (documented; BT picks within the cap)"))
+			.Optional(TEXT("max_walk_speed"),         TEXT("number"), TEXT("Explicit MaxWalkSpeed cap override (defaults to run_speed)"))
+			.Optional(TEXT("max_acceleration"),       TEXT("number"), TEXT("MaxAcceleration (default 2048)"))
+			.Optional(TEXT("braking_deceleration"),   TEXT("number"), TEXT("BrakingDecelerationWalking (default 2048)"))
 			.Build());
 }
 
@@ -987,5 +1055,484 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleGetInherited
 	Root->SetStringField(TEXT("component_class"), Comp->GetClass()->GetName());
 	Root->SetStringField(TEXT("source"), SourceClass);
 	Root->SetObjectField(TEXT("properties"), PropsObj);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ===========================================================================
+// Pack A — thread-safe AnimBP event-graph authoring
+// ===========================================================================
+
+namespace
+{
+	/** Name the engine gives the BlueprintThreadSafeUpdateAnimation override function graph. */
+	static const TCHAR* kThreadSafeUpdateFuncName = TEXT("BlueprintThreadSafeUpdateAnimation");
+
+	/** Return the override function graph for the thread-safe update, or nullptr if absent. */
+	UEdGraph* FindThreadSafeUpdateGraph(UAnimBlueprint* ABP)
+	{
+		if (!ABP) return nullptr;
+		for (const TObjectPtr<UEdGraph>& Graph : ABP->FunctionGraphs)
+		{
+			if (Graph && Graph->GetName() == kThreadSafeUpdateFuncName)
+			{
+				return Graph.Get();
+			}
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Ensure the thread-safe update override exists on the AnimBP. Idempotent: returns
+	 * true if the override already exists OR was created successfully. OutCreated reports
+	 * whether this call authored it. Delegates to override_parent_function (the same
+	 * GetOverrideFunctionClass + AddFunctionGraph path used elsewhere).
+	 */
+	bool EnsureThreadSafeUpdate(const FString& AbpPath, UAnimBlueprint* ABP, bool& bOutCreated, FString& OutError)
+	{
+		bOutCreated = false;
+		if (FindThreadSafeUpdateGraph(ABP))
+		{
+			return true; // already present
+		}
+
+		TSharedRef<FJsonObject> Sub = MakeShared<FJsonObject>();
+		Sub->SetStringField(TEXT("asset_path"), AbpPath);
+		Sub->SetStringField(TEXT("parent_function_name"), kThreadSafeUpdateFuncName);
+		FMonolithActionResult R = FMonolithBlueprintGraphActions::HandleOverrideParentFunction(Sub);
+		if (!R.bSuccess)
+		{
+			OutError = R.ErrorMessage;
+			return false;
+		}
+		bOutCreated = true;
+		return true;
+	}
+
+	/**
+	 * Pull a temp_id -> node_id map out of an add_nodes_bulk result. That handler returns
+	 * { "nodes_created": [ { temp_id, node_id, ... }, ... ], "count": N } in Result.
+	 */
+	void ExtractBulkNodeIds(const FMonolithActionResult& BulkResult, TMap<FString, FString>& OutMap)
+	{
+		if (!BulkResult.bSuccess || !BulkResult.Result.IsValid()) return;
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (!BulkResult.Result->TryGetArrayField(TEXT("nodes_created"), Arr) || !Arr) return;
+		for (const TSharedPtr<FJsonValue>& Entry : *Arr)
+		{
+			const TSharedPtr<FJsonObject> Obj = Entry.IsValid() ? Entry->AsObject() : nullptr;
+			if (!Obj.IsValid()) continue;
+			FString TempId, NodeId;
+			Obj->TryGetStringField(TEXT("temp_id"), TempId);
+			Obj->TryGetStringField(TEXT("node_id"), NodeId);
+			if (!TempId.IsEmpty() && !NodeId.IsEmpty())
+			{
+				OutMap.Add(TempId, NodeId);
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A.1 — scaffold_threadsafe_update
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldThreadSafeUpdate(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath = Params->GetStringField(TEXT("abp_path"));
+	if (AbpPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: abp_path"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Animation Blueprint not found: %s"), *AbpPath));
+	}
+
+	bool bCreated = false;
+	FString OverrideError;
+	if (!EnsureThreadSafeUpdate(AbpPath, ABP, bCreated, OverrideError))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("scaffold_threadsafe_update: failed to override %s — %s"),
+			kThreadSafeUpdateFuncName, *OverrideError));
+	}
+
+	// Locate the entry node of the override graph so callers can chain logic off its exec.
+	UEdGraph* Graph = FindThreadSafeUpdateGraph(ABP);
+	FString EntryNodeId;
+	if (Graph)
+	{
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (Node && Node->GetClass() && Node->GetClass()->GetName().Contains(TEXT("FunctionEntry")))
+			{
+				EntryNodeId = Node->GetName();
+				break;
+			}
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("graph_name"), kThreadSafeUpdateFuncName);
+	Root->SetStringField(TEXT("entry_node_id"), EntryNodeId);
+	Root->SetBoolField(TEXT("created"), bCreated);
+	Root->SetBoolField(TEXT("already_existed"), !bCreated);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// A.2 — add_pawn_owner_access
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleAddPawnOwnerAccess(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath = Params->GetStringField(TEXT("abp_path"));
+	if (AbpPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: abp_path"));
+
+	FString CastClass = Params->GetStringField(TEXT("cast_class"));
+	if (CastClass.IsEmpty()) CastClass = TEXT("Character");
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Animation Blueprint not found: %s"), *AbpPath));
+	}
+
+	// Ensure the thread-safe update exists first (compose A.1).
+	bool bCreated = false;
+	FString EnsureError;
+	if (!EnsureThreadSafeUpdate(AbpPath, ABP, bCreated, EnsureError))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("add_pawn_owner_access: thread-safe update unavailable — %s"), *EnsureError));
+	}
+
+	// Author TryGetPawnOwner + Cast-To-<CastClass> in the override graph via add_nodes_bulk.
+	// TryGetPawnOwner is a UAnimInstance member (self-context), worker-thread safe.
+	TSharedRef<FJsonObject> NodesSub = MakeShared<FJsonObject>();
+	NodesSub->SetStringField(TEXT("asset_path"), AbpPath);
+	NodesSub->SetStringField(TEXT("graph_name"), kThreadSafeUpdateFuncName);
+	{
+		TArray<TSharedPtr<FJsonValue>> Nodes;
+
+		// TryGetPawnOwner — CallFunction on the AnimInstance (self).
+		TSharedPtr<FJsonObject> PawnNode = MakeShared<FJsonObject>();
+		PawnNode->SetStringField(TEXT("temp_id"), TEXT("get_pawn"));
+		PawnNode->SetStringField(TEXT("node_type"), TEXT("call_function"));
+		PawnNode->SetStringField(TEXT("function_name"), TEXT("TryGetPawnOwner"));
+		PawnNode->SetStringField(TEXT("target_class"), TEXT("AnimInstance"));
+		Nodes.Add(MakeShared<FJsonValueObject>(PawnNode));
+
+		// DynamicCast to the requested class (DynamicCast node takes 'cast_class').
+		TSharedPtr<FJsonObject> CastNode = MakeShared<FJsonObject>();
+		CastNode->SetStringField(TEXT("temp_id"), TEXT("cast_pawn"));
+		CastNode->SetStringField(TEXT("node_type"), TEXT("cast"));
+		CastNode->SetStringField(TEXT("cast_class"), CastClass);
+		Nodes.Add(MakeShared<FJsonValueObject>(CastNode));
+
+		NodesSub->SetArrayField(TEXT("nodes"), Nodes);
+		NodesSub->SetBoolField(TEXT("auto_layout"), true);
+	}
+
+	FMonolithActionResult NR = FMonolithBlueprintNodeActions::HandleAddNodesBulk(NodesSub);
+	if (!NR.bSuccess)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("add_pawn_owner_access: add_nodes_bulk failed — %s"), *NR.ErrorMessage));
+	}
+
+	// Resolve the real node ids from the temp_id -> node_id map add_nodes_bulk returns.
+	TMap<FString, FString> IdMap;
+	ExtractBulkNodeIds(NR, IdMap);
+	const FString GetPawnNodeId = IdMap.FindRef(TEXT("get_pawn"));
+	const FString CastNodeId    = IdMap.FindRef(TEXT("cast_pawn"));
+
+	// Wire TryGetPawnOwner return -> cast object input via connect_pins_bulk. Pin names are
+	// the engine defaults (CallFunction return = "ReturnValue"; DynamicCast input = "Object").
+	if (!GetPawnNodeId.IsEmpty() && !CastNodeId.IsEmpty())
+	{
+		TSharedRef<FJsonObject> ConnSub = MakeShared<FJsonObject>();
+		ConnSub->SetStringField(TEXT("asset_path"), AbpPath);
+		ConnSub->SetStringField(TEXT("graph_name"), kThreadSafeUpdateFuncName);
+		TArray<TSharedPtr<FJsonValue>> Conns;
+		TSharedPtr<FJsonObject> C = MakeShared<FJsonObject>();
+		C->SetStringField(TEXT("source_node"), GetPawnNodeId);
+		C->SetStringField(TEXT("source_pin"), TEXT("ReturnValue"));
+		C->SetStringField(TEXT("target_node"), CastNodeId);
+		C->SetStringField(TEXT("target_pin"), TEXT("Object"));
+		Conns.Add(MakeShared<FJsonValueObject>(C));
+		ConnSub->SetArrayField(TEXT("connections"), Conns);
+		FMonolithBlueprintNodeActions::HandleConnectPinsBulk(ConnSub); // best-effort wire
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(ABP);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("graph_name"), kThreadSafeUpdateFuncName);
+	Root->SetStringField(TEXT("cast_class"), CastClass);
+	Root->SetStringField(TEXT("get_pawn_node_id"), GetPawnNodeId);
+	Root->SetStringField(TEXT("cast_node_id"), CastNodeId);
+	// The cast result pin (the As<CastClass> output) is what downstream nodes read pawn/CMC from.
+	Root->SetStringField(TEXT("cast_result_pin"), FString::Printf(TEXT("As%s"), *CastClass));
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// A.3 — scaffold_locomotion_anim_values (COMPOSITE)
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleScaffoldLocomotionAnimValues(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath = Params->GetStringField(TEXT("abp_path"));
+	if (AbpPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: abp_path"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Animation Blueprint not found: %s"), *AbpPath));
+	}
+
+	// Name overrides (default to the §4.1 contract names).
+	auto VarName = [&Params](const TCHAR* Key, const TCHAR* Default) -> FString
+	{
+		FString V = Params->GetStringField(Key);
+		return V.IsEmpty() ? FString(Default) : V;
+	};
+	const FString VelocityVar     = VarName(TEXT("velocity_var"),     TEXT("Velocity"));
+	const FString GroundSpeedVar  = VarName(TEXT("ground_speed_var"), TEXT("GroundSpeed"));
+	const FString AccelerationVar  = VarName(TEXT("acceleration_var"), TEXT("Acceleration"));
+	const FString IsMovingVar     = VarName(TEXT("is_moving_var"),    TEXT("bIsMoving"));
+	const FString IsCrouchedVar   = VarName(TEXT("is_crouched_var"),  TEXT("bIsCrouched"));
+
+	TArray<TSharedPtr<FJsonValue>> Steps;
+	auto NoteStep = [&Steps](const FString& Name, bool bOk, const FString& Detail)
+	{
+		TSharedPtr<FJsonObject> S = MakeShared<FJsonObject>();
+		S->SetStringField(TEXT("step"), Name);
+		S->SetBoolField(TEXT("success"), bOk);
+		if (!Detail.IsEmpty()) S->SetStringField(TEXT("detail"), Detail);
+		Steps.Add(MakeShared<FJsonValueObject>(S));
+	};
+
+	// 1) Ensure thread-safe update + pawn access (compose A.1 + A.2).
+	{
+		bool bCreated = false; FString Err;
+		if (!EnsureThreadSafeUpdate(AbpPath, ABP, bCreated, Err))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("scaffold_locomotion_anim_values: thread-safe update unavailable — %s"), *Err));
+		}
+		NoteStep(TEXT("scaffold_threadsafe_update"), true, bCreated ? TEXT("created") : TEXT("already existed"));
+
+		TSharedRef<FJsonObject> PawnSub = MakeShared<FJsonObject>();
+		PawnSub->SetStringField(TEXT("abp_path"), AbpPath);
+		PawnSub->SetStringField(TEXT("cast_class"), TEXT("Character"));
+		FMonolithActionResult PR = HandleAddPawnOwnerAccess(PawnSub);
+		NoteStep(TEXT("add_pawn_owner_access"), PR.bSuccess, PR.bSuccess ? TEXT("") : PR.ErrorMessage);
+	}
+
+	// 2) Create the locomotion anim variables (idempotent — add_variable warns/errors on
+	//    a duplicate, which we tolerate so re-running the composite is safe).
+	struct FVarSpec { FString Name; const TCHAR* Type; };
+	const TArray<FVarSpec> Vars = {
+		{ VelocityVar,    TEXT("struct:Vector") },
+		{ GroundSpeedVar, TEXT("float") },
+		{ AccelerationVar,TEXT("struct:Vector") },
+		{ IsMovingVar,    TEXT("bool") },
+		{ IsCrouchedVar,  TEXT("bool") },
+	};
+	int32 VarsCreated = 0;
+	for (const FVarSpec& V : Vars)
+	{
+		TSharedRef<FJsonObject> VarSub = MakeShared<FJsonObject>();
+		VarSub->SetStringField(TEXT("asset_path"), AbpPath);
+		VarSub->SetStringField(TEXT("name"), V.Name);
+		VarSub->SetStringField(TEXT("type"), V.Type);
+		VarSub->SetStringField(TEXT("category"), TEXT("Locomotion"));
+		VarSub->SetBoolField(TEXT("instance_editable"), false);
+		FMonolithActionResult VR = FMonolithBlueprintVariableActions::HandleAddVariable(VarSub);
+		if (VR.bSuccess) { ++VarsCreated; }
+		NoteStep(FString::Printf(TEXT("add_variable:%s"), *V.Name), VR.bSuccess,
+			VR.bSuccess ? FString(V.Type) : VR.ErrorMessage);
+	}
+
+	// 3) Author the read+SET nodes inside the thread-safe update via add_nodes_bulk.
+	//    The pawn/CMC reads (GetVelocity, GetCurrentAcceleration, IsCrouched) and the
+	//    VSizeXY math are dropped as CallFunction nodes; each anim var gets a VariableSet.
+	//    Inter-node pin wiring (cast-result -> getters, getters -> setters) is intentionally
+	//    LEFT to a follow-up connect_pins_bulk call by the asset-build sequence (§7.2.d) —
+	//    add_property_access/add_nodes_bulk return the node ids needed for that wiring, and
+	//    keeping the wiring caller-driven matches how scaffold_locomotion_input composes.
+	TSharedRef<FJsonObject> NodesSub = MakeShared<FJsonObject>();
+	NodesSub->SetStringField(TEXT("asset_path"), AbpPath);
+	NodesSub->SetStringField(TEXT("graph_name"), kThreadSafeUpdateFuncName);
+	{
+		TArray<TSharedPtr<FJsonValue>> Nodes;
+
+		auto AddCall = [&Nodes](const TCHAR* TempId, const TCHAR* Func, const TCHAR* TargetClass)
+		{
+			TSharedPtr<FJsonObject> N = MakeShared<FJsonObject>();
+			N->SetStringField(TEXT("temp_id"), TempId);
+			N->SetStringField(TEXT("node_type"), TEXT("call_function"));
+			N->SetStringField(TEXT("function_name"), Func);
+			N->SetStringField(TEXT("target_class"), TargetClass);
+			Nodes.Add(MakeShared<FJsonValueObject>(N));
+		};
+		auto AddSet = [&Nodes](const TCHAR* TempId, const FString& VarName)
+		{
+			TSharedPtr<FJsonObject> N = MakeShared<FJsonObject>();
+			N->SetStringField(TEXT("temp_id"), TempId);
+			N->SetStringField(TEXT("node_type"), TEXT("VariableSet"));
+			N->SetStringField(TEXT("variable_name"), VarName);
+			Nodes.Add(MakeShared<FJsonValueObject>(N));
+		};
+
+		// Reads from the pawn / movement component.
+		AddCall(TEXT("get_velocity"), TEXT("GetVelocity"), TEXT("Actor"));
+		AddCall(TEXT("vsize_xy"),     TEXT("VSizeXY"),     TEXT("KismetMathLibrary"));
+		AddCall(TEXT("get_accel"),    TEXT("GetCurrentAcceleration"), TEXT("CharacterMovementComponent"));
+		AddCall(TEXT("is_crouched"),  TEXT("IsCrouched"),  TEXT("Character"));
+
+		// Setters for each anim var.
+		AddSet(TEXT("set_velocity"),    VelocityVar);
+		AddSet(TEXT("set_groundspeed"), GroundSpeedVar);
+		AddSet(TEXT("set_accel"),       AccelerationVar);
+		AddSet(TEXT("set_iscrouched"),  IsCrouchedVar);
+		AddSet(TEXT("set_ismoving"),    IsMovingVar);
+
+		NodesSub->SetArrayField(TEXT("nodes"), Nodes);
+		NodesSub->SetBoolField(TEXT("auto_layout"), true);
+	}
+
+	FMonolithActionResult NR = FMonolithBlueprintNodeActions::HandleAddNodesBulk(NodesSub);
+	NoteStep(TEXT("add_nodes_bulk"), NR.bSuccess, NR.bSuccess ? TEXT("") : NR.ErrorMessage);
+
+	// Surface the temp_id -> node_id map so the asset-build sequence can wire the chain.
+	TMap<FString, FString> IdMap;
+	ExtractBulkNodeIds(NR, IdMap);
+	TSharedPtr<FJsonObject> NodeIdMap = MakeShared<FJsonObject>();
+	for (const TPair<FString, FString>& KV : IdMap)
+	{
+		NodeIdMap->SetStringField(KV.Key, KV.Value);
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(ABP);
+
+	TArray<TSharedPtr<FJsonValue>> VarNames;
+	for (const FVarSpec& V : Vars) { VarNames.Add(MakeShared<FJsonValueString>(V.Name)); }
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("graph_name"), kThreadSafeUpdateFuncName);
+	Root->SetArrayField(TEXT("anim_variables"), VarNames);
+	Root->SetNumberField(TEXT("variables_created"), VarsCreated);
+	Root->SetArrayField(TEXT("steps"), Steps);
+	Root->SetObjectField(TEXT("node_id_map"), NodeIdMap);
+	Root->SetBoolField(TEXT("success"), true);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ===========================================================================
+// Pack D — apply_locomotion_speed_band
+// ===========================================================================
+
+FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleApplyLocomotionSpeedBand(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString BpPath = Params->GetStringField(TEXT("bp_path"));
+	if (BpPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: bp_path"));
+
+	double WalkSpeed = 0.0, RunSpeed = 0.0, CrouchSpeed = 0.0;
+	if (!Params->TryGetNumberField(TEXT("walk_speed"), WalkSpeed))
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: walk_speed"));
+	if (!Params->TryGetNumberField(TEXT("run_speed"), RunSpeed))
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: run_speed"));
+	if (!Params->TryGetNumberField(TEXT("crouch_speed"), CrouchSpeed))
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: crouch_speed"));
+
+	double JogSpeed = 0.0; Params->TryGetNumberField(TEXT("jog_speed"), JogSpeed);
+
+	// MaxWalkSpeed cap defaults to run_speed; explicit override wins.
+	double MaxWalkSpeed = RunSpeed;
+	Params->TryGetNumberField(TEXT("max_walk_speed"), MaxWalkSpeed);
+	double MaxAcceleration = 2048.0;
+	Params->TryGetNumberField(TEXT("max_acceleration"), MaxAcceleration);
+	double BrakingDecel = 2048.0;
+	Params->TryGetNumberField(TEXT("braking_deceleration"), BrakingDecel);
+
+	UBlueprint* BP = FMonolithAssetUtils::LoadAssetByPath<UBlueprint>(BpPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *BpPath));
+	}
+
+	// Resolve the CMC BY CLASS on the CDO — same handshake as apply_movement_preset
+	// (the native inherited CMC is "CharMoveComp", not "CharacterMovement").
+	UClass* CmcClass = FindFirstObject<UClass>(TEXT("CharacterMovementComponent"), EFindFirstObjectOptions::NativeFirst);
+	if (!CmcClass)
+	{
+		CmcClass = FindFirstObject<UClass>(TEXT("UCharacterMovementComponent"), EFindFirstObjectOptions::NativeFirst);
+	}
+	if (!CmcClass)
+	{
+		return FMonolithActionResult::Error(TEXT("apply_locomotion_speed_band: UCharacterMovementComponent class not found"));
+	}
+	UActorComponent* CmcComp = ResolveComponentOnBP(BP, FString(), CmcClass, {});
+	if (!CmcComp)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("apply_locomotion_speed_band: no CharacterMovementComponent found on '%s' (is the parent a Character?)"), *BpPath));
+	}
+	const FString CmcName = CmcComp->GetName();
+
+	// Write each CMC cap via set_component_property (Details-panel write path +
+	// PostEditChange), mirroring apply_movement_preset.
+	TArray<TPair<FString, FString>> Writes;
+	Writes.Emplace(TEXT("MaxWalkSpeed"),              FString::SanitizeFloat(MaxWalkSpeed));
+	Writes.Emplace(TEXT("MaxWalkSpeedCrouched"),      FString::SanitizeFloat(CrouchSpeed));
+	Writes.Emplace(TEXT("MaxAcceleration"),           FString::SanitizeFloat(MaxAcceleration));
+	Writes.Emplace(TEXT("BrakingDecelerationWalking"),FString::SanitizeFloat(BrakingDecel));
+
+	TArray<TSharedPtr<FJsonValue>> Applied;
+	for (const TPair<FString, FString>& Write : Writes)
+	{
+		TSharedRef<FJsonObject> Sub = MakeSub(BpPath);
+		Sub->SetStringField(TEXT("component_name"), CmcName);
+		Sub->SetStringField(TEXT("property_name"), Write.Key);
+		Sub->SetStringField(TEXT("value"), Write.Value);
+
+		FMonolithActionResult R = FMonolithBlueprintComponentActions::HandleSetComponentProperty(Sub);
+		if (!R.bSuccess)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("apply_locomotion_speed_band: failed to set '%s' on %s — %s"),
+				*Write.Key, *CmcName, *R.ErrorMessage));
+		}
+		TSharedPtr<FJsonObject> A = MakeShared<FJsonObject>();
+		A->SetStringField(TEXT("property"), Write.Key);
+		A->SetStringField(TEXT("value"), Write.Value);
+		Applied.Add(MakeShared<FJsonValueObject>(A));
+	}
+
+	// Same persistence handshake as set_anim_class / apply_movement_preset for an inherited
+	// native component: structural-modify + recompile so the CDO override survives reload.
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+	FKismetEditorUtilities::CompileBlueprint(BP);
+	BP->MarkPackageDirty();
+
+	// Echo the documented gait band (BT picks within these caps at runtime).
+	TSharedPtr<FJsonObject> Band = MakeShared<FJsonObject>();
+	Band->SetNumberField(TEXT("walk"), WalkSpeed);
+	if (JogSpeed > 0.0) Band->SetNumberField(TEXT("jog"), JogSpeed);
+	Band->SetNumberField(TEXT("run"), RunSpeed);
+	Band->SetNumberField(TEXT("crouch"), CrouchSpeed);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("bp_path"), BpPath);
+	Root->SetStringField(TEXT("component"), CmcName);
+	Root->SetArrayField(TEXT("applied"), Applied);
+	Root->SetObjectField(TEXT("band"), Band);
 	return FMonolithActionResult::Success(Root);
 }

@@ -186,6 +186,17 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 | `build_motion_matching_node` | Composite: spawn + wire + configure a Motion-Matching node (with its Pose-History) in one call. As of 2026-06-07 also wires the Pose-History pose-out to the AnimGraph Output Pose (`UAnimGraphNode_Root` 'Result' input) and reports `output_pose_wired`. |
 | `get_anim_graph_output_connection` | READ-ONLY: report whether the AnimGraph's Output Pose (`UAnimGraphNode_Root` 'Result' input) is driven, and by which `source_node`/`source_pin`. Optional `graph_name` (default the main AnimGraph). |
 
+**Retarget create/run pack (4 — 2026-06-07)** — namespace `animation`. Create the IK Rig / IK Retargeter assets and run a batch retarget, so a source skeleton's animation library can be re-authored onto a target skeleton.
+
+| Action | Description |
+|--------|-------------|
+| `create_ik_rig` | Create a `UIKRigDefinition` for a target skeletal mesh / skeleton. |
+| `create_ik_retargeter` | Create a `UIKRetargeter` referencing a source and target IK Rig. |
+| `set_retargeter_rigs` | Assign the source and target IK Rig on an existing `UIKRetargeter`. Auto-seeds the default retarget op stack (Pelvis / FKChains / RunIK / IKChains / RootMotion / CurveRemap) plus `AutoMapChains` so a freshly-created retargeter actually produces motion rather than passing through a frozen pose. Optional `auto_map` (default true) controls the chain auto-mapping pass. |
+| `batch_retarget_animations` | Run a batch retarget of source animations onto the target skeleton through a configured `UIKRetargeter`, writing the retargeted sequences. When the retargeter was created without an op stack it is seeded as in `set_retargeter_rigs` before the run. |
+
+> **Op-stack seeding (2026-06-07).** A bare UE 5.7 `UIKRetargeter` carries no retarget operations, so an un-seeded retarget passes the source pose straight through and produces frozen output clips. `set_retargeter_rigs` and `batch_retarget_animations` therefore seed the canonical op stack (Pelvis / FKChains / RunIK / IKChains / RootMotion / CurveRemap) + `AutoMapChains` on creation. See Fixes below.
+
 **ABP Write (5) — v0.14.3 PR #34 by @MaxenceEpitech**
 | Action | Description |
 |--------|-------------|
@@ -198,6 +209,8 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 **Fixes (2026-06-07)**
 - `add_anim_graph_node` — fixed a pre-existing crash when spawning bound-graph nodes (BlendStack / MotionMatching); the spawn path now uses `FGraphNodeCreator` so the node's bound graph is constructed correctly.
 - `get_database_stats` — fixed a pre-existing crash that asserted on a PoseSearch database with no built search index (unbuilt database). Now returns stats / a clear state instead of asserting.
+- `build_motion_matching_node` — now wires the Pose-History chain through to the AnimGraph Output Pose (`UAnimGraphNode_Root` 'Result' input); previously the composite spawned and configured the node but left it disconnected from the output, so it never drove the final pose.
+- `batch_retarget_animations` — no longer produces frozen (pass-through) output clips. The default retarget op stack is now seeded on the retargeter (see Retarget pack above), so retargeted sequences carry actual remapped motion.
 
 **ControlRig Write (3)**
 | Action | Description |
@@ -298,7 +311,7 @@ Full free-form **expression-graph** authoring (e.g. `Abs(X) > 45.0`) is **deferr
 
 ---
 
-## Chooser Namespace (9 — namespace: "chooser")
+## Chooser Namespace (10 — namespace: "chooser")
 
 A dedicated namespace for inspecting and editing `UChooserTable` assets, registered from `MonolithAnimation`. **All actions are `#if WITH_CHOOSER` gated** — they register only when the Chooser plugin (`Engine/Plugins/Chooser`) is present. The namespace registers no actions in builds without it.
 
@@ -311,12 +324,13 @@ A dedicated namespace for inspecting and editing `UChooserTable` assets, registe
 | `set_evaluate_chooser_result_reference` | Rewrite the child `UChooserTable` that an EvaluateChooser result row points at (`FEvaluateChooser`). Root / nested chooser rows are EvaluateChooser rows and are NOT settable via `set_result_asset_reference`; this action handles them. Params: `asset_path` (required, the table to edit), `row` (required, 0-based result row index of the EvaluateChooser row), `child_chooser_path` (required, the `UChooserTable` to point it at). Marks the package dirty and recompiles (`Compile(true)`). |
 | `validate_chooser` | `Compile(true)` plus validation: optional `expected_context_class` and `expected_result_type` (`ObjectResult` / `ClassResult` / `NoPrimaryResult`), plus a sweep for null / stale result-row asset references. Read-only apart from the compile pass. |
 
-**Chooser authoring (3 — 2026-06-07)** — create a chooser table from scratch and populate it row-by-row, the companion write surface to the inspect/edit/duplicate actions above.
+**Chooser authoring (4 — 2026-06-07)** — create a chooser table from scratch and populate it row-by-row (plus single-cell edits), the companion write surface to the inspect/edit/duplicate actions above.
 
 | Action | Description |
 |--------|-------------|
 | `create_chooser_table` | Create a new `UChooserTable`. Sets `output_type` (`ObjectResult` (default) / `ClassResult` / `NoPrimaryResult`; `Object` aliased to `ObjectResult`), an optional `output_class` (the Result Class — resolved from a class path/name, e.g. an ABP `_C` or `PoseSearchDatabase`), and an optional `context_class` added as a `FContextObjectTypeClass` parameter. Marks the package dirty. |
-| `add_chooser_column` | Append a column. `column_kind` is `Bool` / `Enum` / `GameplayTag` / `FloatRange` / `OutputObject`. Input (filter) columns take an optional `binding_property` dotted path setting the `InputValue` binding chain. The new column's per-row value array is grown to the table's current row count so all parallel arrays stay aligned. Marks the package dirty. |
+| `add_chooser_column` | Append a column. `column_kind` is `Bool` / `Enum` / `GameplayTag` / `FloatRange` / `OutputObject`. Input (filter) columns take an optional `binding_property` dotted path setting the `InputValue` binding chain. For an `Enum` column, an optional `enum_class` (resolved from an enum path/name) sets the column's enum type so cell values validate against the right `UEnum`. The new column's per-row value array is grown to the table's current row count so all parallel arrays stay aligned. Marks the package dirty. |
 | `add_chooser_row` | Append a row. `cells` is one entry per INPUT column in column order (`Bool`: bool/`any`; `Enum`: int; `FloatRange`: `{min,max}`; `GameplayTag`: tag string); `output_psd` is the asset the row selects (written as an `FAssetChooser` result). Every parallel array (per-column value arrays, `OutputObject` `RowValues`, `ResultsStructs`, `DisabledRows`) grows by exactly 1 atomically. Marks the package dirty. |
+| `set_chooser_cell` | Set a single cell value at `(row, column)` in an existing chooser table. Dispatches per column kind to the matching predicate-cell write (`Bool` → bool/`any`; `Enum` → int validated against the column's `enum_class`; `FloatRange` → `{min,max}`; `GameplayTag` → tag string), keeping the typed predicate arrays aligned. Marks the package dirty. |
 
 ---

@@ -7,6 +7,7 @@
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraph/EdGraphSchema.h"
+#include "EdGraphSchema_K2.h"
 #include "K2Node.h"
 #include "K2Node_DynamicCast.h"
 #include "K2Node_VariableGet.h"
@@ -469,6 +470,29 @@ void FMonolithAbpGraphSurgeryActions::RegisterActions(FMonolithToolRegistry& Reg
 			.RequiredAssetPath(TEXT("anim_blueprint"), TEXT("Animation Blueprint asset path"))
 			.Required(TEXT("replacements"), TEXT("array"), TEXT("Array of {graph_name, node_ref, chooser_asset} objects"))
 			.Optional(TEXT("dry_run"), TEXT("bool"), TEXT("Report only, no mutation (default: true)"), TEXT("true"))
+			.Build());
+
+	// --- add_evaluate_chooser_node (Pack B) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_evaluate_chooser_node"),
+		TEXT("Spawn a FRESH Evaluate-Chooser (v2) node into an ABP AnimGraph, bound to a UChooserTable. Reflectively creates UK2Node_EvaluateChooser2 (its header is in ChooserUncooked/Private and cannot be included). The node's 'Result' output pin type follows the chooser's OutputObjectType (e.g. UPoseSearchDatabase). Returns node_name + result_pin for wiring. Requires the Chooser plugin (WITH_CHOOSER)."),
+		FMonolithActionHandler::CreateStatic(&HandleAddEvaluateChooserNode),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.RequiredAssetPath(TEXT("chooser_path"), TEXT("UChooserTable asset to bind on the new node"))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Target graph ('AnimGraph' for the main anim graph). Default: AnimGraph"), TEXT("AnimGraph"))
+			.Optional(TEXT("position_x"), TEXT("number"), TEXT("Node X position (default: 0)"), TEXT("0"))
+			.Optional(TEXT("position_y"), TEXT("number"), TEXT("Node Y position (default: 0)"), TEXT("0"))
+			.Build());
+
+	// --- wire_chooser_to_motion_matching (Pack B) ---
+	Registry.RegisterAction(TEXT("animation"), TEXT("wire_chooser_to_motion_matching"),
+		TEXT("Connect an Evaluate-Chooser node's 'Result' output (a UPoseSearchDatabase) to a Motion Matching node's 'Database' input pin, so the active MM database is chooser-driven. Use after add_evaluate_chooser_node + build_motion_matching_node. Requires the Chooser plugin (WITH_CHOOSER)."),
+		FMonolithActionHandler::CreateStatic(&HandleWireChooserToMotionMatching),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("abp_path"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("chooser_node"), TEXT("string"), TEXT("UObject name of the Evaluate-Chooser node (from add_evaluate_chooser_node response)"))
+			.Required(TEXT("mm_node"), TEXT("string"), TEXT("UObject name of the Motion Matching node (from build_motion_matching_node response)"))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Graph containing both nodes. Default: AnimGraph"), TEXT("AnimGraph"))
 			.Build());
 
 	// --- duplicate_reparent_and_sanitize ---
@@ -943,6 +967,42 @@ namespace
 {
 
 /**
+ * Shared reflective spawn of a UK2Node_EvaluateChooser2. NewObject<UK2Node>(Graph, EvalClass),
+ * binds the Chooser FObjectProperty BEFORE pin generation (pin shape derives from the chooser
+ * context), adds the node to the graph, then AllocateDefaultPins + PostPlacedNewNode + ReconstructNode.
+ * Returns the spawned node or nullptr if the reflective set could not be performed. Used by both the
+ * delete-and-rebuild path (RebuildOneChooserNode) and the spawn-fresh path (Pack B
+ * add_evaluate_chooser_node) so the reflective logic lives in one place.
+ */
+UK2Node* SpawnEvaluateChooser2Node(UEdGraph* Graph, UClass* EvalClass, UObject* ChooserTable,
+	int32 PosX, int32 PosY)
+{
+	if (!Graph || !EvalClass) return nullptr;
+
+	FObjectProperty* ChooserProp = FindFProperty<FObjectProperty>(EvalClass, TEXT("Chooser"));
+	if (!ChooserProp) return nullptr;
+
+	UK2Node* Spawned = NewObject<UK2Node>(Graph, EvalClass, NAME_None, RF_Transactional);
+	if (!Spawned) return nullptr;
+
+	Graph->Modify();
+	Graph->AddNode(Spawned, /*bUserAction=*/false, /*bSelectNewNode=*/false);
+	Spawned->CreateNewGuid();
+	Spawned->NodePosX = PosX;
+	Spawned->NodePosY = PosY;
+
+	// Bind the chooser BEFORE pin generation — pin shape (the 'Result' output type) derives
+	// from the chooser's OutputObjectType. For a PoseSearchDatabase chooser, Result is a
+	// UPoseSearchDatabase object pin, compatible with the MM node's 'Database' input.
+	ChooserProp->SetObjectPropertyValue_InContainer(Spawned, ChooserTable);
+
+	Spawned->AllocateDefaultPins();
+	Spawned->PostPlacedNewNode(); // UEdGraphNode::PostPlacedNewNode() takes no args in UE 5.7
+	Spawned->ReconstructNode();   // regenerate pins from the bound chooser context
+	return Spawned;
+}
+
+/**
  * Core rebuild of one Evaluate-Chooser node. Captures the old node's external links, spawns a fresh
  * UK2Node_EvaluateChooser2 reflectively, binds the chooser, regenerates pins, reconnects type+name
  * compatible links, removes the old node. Reports reconnected + unreconnected links into OutEntry.
@@ -966,30 +1026,9 @@ bool RebuildOneChooserNode(UBlueprint* /*BP*/, UEdGraph* Graph, UEdGraphNode* Ol
 	}
 	OutEntry->SetArrayField(TEXT("old_pins"), OldPinsArr);
 
-	// Spawn the new node reflectively.
-	UEdGraphNode* NewNode = nullptr;
-	FObjectProperty* ChooserProp = FindFProperty<FObjectProperty>(EvalClass, TEXT("Chooser"));
-	if (EvalClass && ChooserProp)
-	{
-		UK2Node* Spawned = NewObject<UK2Node>(Graph, EvalClass, NAME_None, RF_Transactional);
-		if (Spawned)
-		{
-			Graph->Modify();
-			Graph->AddNode(Spawned, /*bUserAction=*/false, /*bSelectNewNode=*/false);
-			Spawned->CreateNewGuid();
-			Spawned->NodePosX = OldNode->NodePosX;
-			Spawned->NodePosY = OldNode->NodePosY;
-
-			// Bind the chooser BEFORE pin generation — pin shape derives from the chooser context.
-			ChooserProp->SetObjectPropertyValue_InContainer(Spawned, ChooserTable);
-
-			Spawned->AllocateDefaultPins();
-			Spawned->PostPlacedNewNode(); // UEdGraphNode::PostPlacedNewNode() takes no args in UE 5.7
-			Spawned->ReconstructNode(); // regenerate pins from the bound chooser context
-
-			NewNode = Spawned;
-		}
-	}
+	// Spawn the new node reflectively (shared helper — see SpawnEvaluateChooser2Node).
+	UEdGraphNode* NewNode = SpawnEvaluateChooser2Node(Graph, EvalClass, ChooserTable,
+		OldNode->NodePosX, OldNode->NodePosY);
 
 	if (NewNode)
 	{
@@ -1261,6 +1300,195 @@ FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleReplaceEvaluateChoo
 	return FMonolithActionResult::Success(Root);
 }
 
+
+// ===========================================================================
+//  Pack B — add_evaluate_chooser_node (spawn-fresh, no-delete)
+// ===========================================================================
+
+FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleAddEvaluateChooserNode(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath     = Params->GetStringField(TEXT("abp_path"));
+	const FString ChooserPath = Params->GetStringField(TEXT("chooser_path"));
+	FString GraphName = Params->HasField(TEXT("graph_name")) ? Params->GetStringField(TEXT("graph_name")) : TEXT("AnimGraph");
+	if (GraphName.IsEmpty()) GraphName = TEXT("AnimGraph");
+
+	double TempVal;
+	int32 PosX = 0, PosY = 0;
+	if (Params->TryGetNumberField(TEXT("position_x"), TempVal)) PosX = static_cast<int32>(TempVal);
+	if (Params->TryGetNumberField(TEXT("position_y"), TempVal)) PosY = static_cast<int32>(TempVal);
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Animation Blueprint not found: %s"), *AbpPath));
+	}
+
+	UClass* EvalClass = ResolveEvaluateChooser2Class();
+	if (!EvalClass)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Could not resolve Evaluate-Chooser node class at '%s'. Is the Chooser plugin enabled and loaded?"),
+			EvaluateChooser2ClassPath));
+	}
+
+	UChooserTable* Chooser = FMonolithAssetUtils::LoadAssetByPath<UChooserTable>(ChooserPath);
+	if (!Chooser)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Chooser table not found: %s"), *ChooserPath));
+	}
+
+	FString GraphErr;
+	UEdGraph* Graph = ResolveGraphByName(ABP, GraphName, GraphErr);
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(GraphErr);
+	}
+
+	// Spawn-fresh variant of RebuildOneChooserNode: reuse its reflective spawn helper, but with
+	// no old node to capture/delete. The node binds the chooser and regenerates its pins; the
+	// 'Result' output pin's type follows the chooser's OutputObjectType (PoseSearchDatabase here).
+	UK2Node* NewNode = SpawnEvaluateChooser2Node(Graph, EvalClass, Chooser, PosX, PosY);
+	if (!NewNode)
+	{
+		return FMonolithActionResult::Error(TEXT("Reflective UK2Node_EvaluateChooser2 spawn failed (no 'Chooser' FObjectProperty or node could not be created)."));
+	}
+
+	// Locate the output result pin. The Evaluate-Chooser v2 node names its primary output 'Result'
+	// (EvaluateChooserNode.cpp:520). Prefer that by name; fall back to the first output data pin.
+	UEdGraphPin* ResultPin = FindPinByNameDir(NewNode, FName(TEXT("Result")), EGPD_Output);
+	if (!ResultPin)
+	{
+		for (UEdGraphPin* Pin : NewNode->Pins)
+		{
+			if (Pin && Pin->Direction == EGPD_Output
+				&& Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{
+				ResultPin = Pin;
+				break;
+			}
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+	ABP->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("graph_name"), Graph->GetName());
+	Root->SetStringField(TEXT("chooser_path"), Chooser->GetPathName());
+	Root->SetStringField(TEXT("resolved_node_class"), EvalClass->GetPathName());
+	Root->SetStringField(TEXT("node_name"), NewNode->GetName());
+	Root->SetStringField(TEXT("result_pin"), ResultPin ? ResultPin->PinName.ToString() : FString());
+	Root->SetBoolField(TEXT("result_pin_found"), ResultPin != nullptr);
+
+	TArray<TSharedPtr<FJsonValue>> PinArr;
+	for (UEdGraphPin* Pin : NewNode->Pins)
+	{
+		PinArr.Add(MakeShared<FJsonValueObject>(DescribePin(Pin)));
+	}
+	Root->SetArrayField(TEXT("pins"), PinArr);
+	Root->SetBoolField(TEXT("saved"), false);
+	return FMonolithActionResult::Success(Root);
+}
+
+
+// ===========================================================================
+//  Pack B — wire_chooser_to_motion_matching
+// ===========================================================================
+
+FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleWireChooserToMotionMatching(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AbpPath        = Params->GetStringField(TEXT("abp_path"));
+	const FString ChooserNodeRef = Params->GetStringField(TEXT("chooser_node"));
+	const FString MMNodeRef      = Params->GetStringField(TEXT("mm_node"));
+	FString GraphName = Params->HasField(TEXT("graph_name")) ? Params->GetStringField(TEXT("graph_name")) : TEXT("AnimGraph");
+	if (GraphName.IsEmpty()) GraphName = TEXT("AnimGraph");
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AbpPath);
+	if (!ABP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Animation Blueprint not found: %s"), *AbpPath));
+	}
+
+	FString GraphErr;
+	UEdGraph* Graph = ResolveGraphByName(ABP, GraphName, GraphErr);
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(GraphErr);
+	}
+
+	UEdGraphNode* ChooserNode = FindNodeByNameBP(ABP, ChooserNodeRef, Graph);
+	if (!ChooserNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Chooser node '%s' not found in graph '%s'"), *ChooserNodeRef, *GraphName));
+	}
+	UEdGraphNode* MMNode = FindNodeByNameBP(ABP, MMNodeRef, Graph);
+	if (!MMNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Motion Matching node '%s' not found in graph '%s'"), *MMNodeRef, *GraphName));
+	}
+
+	// Chooser side: the 'Result' output (PoseSearchDatabase for a DB chooser). Fall back to the
+	// first non-exec output pin.
+	UEdGraphPin* SourcePin = FindPinByNameDir(ChooserNode, FName(TEXT("Result")), EGPD_Output);
+	if (!SourcePin)
+	{
+		for (UEdGraphPin* Pin : ChooserNode->Pins)
+		{
+			if (Pin && Pin->Direction == EGPD_Output
+				&& Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{
+				SourcePin = Pin;
+				break;
+			}
+		}
+	}
+	if (!SourcePin)
+	{
+		return FMonolithActionResult::Error(TEXT("Chooser node has no output result pin to wire"));
+	}
+
+	// MM side: the FAnimNode_MotionMatching 'Database' property is UPROPERTY(meta=(PinShownByDefault)),
+	// so the input pin is named 'Database' (AnimNode_MotionMatching.h:110-111). Verified.
+	UEdGraphPin* TargetPin = FindPinByNameDir(MMNode, FName(TEXT("Database")), EGPD_Input);
+	if (!TargetPin)
+	{
+		return FMonolithActionResult::Error(TEXT("Motion Matching node has no 'Database' input pin. Ensure the node is a UAnimGraphNode_MotionMatching with the Database pin shown."));
+	}
+
+	const UEdGraphSchema* Schema = Graph->GetSchema();
+	if (!Schema)
+	{
+		return FMonolithActionResult::Error(TEXT("Graph has no schema"));
+	}
+
+	const FPinConnectionResponse Resp = Schema->CanCreateConnection(SourcePin, TargetPin);
+	if (Resp.Response == CONNECT_RESPONSE_DISALLOW)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Schema disallowed Result -> Database connection: %s"), *Resp.Message.ToString()));
+	}
+
+	Graph->Modify();
+	ChooserNode->Modify();
+	MMNode->Modify();
+	const bool bConnected = Schema->TryCreateConnection(SourcePin, TargetPin);
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+	ABP->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("abp_path"), AbpPath);
+	Root->SetStringField(TEXT("graph_name"), Graph->GetName());
+	Root->SetStringField(TEXT("chooser_node"), ChooserNode->GetName());
+	Root->SetStringField(TEXT("chooser_pin"), SourcePin->PinName.ToString());
+	Root->SetStringField(TEXT("mm_node"), MMNode->GetName());
+	Root->SetStringField(TEXT("mm_pin"), TargetPin->PinName.ToString());
+	Root->SetBoolField(TEXT("connected"), bConnected);
+	Root->SetBoolField(TEXT("saved"), false);
+	return FMonolithActionResult::Success(Root);
+}
+
 #else // !WITH_CHOOSER
 
 // Off-gate stubs: register cleanly, return a precise "not available" error rather than failing to link.
@@ -1273,6 +1501,16 @@ FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleRebuildEvaluateChoo
 FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleReplaceEvaluateChooserNodes(const TSharedPtr<FJsonObject>& /*Params*/)
 {
 	return FMonolithActionResult::Error(TEXT("Chooser plugin not available (WITH_CHOOSER=0). Evaluate-Chooser node surgery is disabled in this build."));
+}
+
+FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleAddEvaluateChooserNode(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+	return FMonolithActionResult::Error(TEXT("Chooser plugin not available (WITH_CHOOSER=0). add_evaluate_chooser_node is disabled in this build."));
+}
+
+FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleWireChooserToMotionMatching(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+	return FMonolithActionResult::Error(TEXT("Chooser plugin not available (WITH_CHOOSER=0). wire_chooser_to_motion_matching is disabled in this build."));
 }
 
 #endif // WITH_CHOOSER
