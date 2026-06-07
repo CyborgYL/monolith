@@ -90,16 +90,16 @@ void FMonolithChooserAuthoringActions::RegisterActions(FMonolithToolRegistry& Re
 
 namespace
 {
-	FMonolithActionResult ChooserUnavailable()
+	FMonolithActionResult ChooserAuthoringUnavailable()
 	{
 		return FMonolithActionResult::Error(TEXT("Chooser plugin not available"));
 	}
 }
 
-FMonolithActionResult FMonolithChooserAuthoringActions::HandleCreateChooserTable(const TSharedPtr<FJsonObject>&) { return ChooserUnavailable(); }
-FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserColumn(const TSharedPtr<FJsonObject>&)  { return ChooserUnavailable(); }
-FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserRow(const TSharedPtr<FJsonObject>&)     { return ChooserUnavailable(); }
-FMonolithActionResult FMonolithChooserAuthoringActions::HandleSetChooserCell(const TSharedPtr<FJsonObject>&)   { return ChooserUnavailable(); }
+FMonolithActionResult FMonolithChooserAuthoringActions::HandleCreateChooserTable(const TSharedPtr<FJsonObject>&) { return ChooserAuthoringUnavailable(); }
+FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserColumn(const TSharedPtr<FJsonObject>&)  { return ChooserAuthoringUnavailable(); }
+FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserRow(const TSharedPtr<FJsonObject>&)     { return ChooserAuthoringUnavailable(); }
+FMonolithActionResult FMonolithChooserAuthoringActions::HandleSetChooserCell(const TSharedPtr<FJsonObject>&)   { return ChooserAuthoringUnavailable(); }
 
 #else // WITH_CHOOSER
 
